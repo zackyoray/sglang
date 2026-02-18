@@ -43,10 +43,10 @@ class NixlEPDispatchOutput(NamedTuple):
     """NixlEP dispatch output.
 
     Note: Uses same format as DeepEPLLOutput for compatibility with downstream code.
-    hidden_states_fp8 is a tuple of (hidden_states, scale) or just hidden_states if no scale.
     """
 
-    hidden_states_fp8: Tuple[torch.Tensor, torch.Tensor]
+    hidden_states: torch.Tensor
+    hidden_states_scale: Optional[torch.Tensor]
     topk_idx: torch.Tensor
     topk_weights: torch.Tensor
     masked_m: torch.Tensor
@@ -273,8 +273,14 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
             masked_m
         )
 
+        if isinstance(hidden_states, tuple):
+            hidden_states, hidden_states_scale = hidden_states
+        else:
+            hidden_states_scale = None
+
         nixl_output = NixlEPDispatchOutput(
             hidden_states,
+            hidden_states_scale,
             topk_idx,
             topk_weights,
             masked_m,
