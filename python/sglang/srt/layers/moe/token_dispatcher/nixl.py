@@ -190,6 +190,16 @@ class _NixlEPDispatcherImplBase:
         self._mask_buffer = torch.zeros_like(self.active_ranks) if self.active_ranks is not None else None
 
         self.handle = None
+        self.quant_config = None
+        self.overlap_args = None
+        self.meta_overlap_args = None
+
+    def set_quant_config(self, quant_config: dict) -> None:
+        self.quant_config = quant_config
+
+    def set_overlap_args(self, combine_overlap_args, meta_overlap_args) -> None:
+        self.overlap_args = combine_overlap_args
+        self.meta_overlap_args = meta_overlap_args
 
     def dispatch_a(
         self,
@@ -504,6 +514,18 @@ class NixlEPDispatcher(BaseDispatcher):
             return self._low_latency_dispatcher
         else:
             raise ValueError(f"Invalid deepep_mode: {self.deepep_mode}")
+
+    def set_quant_config(self, quant_config: dict):
+        super().set_quant_config(quant_config)
+        if self.deepep_mode.enable_low_latency():
+            self._low_latency_dispatcher.set_quant_config(quant_config)
+
+    def set_overlap_args(self, combine_overlap_args, meta_overlap_args):
+        super().set_overlap_args(combine_overlap_args, meta_overlap_args)
+        if self.deepep_mode.enable_low_latency():
+            self._low_latency_dispatcher.set_overlap_args(
+                combine_overlap_args, meta_overlap_args
+            )
 
     def _update_stage(self, old_stage, new_stage):
         assert self._stage == old_stage
