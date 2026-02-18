@@ -21,14 +21,14 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
 )
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import DeepEPMode
-from sglang.srt.layers.quantization import deep_gemm_wrapper
+from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.distributed.utils import get_global_tcp_store
 from sglang.srt.utils import get_bool_env_var, get_int_env_var, is_npu
 
 _is_npu = is_npu()
 
 if TYPE_CHECKING:
-    from sglang.srt.single_batch_overlap import CombineOverlapArgs
+    from sglang.srt.batch_overlap.single_batch_overlap import CombineOverlapArgs
 
 try:
     from nixl_ep import Buffer
