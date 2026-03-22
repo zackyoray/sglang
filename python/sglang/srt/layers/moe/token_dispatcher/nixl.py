@@ -44,6 +44,8 @@ class NixlEPBuffer:
     _num_max_dispatch_tokens_per_rank: Optional[int] = None
     _num_experts: Optional[int] = None
     _num_local_experts: Optional[int] = None
+    _connected_ep_size: int = 0
+    _scale_to: int = 0
 
     @classmethod
     def get_nixl_buffer(
@@ -55,31 +57,53 @@ class NixlEPBuffer:
         num_experts: int = -1,
         num_local_experts: int = -1,
     ):
+        """Get (or update) the NIXL EP buffer singleton.
+
+        On first call: creates the buffer, pre-allocates for
+        ``max_ep_size``, and connects to currently active EP ranks.
+
+        On subsequent calls: if ``_scale_to != _connected_ep_size``
+        (set by ``on_scale``), updates connections to match.
+        Otherwise returns the cached buffer immediately.
+
+        Called on every dispatch/combine via the dispatcher's
+        ``_get_buffer()`` method.
+        """
         if cls._buffer is not None:
+            if cls._scale_to != cls._connected_ep_size:
+                cls._update_connections(cls._scale_to)
             return cls._buffer
 
+        frontier = ElasticEPStateManager.get_ep_frontier()
+
+        # -- First-time init --
         cls._hidden_size = hidden_size
         cls._num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
         cls._num_experts = num_experts
         cls._num_local_experts = num_local_experts
+
+        from sglang.srt.server_args import get_global_server_args
+
+        rank = dist.get_rank(group)
+        server_args = get_global_server_args()
+        max_ep_size = getattr(server_args, "max_ep_size", 0)
+        if not max_ep_size or max_ep_size <= 0:
+            max_ep_size = frontier if frontier > 0 else dist.get_world_size(group)
 
         num_rdma_bytes = 0
         if deepep_mode.enable_normal():
             raise NotImplementedError("Normal mode is not supported for Nixl EP yet.")
         if deepep_mode.enable_low_latency():
             assert num_max_dispatch_tokens_per_rank != -1
-            assert num_experts != -1 and num_experts % group.size() == 0
+            assert num_experts != -1
+            max_num_experts = num_local_experts * max_ep_size
             num_rdma_bytes = Buffer.get_rdma_size_hint(
                 num_max_dispatch_tokens_per_rank,
                 hidden_size,
-                group.size(),
-                num_experts,
+                max_ep_size,
+                max_num_experts,
             )
 
-        rank = dist.get_rank(group)
-        world_size = dist.get_world_size(group)
-
-        # Get the global TCPStore for coordination
         tcp_store = get_global_tcp_store()
         if tcp_store is None:
             raise RuntimeError(
@@ -88,8 +112,9 @@ class NixlEPBuffer:
             )
 
         logger.info(
-            f"Using NIXL EP (world_size={world_size}, rank={rank}, "
-            f"num_experts={cls._num_experts}, num_experts_per_rank={cls._num_local_experts}) "
+            "Using NIXL EP (frontier=%d, max_ep_size=%d, rank=%d, "
+            "num_experts=%d, num_experts_per_rank=%d)",
+            frontier, max_ep_size, rank, cls._num_experts, cls._num_local_experts,
         )
 
         cls._buffer = Buffer(
@@ -98,14 +123,85 @@ class NixlEPBuffer:
         )
 
         cls._buffer.update_memory_buffers(
-            num_ranks=world_size,
+            num_ranks=max_ep_size,
             num_experts_per_rank=cls._num_local_experts,
             num_rdma_bytes=num_rdma_bytes,
         )
-        all_ranks = list(range(world_size))
-        cls._buffer.connect_ranks(all_ranks)
+
+        # Connect to all currently active ranks.
+        if frontier > 0:
+            cls._buffer.connect_ranks(list(range(frontier)))
+        cls._connected_ep_size = frontier
+        cls._scale_to = frontier
 
         return cls._buffer
+
+    @classmethod
+    def _update_connections(cls, new_frontier: int) -> None:
+        """Connect or disconnect ranks to match the new frontier.
+
+        Called automatically from ``get_nixl_buffer()`` when the EP
+        frontier has changed (i.e. ``ElasticEPStateManager.scale()``
+        flipped ``active_ranks`` bits).
+
+        NIXL ``connect_ranks`` / ``disconnect_ranks`` handle
+        reachability atomically.
+        """
+        buf = cls._buffer
+        old = cls._connected_ep_size
+        my_rank = buf.rank
+
+        if new_frontier > old:
+            new_ranks = list(range(old, new_frontier))
+            if my_rank in new_ranks:
+                elastic_state = ElasticEPStateManager.instance()
+                active = elastic_state.active_ranks if elastic_state is not None else None
+                if active is not None:
+                    all_others = [
+                        r for r in range(new_frontier)
+                        if int(active[r].item()) == 1
+                    ]
+                else:
+                    all_others = list(range(new_frontier))
+                logger.info(
+                    "[Elastic EP][NIXL] New rank %d connecting to %s",
+                    my_rank, all_others,
+                )
+                buf.connect_ranks(all_others)
+            else:
+                logger.info(
+                    "[Elastic EP][NIXL] Existing rank %d connecting to %s",
+                    my_rank, new_ranks,
+                )
+                buf.connect_ranks(new_ranks)
+        else:
+            removed_ranks = list(range(new_frontier, old))
+            if my_rank in removed_ranks:
+                remaining = list(range(new_frontier))
+                logger.info(
+                    "[Elastic EP][NIXL] Removing rank %d disconnecting from %s",
+                    my_rank, remaining,
+                )
+                buf.disconnect_ranks(remaining)
+            else:
+                logger.info(
+                    "[Elastic EP][NIXL] Remaining rank %d disconnecting from %s",
+                    my_rank, removed_ranks,
+                )
+                buf.disconnect_ranks(removed_ranks)
+
+        cls._connected_ep_size = new_frontier
+
+    @classmethod
+    def on_scale(cls, from_ep_size: int, to_ep_size: int) -> None:
+        """Signal that a scale event occurred.
+
+        Sets ``_scale_to`` so the next ``get_nixl_buffer()`` call
+        detects ``_scale_to != _connected_ep_size`` and performs the
+        actual ``connect_ranks`` / ``disconnect_ranks``.  Direction
+        is derived from the comparison at that time.
+        """
+        cls._scale_to = to_ep_size
 
     @classmethod
     def clean_buffer(cls):

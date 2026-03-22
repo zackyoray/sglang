@@ -532,6 +532,7 @@ class ServerArgs:
     deepep_config: Optional[str] = None
     moe_dense_tp_size: Optional[int] = None
     elastic_ep_backend: Literal[None, "mooncake", "nixl"] = None
+    max_ep_size: int = 0
     enable_elastic_expert_backup: bool = False
     mooncake_ib_device: Optional[str] = None
 
@@ -2704,6 +2705,13 @@ class ServerArgs:
                     "elasticity_aware_hierarchical",
                 ], "Elastic EP requires eplb_algorithm to be set to 'auto' or 'elasticity_aware(_hierarchical)'."
 
+            if self.max_ep_size > 0:
+                assert self.max_ep_size >= self.ep_size, (
+                    f"max_ep_size ({self.max_ep_size}) must be >= ep_size ({self.ep_size})"
+                )
+            else:
+                self.max_ep_size = self.ep_size
+
             if self.elastic_ep_backend == "mooncake":
                 self.mooncake_ib_device = self._validate_ib_devices(
                     self.mooncake_ib_device
@@ -4763,6 +4771,12 @@ class ServerArgs:
             default=ServerArgs.elastic_ep_backend,
             choices=["none", "mooncake", "nixl"],
             help="Specify the collective communication backend for elastic EP. Supports 'mooncake' and 'nixl'.",
+        )
+        parser.add_argument(
+            "--max-ep-size",
+            type=int,
+            default=ServerArgs.max_ep_size,
+            help="Maximum EP size for elastic scaling. Pre-allocates buffers for this many ranks. Defaults to ep_size (no scaling headroom).",
         )
         parser.add_argument(
             "--enable-elastic-expert-backup",
