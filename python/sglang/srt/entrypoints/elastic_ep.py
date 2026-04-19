@@ -22,17 +22,17 @@ async def scale_elastic_ep(raw_request: Request):
             status_code=HTTPStatus.BAD_REQUEST,
         )
 
-    new_tp_size = body.get("new_tp_size")
-    if new_tp_size is None or not isinstance(new_tp_size, int) or new_tp_size <= 0:
+    new_ep_size = body.get("new_ep_size")
+    if new_ep_size is None or not isinstance(new_ep_size, int) or new_ep_size <= 0:
         return ORJSONResponse(
-            {"error": "new_tp_size must be a positive integer"},
+            {"error": "new_ep_size must be a positive integer"},
             status_code=HTTPStatus.BAD_REQUEST,
         )
 
     from sglang.srt.entrypoints.http_server import _global_state
     from sglang.srt.managers.io_struct import ScaleElasticEPReqInput
 
-    req = ScaleElasticEPReqInput(new_tp_size=new_tp_size)
+    req = ScaleElasticEPReqInput(new_ep_size=new_ep_size)
     result = await _global_state.tokenizer_manager.scale_elastic_ep(req)
 
     if not result.success:
@@ -44,8 +44,8 @@ async def scale_elastic_ep(raw_request: Request):
     return ORJSONResponse(
         {
             "message": result.message,
-            "old_tp_size": result.old_tp_size,
-            "new_tp_size": result.new_tp_size,
+            "old_ep_size": result.old_ep_size,
+            "new_ep_size": result.new_ep_size,
         }
     )
 
@@ -54,6 +54,6 @@ async def scale_elastic_ep(raw_request: Request):
 async def is_scaling_elastic_ep(raw_request: Request):
     from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 
-    inst = ElasticEPStateManager.instance()
-    is_scaling = inst is not None and getattr(inst, "scaling_in_progress", False)
-    return ORJSONResponse({"is_scaling_elastic_ep": is_scaling})
+    return ORJSONResponse(
+        {"is_scaling_elastic_ep": ElasticEPStateManager.is_scaling()}
+    )

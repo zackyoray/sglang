@@ -125,14 +125,14 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     PauseGenerationReqInput,
     ProfileReq,
-    ScaleElasticEPReqInput,
-    ScaleElasticEPReqOutput,
     ReleaseMemoryOccupationReqInput,
     RemoveExternalCorpusReqInput,
     RemoveExternalCorpusReqOutput,
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
     RpcReqOutput,
+    ScaleElasticEPReqInput,
+    ScaleElasticEPReqOutput,
     SendWeightsToRemoteInstanceReqInput,
     SendWeightsToRemoteInstanceReqOutput,
     SetInternalStateReq,
@@ -3482,29 +3482,68 @@ class Scheduler(
             _iter_live_parallel_groups,
         )
 
+        old_ep_size = ElasticEPStateManager.get_effective_ep_size()
+        new_ep_size = recv_req.new_ep_size
+        max_ep_size = ElasticEPStateManager.get_max_ep_size()
+
+        # Validate before touching the backend.
+        if new_ep_size <= old_ep_size:
+            return ScaleElasticEPReqOutput(
+                success=False,
+                message=(
+                    f"new_ep_size ({new_ep_size}) must be greater than current "
+                    f"effective_ep_size ({old_ep_size}); scale-down is handled separately."
+                ),
+                old_ep_size=old_ep_size,
+                new_ep_size=new_ep_size,
+            )
+        if max_ep_size and new_ep_size > max_ep_size:
+            return ScaleElasticEPReqOutput(
+                success=False,
+                message=(
+                    f"new_ep_size ({new_ep_size}) exceeds --max-ep-size "
+                    f"({max_ep_size}). Restart with a larger --max-ep-size."
+                ),
+                old_ep_size=old_ep_size,
+                new_ep_size=new_ep_size,
+            )
+        if ElasticEPStateManager.is_scaling():
+            return ScaleElasticEPReqOutput(
+                success=False,
+                message=(
+                    "A previous scale operation has not completed yet. Wait until "
+                    "all pending ranks have joined before issuing another scale."
+                ),
+                old_ep_size=old_ep_size,
+                new_ep_size=new_ep_size,
+            )
+
         try:
             from mooncake import ep as mooncake_ep
-
-            old_ep_size = ElasticEPStateManager.get_effective_ep_size()
-            new_ep_size = recv_req.new_tp_size
 
             for group in _iter_live_parallel_groups():
                 backend = _get_process_group_backend(group.device_group, "cuda")
                 mooncake_ep.extend_group_size_to(backend, new_ep_size)
 
+            # NOTE: do not call _on_scale here — that would block on the NIXL
+            # two-sided handshake before new ranks have joined the PG. The
+            # poll loop in maybe_join_ep_ranks calls _on_scale after the new
+            # ranks have published their metadata.
             ElasticEPStateManager.set_effective_ep_size(new_ep_size)
 
             return ScaleElasticEPReqOutput(
                 success=True,
                 message=f"Scaling initiated from {old_ep_size} to {new_ep_size}",
-                old_tp_size=old_ep_size,
-                new_tp_size=new_ep_size,
+                old_ep_size=old_ep_size,
+                new_ep_size=new_ep_size,
             )
         except Exception as e:
             logger.error("[Elastic EP] Scale failed: %s", e)
             return ScaleElasticEPReqOutput(
                 success=False,
                 message=str(e),
+                old_ep_size=old_ep_size,
+                new_ep_size=new_ep_size,
             )
 
     def load_lora_adapter(

@@ -141,6 +141,28 @@ class ElasticEPStateManager:
             return False
         return any(r < inst.original_ep_size for r in rank_ids)
 
+    @classmethod
+    def is_scaling(cls) -> bool:
+        """True iff there are unjoined ranks within the current poll window.
+
+        Computed on demand from active_ranks vs effective_ep_size so it stays
+        consistent without an explicit state-machine flag. Equivalent to
+        "the scheduler asked for N slots but fewer than N have joined yet".
+        """
+        inst = cls._instance
+        if inst is None or inst.active_ranks is None:
+            return False
+        active_count = int(inst.active_ranks[: inst.effective_ep_size].sum().item())
+        return active_count < inst.effective_ep_size
+
+    @classmethod
+    def get_max_ep_size(cls) -> int:
+        """Upper bound for new_ep_size in scale requests."""
+        inst = cls._instance
+        if inst is None or inst.active_ranks is None:
+            return 0
+        return int(inst.active_ranks.numel())
+
 
 # ---------------------------------------------------------------------------
 # Helpers for elastic EP recovery

@@ -51,8 +51,6 @@ from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
     BatchEmbeddingOutput,
-    ScaleElasticEPReqInput,
-    ScaleElasticEPReqOutput,
     BatchStrOutput,
     BatchTokenIDOutput,
     BatchTokenizedEmbeddingReqInput,
@@ -66,6 +64,8 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     OpenSessionReqOutput,
     PauseGenerationReqInput,
+    ScaleElasticEPReqInput,
+    ScaleElasticEPReqOutput,
     SessionParams,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -2368,7 +2368,12 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
     async def scale_elastic_ep(
         self, obj: ScaleElasticEPReqInput
     ) -> ScaleElasticEPReqOutput:
-        """Send scaling request to scheduler and wait for result."""
+        """Send scaling request to scheduler and wait for result.
+
+        NOTE: single-flight — concurrent calls will clobber the pending future.
+        Callers should serialize scale requests at the orchestrator level, and
+        the scheduler also rejects overlapping scales via is_scaling() guard.
+        """
         self.auto_create_handle_loop()
         await self.send_to_scheduler.send_pyobj(obj)
         self._scale_elastic_ep_future = asyncio.Future()
