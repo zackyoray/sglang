@@ -65,6 +65,15 @@ class ElasticEPStateManager:
             cls._instance.effective_ep_size = world_size
             cls._instance.original_ep_size = world_size
 
+            # Slots beyond the launch-time world are reserved for scale-up;
+            # they are NOT active yet. is_scaling() and the poll loop in
+            # maybe_join_ep_ranks distinguish active (1) from unjoined (0)
+            # within the [0, effective_ep_size) window.
+            if tensor_size > world_size:
+                cls._instance.active_ranks[world_size:].zero_()
+                cls._instance.snapshot_active_to_last()
+                cls._instance.sync_active_to_cpu()
+
             backend = server_args.elastic_ep_backend
             if backend == "nixl":
                 cls._on_scale = cls._on_scale_nixl

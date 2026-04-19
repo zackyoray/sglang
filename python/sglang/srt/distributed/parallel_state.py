@@ -275,9 +275,25 @@ class GroupCoordinator:
             self.device = torch.device("cpu")
         self.device_module = torch.get_device_module(self.device)
 
+        # For elastic EP with --max-ep-size > world_size we pre-size the
+        # active_ranks tensor to max_ep_size so Mooncake can write into the
+        # higher slots when extend_group_size_to() makes them available.
+        # The first len(ranks) entries are 1 (active); the rest start as 0
+        # and get flipped to 1 when the new ranks join via the recovery /
+        # scale-up flow.
+        from sglang.srt.server_args import get_global_server_args
+
+        _max_ep_size = (
+            get_global_server_args().max_ep_size if "mooncake" in torch_distributed_backend else None
+        )
+
         for ranks in group_ranks:
-            active_ranks = torch.ones(len(ranks), dtype=torch.int32, device=self.device)
-            active_ranks_cpu = torch.ones(len(ranks), dtype=torch.int32)
+            tensor_size = max(_max_ep_size or 0, len(ranks))
+            active_ranks = torch.ones(tensor_size, dtype=torch.int32, device=self.device)
+            active_ranks_cpu = torch.ones(tensor_size, dtype=torch.int32)
+            if tensor_size > len(ranks):
+                active_ranks[len(ranks):].zero_()
+                active_ranks_cpu[len(ranks):].zero_()
             if "mooncake" in torch_distributed_backend:
                 from mooncake.ep import MooncakeBackendOptions
 
@@ -1679,9 +1695,15 @@ def init_distributed_environment(
 
         if backend == "mooncake":
             from mooncake.ep import MooncakeBackendOptions
+            from sglang.srt.server_args import get_global_server_args
 
-            # Setting "cuda" as device here is safe, as it is guarded under the mooncake case
-            active_ranks = torch.ones(world_size, dtype=torch.int32, device="cuda")
+            # Setting "cuda" as device here is safe, as it is guarded under the mooncake case.
+            # Pre-size to --max-ep-size so Mooncake can write into higher slots
+            # after extend_group_size_to() — see the analogous note in init_world_group.
+            tensor_size = max(get_global_server_args().max_ep_size or 0, world_size)
+            active_ranks = torch.ones(tensor_size, dtype=torch.int32, device="cuda")
+            if tensor_size > world_size:
+                active_ranks[world_size:].zero_()
             pg_options = MooncakeBackendOptions(active_ranks, recovered_rank)
         else:
             pg_options = get_torch_distributed_pg_options()
