@@ -79,6 +79,26 @@ class NixlEPBuffer:
         rank = dist.get_rank(group)
         world_size = dist.get_world_size(group)
 
+        # For elastic EP, pre-allocate buffers for the maximum EP size we may
+        # ever scale to. update_memory_buffers cannot be resized at runtime,
+        # so connecting more ranks later (via on_scale) requires the slots
+        # to already exist. Connect only the live ranks for now; the others
+        # are connected lazily on scale-up.
+        from sglang.srt.server_args import get_global_server_args
+
+        max_ep_size = get_global_server_args().max_ep_size or world_size
+        if max_ep_size > world_size and num_rdma_bytes:
+            assert num_experts % max_ep_size == 0, (
+                f"num_experts ({num_experts}) must be divisible by --max-ep-size "
+                f"({max_ep_size}) for elastic EP buffer pre-allocation."
+            )
+            num_rdma_bytes = Buffer.get_rdma_size_hint(
+                cls._num_max_dispatch_tokens_per_rank,
+                cls._hidden_size,
+                max_ep_size,
+                cls._num_experts,
+            )
+
         # Get the global TCPStore for coordination
         tcp_store = get_global_tcp_store()
         if tcp_store is None:
@@ -88,8 +108,9 @@ class NixlEPBuffer:
             )
 
         logger.info(
-            f"Using NIXL EP (world_size={world_size}, rank={rank}, "
-            f"num_experts={cls._num_experts}, num_experts_per_rank={cls._num_local_experts}) "
+            f"Using NIXL EP (world_size={world_size}, max_ep_size={max_ep_size}, "
+            f"rank={rank}, num_experts={cls._num_experts}, "
+            f"num_experts_per_rank={cls._num_local_experts}) "
         )
 
         cls._buffer = Buffer(
@@ -98,12 +119,12 @@ class NixlEPBuffer:
         )
 
         cls._buffer.update_memory_buffers(
-            num_ranks=world_size,
+            num_ranks=max_ep_size,
             num_experts_per_rank=cls._num_local_experts,
             num_rdma_bytes=num_rdma_bytes,
         )
-        all_ranks = list(range(world_size))
-        cls._buffer.connect_ranks(all_ranks)
+        live_ranks = list(range(world_size))
+        cls._buffer.connect_ranks(live_ranks)
 
         return cls._buffer
 
