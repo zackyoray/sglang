@@ -1494,6 +1494,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
             )
 
+            # Snapshot the pre-join active count for _on_scale before reset()
+            # below clobbers last_active_ranks.
+            from_ep_size = int(
+                ElasticEPStateManager.instance().last_active_ranks.sum().item()
+            )
+
             if ElasticEPStateManager.is_recovery_join(ranks_to_join):
                 # Recovery: skip EPLB rebalance due to stale metadata (PR #15771).
                 self.eplb_manager.reset_generator()
@@ -1504,8 +1510,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             # (which is inside try_recover_ranks) so new ranks are unblocked
             # and can publish their buffer metadata on first dispatch.
             if ElasticEPStateManager._on_scale is not None:
-                effective_size = ElasticEPStateManager.get_effective_ep_size()
-                ElasticEPStateManager._on_scale(0, effective_size)
+                ElasticEPStateManager._on_scale(from_ep_size, effective_size)
 
             ElasticEPStateManager.instance().snapshot_active_to_last()
             ElasticEPStateManager.instance().sync_active_to_cpu()
