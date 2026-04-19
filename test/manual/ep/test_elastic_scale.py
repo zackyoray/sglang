@@ -1,19 +1,21 @@
 """
-Manual test for elastic EP scale-up.
+Manual smoke test for elastic EP scale-up.
 
-Usage (4 GPUs initial, scale to 8):
+Usage (4 GPUs initial, scale headroom to 8):
 
-  # Terminal 1: start server with room for 8 ranks
-  CUDA_VISIBLE_DEVICES=0,1,2,3 python -m pytest test/manual/ep/test_elastic_scale.py -v -s
+  CUDA_VISIBLE_DEVICES=0,1,2,3 python -m pytest \\
+      test/manual/ep/test_elastic_scale.py -v -s
 
-This test launches a 4-GPU server with --max-ep-size 8, then would
-require launching 4 new ranks with --ep-join-mode scale and calling
-POST /scale_elastic_ep to trigger the scale-up.
+This test launches a 4-GPU server with --max-ep-size 8 and verifies:
+  * the /is_scaling_elastic_ep and /scale_elastic_ep endpoints are
+    mounted and reachable;
+  * HTTP-layer input validation rejects malformed bodies;
+  * scheduler-layer validation rejects scale-down and over-max requests.
 
-NOTE: Full end-to-end scale-up requires multi-process coordination
-that is not easily expressed in a single pytest file. This test
-validates the server launch with max_ep_size and the HTTP API
-endpoint availability. The actual rank joining is tested manually.
+Full end-to-end scale-up additionally requires launching 4 new ranks
+with --ep-join-mode scale and POSTing
+    {"new_ep_size": 8} to /scale_elastic_ep
+which is exercised manually rather than from a single pytest process.
 """
 
 import os
@@ -84,25 +86,46 @@ class TestElasticScaleServerLaunch(CustomTestCase):
         time.sleep(2)
 
     def test_scale_endpoint_exists(self):
-        """Verify the scale API endpoint is reachable."""
+        """Verify the scale API endpoint is reachable and reports idle."""
         url = f"{self.base_url}/is_scaling_elastic_ep"
         response = requests.post(url, timeout=10)
         self.assertEqual(response.status_code, 200)
         data = response.json()
         self.assertIn("is_scaling_elastic_ep", data)
+        # No scale has been triggered yet, so the system must be idle.
         self.assertFalse(data["is_scaling_elastic_ep"])
 
     def test_scale_up_request_validation(self):
-        """Verify the scale API validates input."""
+        """Verify the scale API validates input at the HTTP layer."""
         url = f"{self.base_url}/scale_elastic_ep"
 
-        # Missing new_tp_size
+        # Missing new_ep_size
         response = requests.post(url, json={}, timeout=10)
         self.assertEqual(response.status_code, 400)
 
-        # Invalid new_tp_size
-        response = requests.post(url, json={"new_tp_size": -1}, timeout=10)
+        # Non-positive new_ep_size
+        response = requests.post(url, json={"new_ep_size": -1}, timeout=10)
         self.assertEqual(response.status_code, 400)
+
+        # Wrong type
+        response = requests.post(url, json={"new_ep_size": "8"}, timeout=10)
+        self.assertEqual(response.status_code, 400)
+
+    def test_scale_down_rejected(self):
+        """Scheduler must reject new_ep_size <= current effective_ep_size."""
+        url = f"{self.base_url}/scale_elastic_ep"
+        # Server launched with tp=4 → current effective_ep_size = 4.
+        response = requests.post(url, json={"new_ep_size": 4}, timeout=30)
+        self.assertEqual(response.status_code, 500)
+        self.assertIn("scale-down", response.json().get("error", ""))
+
+    def test_scale_above_max_rejected(self):
+        """Scheduler must reject new_ep_size > --max-ep-size."""
+        url = f"{self.base_url}/scale_elastic_ep"
+        # Server launched with --max-ep-size 8 → 16 must fail.
+        response = requests.post(url, json={"new_ep_size": 16}, timeout=30)
+        self.assertEqual(response.status_code, 500)
+        self.assertIn("max-ep-size", response.json().get("error", ""))
 
 
 if __name__ == "__main__":
