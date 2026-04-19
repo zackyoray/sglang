@@ -1458,30 +1458,27 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     weight_name_filter=weight_name_filter,
                 )
 
-    def maybe_recover_ep_ranks(self):
-        # TODO(perf): `active_ranks.all()` on a CUDA tensor triggers host-device
-        # synchronization, and this function is on the forward-path.
-        # This check only runs when `--elastic-ep-backend` is enabled, so the
-        # synchronization overhead does not propagate to other configs.
-        # Leave for future optimization of the elastic EP path.
+    def maybe_join_ep_ranks(self):
+        """Poll for inactive ranks within effective_ep_size and accept them.
+
+        Handles both recovery (faulted rank rejoining) and scale-up (new rank
+        joining beyond the original group). Runs at the end of every forward
+        pass when --elastic-ep-backend is set.
+        """
         if self.tp_group.active_ranks.all() and self.tp_group.active_ranks_cpu.all():
             return
 
         tp_active_ranks = self.tp_group.active_ranks.detach().cpu().numpy()
         tp_active_ranks_cpu = self.tp_group.active_ranks_cpu.detach().numpy()
         tp_active_ranks &= tp_active_ranks_cpu
-        # NOTE: `ranks_to_recover` uses indices in `tp_group`. For the current
-        # Mooncake elastic EP implementation we assume `--pp-size=1`, so the
-        # tp-group index is the same as the global rank index.
-        ranks_to_recover = [
-            i for i in range(len(tp_active_ranks)) if not tp_active_ranks[i]
+        effective_size = ElasticEPStateManager.get_effective_ep_size()
+        ranks_to_join = [
+            i for i in range(effective_size) if not tp_active_ranks[i]
         ]
 
-        # try_recover_ranks polls peer state via Mooncake EP backend.
-        # Mooncake's internal semantics guarantee that all ranks observe
-        # consistent peer readiness state, so collective operations below
-        # are safe even though polling appears local.
-        if ranks_to_recover and try_recover_ranks(ranks_to_recover):
+        # try_recover_ranks polls peer state via an allreduce — all active
+        # ranks must call it. See RFC open questions re: rank agreement.
+        if ranks_to_join and try_recover_ranks(ranks_to_join):
             self.forward_pass_id = 0
             self.eplb_manager.reset_generator()
             broadcast_global_expert_location_metadata(
@@ -1497,7 +1494,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 get_world_group().cpu_group,
                 src=get_world_group().ranks[0],
             )
-            logger.info(f"recover ranks {ranks_to_recover} done")
+            logger.info(f"joined ranks {ranks_to_join} done")
 
     def _get_healthy_expert_location_src_rank(
         self, invoked_in_ep_join_path: bool
@@ -3000,7 +2997,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             dumper.step()
 
         if self.server_args.elastic_ep_backend is not None:
-            self.maybe_recover_ep_ranks()
+            self.maybe_join_ep_ranks()
 
         return output
 
