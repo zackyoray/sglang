@@ -2380,8 +2380,12 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
         return await self._scale_elastic_ep_future
 
     def _handle_scale_elastic_ep_output(self, recv_obj: ScaleElasticEPReqOutput):
-        if hasattr(self, "_scale_elastic_ep_future"):
-            self._scale_elastic_ep_future.set_result(recv_obj)
+        # In dp_attention deployments every DP scheduler echoes its own
+        # response, so this handler can fire multiple times per scale call.
+        # Only the first callback resolves the future; the rest are dropped.
+        future = getattr(self, "_scale_elastic_ep_future", None)
+        if future is not None and not future.done():
+            future.set_result(recv_obj)
 
     def _handle_open_session_req_output(self, recv_obj):
         future = self.session_futures.get(recv_obj.session_id)
