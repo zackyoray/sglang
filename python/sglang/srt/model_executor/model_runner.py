@@ -488,12 +488,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if (
             self.server_args.elastic_ep_backend is not None
-            and self.server_args.elastic_ep_rejoin
+            and self.server_args.ep_join_mode in ("scale", "recover")
         ):
             join_process_groups()
             broadcast_global_expert_location_metadata(
                 src_rank=self._get_healthy_expert_location_src_rank(
-                    invoked_in_elastic_ep_rejoin_path=True
+                    invoked_in_ep_join_path=True
                 )
             )
             ElasticEPStateManager.instance().reset()
@@ -1077,7 +1077,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 distributed_init_method=dist_init_method,
                 timeout=self.server_args.dist_timeout,
                 moe_a2a_backend=self.server_args.moe_a2a_backend,
-                recovered_rank=self.server_args.elastic_ep_rejoin,
+                recovered_rank=self.server_args.ep_join_mode in ("scale", "recover"),
             )
             initialize_model_parallel(
                 tensor_model_parallel_size=self.tp_size,
@@ -1088,7 +1088,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 moe_data_model_parallel_size=self.moe_dp_size,
                 duplicate_tp_group=self.server_args.enable_pdmux,
                 enable_symm_mem=self.server_args.enable_symm_mem,
-                recovered_rank=self.server_args.elastic_ep_rejoin,
+                recovered_rank=self.server_args.ep_join_mode in ("scale", "recover"),
             )
             initialize_dp_attention(
                 server_args=self.server_args,
@@ -1486,7 +1486,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.eplb_manager.reset_generator()
             broadcast_global_expert_location_metadata(
                 src_rank=self._get_healthy_expert_location_src_rank(
-                    invoked_in_elastic_ep_rejoin_path=False
+                    invoked_in_ep_join_path=False
                 )
             )
             ElasticEPStateManager.instance().reset()
@@ -1500,13 +1500,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             logger.info(f"recover ranks {ranks_to_recover} done")
 
     def _get_healthy_expert_location_src_rank(
-        self, invoked_in_elastic_ep_rejoin_path: bool
+        self, invoked_in_ep_join_path: bool
     ) -> int:
         world_group = get_world_group()
-        # NOTE: do not key off `self.server_args.elastic_ep_rejoin` here.
-        # A rank that was started as a rejoin rank may later act as a healthy
+        # NOTE: do not key off `self.server_args.ep_join_mode` here.
+        # A rank that was started as a join rank may later act as a healthy
         # rank in a subsequent recovery cycle.
-        local_rejoin_flag = bool(invoked_in_elastic_ep_rejoin_path)
+        local_rejoin_flag = bool(invoked_in_ep_join_path)
         gathered_rejoin_flags = world_group.all_gather_object(local_rejoin_flag)
 
         for rank_in_group, is_rejoin_rank in enumerate(gathered_rejoin_flags):
@@ -1515,7 +1515,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         raise RuntimeError(
             "No healthy rank found for broadcasting expert location metadata. "
-            "All ranks are marked as elastic_ep_rejoin."
+            "All ranks are marked as ep_join_mode (scale/recover)."
         )
 
     def update_weights_from_disk(

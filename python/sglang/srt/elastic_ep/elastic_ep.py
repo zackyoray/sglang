@@ -19,6 +19,8 @@ class ElasticEPState:
     active_ranks: Optional[torch.Tensor]
     last_active_ranks: Optional[torch.Tensor]
     active_ranks_cpu: Optional[torch.Tensor]
+    effective_ep_size: int = 0
+    original_ep_size: int = 0
 
     def is_active_equal_last(self) -> bool:
         return torch.equal(self.active_ranks, self.last_active_ranks)
@@ -52,7 +54,10 @@ class ElasticEPStateManager:
 
         if server_args.elastic_ep_backend is not None:
             cls._instance = cls._build_state(ep_size=None, device=None)
-            if server_args.elastic_ep_rejoin:
+            ep_size = torch.distributed.get_world_size()
+            cls._instance.effective_ep_size = ep_size
+            cls._instance.original_ep_size = ep_size
+            if server_args.ep_join_mode in ("scale", "recover"):
                 # Mask out peer ranks to perform cuda graph capture on its own
                 cls._instance.active_ranks.zero_()
                 cls._instance.active_ranks[torch.distributed.get_rank()] = 1
@@ -89,6 +94,28 @@ class ElasticEPStateManager:
         dev = device if device is not None else cls._select_device()
 
         return torch.ones(size, dtype=torch.int32, device=dev)
+
+
+    @classmethod
+    def set_effective_ep_size(cls, n: int) -> None:
+        inst = cls._instance
+        if inst is not None:
+            inst.effective_ep_size = n
+
+    @classmethod
+    def get_effective_ep_size(cls) -> int:
+        inst = cls._instance
+        if inst is None:
+            return 0
+        return inst.effective_ep_size
+
+    @classmethod
+    def is_recovery_join(cls, rank_ids: List[int]) -> bool:
+        """True if any joining rank was previously part of the original world."""
+        inst = cls._instance
+        if inst is None:
+            return False
+        return any(r < inst.original_ep_size for r in rank_ids)
 
 
 # ---------------------------------------------------------------------------

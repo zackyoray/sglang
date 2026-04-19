@@ -552,7 +552,7 @@ class ServerArgs:
     elastic_ep_backend: Literal[None, "mooncake", "nixl"] = None
     enable_elastic_expert_backup: bool = False
     mooncake_ib_device: Optional[str] = None
-    elastic_ep_rejoin: bool = False
+    ep_join_mode: Optional[Literal["scale", "recover"]] = None
 
     # Mamba cache
     max_mamba_cache_size: Optional[int] = None
@@ -2987,10 +2987,10 @@ class ServerArgs:
                 self.mooncake_ib_device = self._validate_ib_devices(
                     self.mooncake_ib_device
                 )
-        if self.elastic_ep_rejoin:
+        if self.ep_join_mode is not None:
             assert (
                 self.elastic_ep_backend is not None
-            ), "Elastic EP rejoin requires elastic_ep_backend to be set."
+            ), "--ep-join-mode requires --elastic-ep-backend to be set."
 
     def _handle_expert_distribution_metrics(self):
         if self.enable_expert_distribution_metrics and (
@@ -5426,10 +5426,13 @@ class ServerArgs:
             "Default is None, which triggers automatic device detection when Mooncake Backend is enabled.",
         )
         parser.add_argument(
-            "--elastic-ep-rejoin",
-            action="store_true",
-            default=ServerArgs.elastic_ep_rejoin,
-            help="Indicates that this process is a relaunched elastic EP rank that should rejoin an existing process group.",
+            "--ep-join-mode",
+            type=str,
+            default=None,
+            choices=["scale", "recover"],
+            help="Join mode for elastic EP. 'recover' rejoins an existing slot after a fault "
+            "(replaces --elastic-ep-rejoin from PR #15771). 'scale' joins as a brand-new "
+            "rank beyond the original group size.",
         )
 
         # Mamba Cache
