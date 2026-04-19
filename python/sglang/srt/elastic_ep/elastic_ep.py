@@ -35,7 +35,10 @@ class ElasticEPState:
 
     def reset(self):
         if self.active_ranks is not None:
-            self.active_ranks.fill_(1)
+            # Only mark the in-window slots active; reserved scale-up slots
+            # beyond effective_ep_size stay 0 until those ranks join.
+            self.active_ranks.zero_()
+            self.active_ranks[: self.effective_ep_size] = 1
             self.snapshot_active_to_last()
             self.sync_active_to_cpu()
 
@@ -55,8 +58,11 @@ class ElasticEPStateManager:
 
         if server_args.elastic_ep_backend is not None:
             world_size = torch.distributed.get_world_size()
-            # Pre-allocate active_ranks to max_ep_size so scale-up can flip
-            # bits beyond the launch-time world without resizing the tensor.
+            # Pre-allocate to max_ep_size so EPLB and is_scaling() can index
+            # reserved slots without ever resizing the tensor (resize would
+            # race with concurrent readers in the dispatcher / EPLB path).
+            # Slots [world_size:] start at 0 (unjoined). reset() preserves
+            # this layout by only filling [:effective_ep_size] with 1.
             tensor_size = server_args.max_ep_size or world_size
             assert tensor_size >= world_size, (
                 f"--max-ep-size ({tensor_size}) must be >= world_size ({world_size})."
@@ -64,11 +70,6 @@ class ElasticEPStateManager:
             cls._instance = cls._build_state(ep_size=tensor_size, device=None)
             cls._instance.effective_ep_size = world_size
             cls._instance.original_ep_size = world_size
-
-            # Slots beyond the launch-time world are reserved for scale-up;
-            # they are NOT active yet. is_scaling() and the poll loop in
-            # maybe_join_ep_ranks distinguish active (1) from unjoined (0)
-            # within the [0, effective_ep_size) window.
             if tensor_size > world_size:
                 cls._instance.active_ranks[world_size:].zero_()
                 cls._instance.snapshot_active_to_last()
@@ -168,14 +169,18 @@ class ElasticEPStateManager:
     def is_scaling(cls) -> bool:
         """True iff there are unjoined ranks within the current poll window.
 
-        Computed on demand from active_ranks vs effective_ep_size so it stays
-        consistent without an explicit state-machine flag. Equivalent to
-        "the scheduler asked for N slots but fewer than N have joined yet".
+        active_ranks is pre-allocated to max_ep_size with reserved slots
+        starting at 0. After /scale_elastic_ep bumps effective_ep_size,
+        the reserved slots fall inside the poll window but stay 0 until
+        the new ranks complete join. The same expression also flips True
+        on a fault inside the window (an active slot drops to 0).
         """
         inst = cls._instance
         if inst is None or inst.active_ranks is None:
             return False
-        active_count = int(inst.active_ranks[: inst.effective_ep_size].sum().item())
+        active_count = int(
+            inst.active_ranks[: inst.effective_ep_size].sum().item()
+        )
         return active_count < inst.effective_ep_size
 
 
