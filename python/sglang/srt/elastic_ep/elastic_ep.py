@@ -169,14 +169,6 @@ class ElasticEPStateManager:
         active_count = int(inst.active_ranks[: inst.effective_ep_size].sum().item())
         return active_count < inst.effective_ep_size
 
-    @classmethod
-    def get_max_ep_size(cls) -> int:
-        """Upper bound for new_ep_size in scale requests."""
-        inst = cls._instance
-        if inst is None or inst.active_ranks is None:
-            return 0
-        return int(inst.active_ranks.numel())
-
 
 # ---------------------------------------------------------------------------
 # Helpers for elastic EP recovery

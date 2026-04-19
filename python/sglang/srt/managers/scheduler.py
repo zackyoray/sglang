@@ -3484,7 +3484,7 @@ class Scheduler(
 
         old_ep_size = ElasticEPStateManager.get_effective_ep_size()
         new_ep_size = recv_req.new_ep_size
-        max_ep_size = ElasticEPStateManager.get_max_ep_size()
+        max_ep_size = self.server_args.max_ep_size or old_ep_size
 
         # Validate before touching the backend.
         if new_ep_size <= old_ep_size:
@@ -3497,7 +3497,7 @@ class Scheduler(
                 old_ep_size=old_ep_size,
                 new_ep_size=new_ep_size,
             )
-        if max_ep_size and new_ep_size > max_ep_size:
+        if new_ep_size > max_ep_size:
             return ScaleElasticEPReqOutput(
                 success=False,
                 message=(
