@@ -125,6 +125,8 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     PauseGenerationReqInput,
     ProfileReq,
+    ScaleElasticEPReqInput,
+    ScaleElasticEPReqOutput,
     ReleaseMemoryOccupationReqInput,
     RemoveExternalCorpusReqInput,
     RemoveExternalCorpusReqOutput,
@@ -1325,6 +1327,7 @@ class Scheduler(
                 (GetLoadsReqInput, self.get_loads),
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
+                (ScaleElasticEPReqInput, self.handle_scale_elastic_ep),
                 (DumperControlReqInput, self.handle_dumper_control),
                 (AddExternalCorpusReqInput, self.add_external_corpus),
                 (
@@ -3468,6 +3471,41 @@ class Scheduler(
 
     def continue_generation(self, recv_req: ContinueGenerationReqInput):
         self._engine_paused = False
+
+    def handle_scale_elastic_ep(
+        self, recv_req: ScaleElasticEPReqInput
+    ) -> ScaleElasticEPReqOutput:
+        """Handle elastic EP scaling: extend PG + set effective_ep_size."""
+        from sglang.srt.elastic_ep.elastic_ep import (
+            ElasticEPStateManager,
+            _get_process_group_backend,
+            _iter_live_parallel_groups,
+        )
+
+        try:
+            from mooncake import ep as mooncake_ep
+
+            old_ep_size = ElasticEPStateManager.get_effective_ep_size()
+            new_ep_size = recv_req.new_tp_size
+
+            for group in _iter_live_parallel_groups():
+                backend = _get_process_group_backend(group.device_group, "cuda")
+                mooncake_ep.extend_group_size_to(backend, new_ep_size)
+
+            ElasticEPStateManager.set_effective_ep_size(new_ep_size)
+
+            return ScaleElasticEPReqOutput(
+                success=True,
+                message=f"Scaling initiated from {old_ep_size} to {new_ep_size}",
+                old_tp_size=old_ep_size,
+                new_tp_size=new_ep_size,
+            )
+        except Exception as e:
+            logger.error("[Elastic EP] Scale failed: %s", e)
+            return ScaleElasticEPReqOutput(
+                success=False,
+                message=str(e),
+            )
 
     def load_lora_adapter(
         self, recv_req: LoadLoRAAdapterReqInput

@@ -418,6 +418,10 @@ from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
 
 app.include_router(v1_loads_router)
 
+from sglang.srt.entrypoints.elastic_ep import router as elastic_ep_router
+
+app.include_router(elastic_ep_router)
+
 
 @app.exception_handler(HTTPException)
 async def validation_exception_handler(request: Request, exc: HTTPException):

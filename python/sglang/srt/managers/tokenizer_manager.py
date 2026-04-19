@@ -51,6 +51,8 @@ from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
     BatchEmbeddingOutput,
+    ScaleElasticEPReqInput,
+    ScaleElasticEPReqOutput,
     BatchStrOutput,
     BatchTokenIDOutput,
     BatchTokenizedEmbeddingReqInput,
@@ -505,6 +507,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 # For handling case when scheduler skips detokenizer and forwards back to the tokenizer manager, we ignore it.
                 (HealthCheckOutput, lambda x: None),
                 (ActiveRanksOutput, self.update_active_ranks),
+                (
+                    ScaleElasticEPReqOutput,
+                    self._handle_scale_elastic_ep_output,
+                ),
             ]
         )
         self.init_communicators(self.server_args)
@@ -2358,6 +2364,19 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
 
     def update_active_ranks(self, ranks: ActiveRanksOutput):
         self.send_to_scheduler.send_pyobj(ranks)
+
+    async def scale_elastic_ep(
+        self, obj: ScaleElasticEPReqInput
+    ) -> ScaleElasticEPReqOutput:
+        """Send scaling request to scheduler and wait for result."""
+        self.auto_create_handle_loop()
+        await self.send_to_scheduler.send_pyobj(obj)
+        self._scale_elastic_ep_future = asyncio.Future()
+        return await self._scale_elastic_ep_future
+
+    def _handle_scale_elastic_ep_output(self, recv_obj: ScaleElasticEPReqOutput):
+        if hasattr(self, "_scale_elastic_ep_future"):
+            self._scale_elastic_ep_future.set_result(recv_obj)
 
     def _handle_open_session_req_output(self, recv_obj):
         future = self.session_futures.get(recv_obj.session_id)

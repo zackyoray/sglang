@@ -1609,6 +1609,21 @@ class ActiveRanksOutput(BaseReq):
 
 
 @dataclass
+class ScaleElasticEPReqInput(BaseReq):
+    """Request to scale EP by changing the effective EP size (dp_attention mode)."""
+
+    new_tp_size: int
+
+
+@dataclass
+class ScaleElasticEPReqOutput(BaseReq):
+    success: bool
+    message: str
+    old_tp_size: int = 0
+    new_tp_size: int = 0
+
+
+@dataclass
 class GetInternalStateReq(BaseReq):
     pass
 
