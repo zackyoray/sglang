@@ -497,10 +497,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
             )
             if self.server_args.ep_join_mode == "recover":
-                # Recovery: restore all active_ranks to 1 (original world)
+                # Recovery: the original world is healthy. Mark all peers
+                # active so cuda graphs and routing immediately resume the
+                # full topology after rejoin.
                 ElasticEPStateManager.instance().reset()
-            # Scale: active_ranks is set by the state published via
-            # recover_ranks from existing ranks — don't reset to all-1s.
+            # Scale: do NOT reset to all-1s. The new rank's active_ranks is
+            # seeded by the sync state that mooncake_pg.join_group() reads
+            # from existing ranks (which previously published it via
+            # recover_ranks inside activate_ranks). Resetting here would
+            # mask out genuinely-pending ranks that have not joined yet.
 
         if self.is_multimodal:
             sanity_check_mm_pad_shift_value(self.model_config.vocab_size)
