@@ -553,6 +553,8 @@ class ServerArgs:
     enable_elastic_expert_backup: bool = False
     mooncake_ib_device: Optional[str] = None
     ep_join_mode: Optional[Literal["scale", "recover"]] = None
+    max_ep_size: Optional[int] = None
+    elastic_ep_rejoin: bool = False
 
     # Mamba cache
     max_mamba_cache_size: Optional[int] = None
@@ -2974,6 +2976,17 @@ class ServerArgs:
             assert self.ep_size > 1
 
     def _handle_elastic_ep(self):
+        if self.elastic_ep_rejoin:
+            if self.ep_join_mode is None:
+                logger.warning(
+                    "--elastic-ep-rejoin is deprecated, use --ep-join-mode recover instead."
+                )
+                self.ep_join_mode = "recover"
+            else:
+                assert self.ep_join_mode == "recover", (
+                    "--elastic-ep-rejoin (deprecated) conflicts with "
+                    f"--ep-join-mode {self.ep_join_mode}."
+                )
         if self.elastic_ep_backend is not None:
             if self.enable_eplb:
                 if self.eplb_algorithm == "auto":
@@ -2991,6 +3004,11 @@ class ServerArgs:
             assert (
                 self.elastic_ep_backend is not None
             ), "--ep-join-mode requires --elastic-ep-backend to be set."
+        if self.max_ep_size is not None:
+            assert (
+                self.elastic_ep_backend is not None
+            ), "--max-ep-size requires --elastic-ep-backend to be set."
+            assert self.max_ep_size > 0, "--max-ep-size must be a positive integer."
 
     def _handle_expert_distribution_metrics(self):
         if self.enable_expert_distribution_metrics and (
@@ -5433,6 +5451,21 @@ class ServerArgs:
             help="Join mode for elastic EP. 'recover' rejoins an existing slot after a fault "
             "(replaces --elastic-ep-rejoin from PR #15771). 'scale' joins as a brand-new "
             "rank beyond the original group size.",
+        )
+        parser.add_argument(
+            "--elastic-ep-rejoin",
+            action="store_true",
+            default=False,
+            help="[Deprecated] Alias for --ep-join-mode recover. Will be removed in a "
+            "future release.",
+        )
+        parser.add_argument(
+            "--max-ep-size",
+            type=int,
+            default=ServerArgs.max_ep_size,
+            help="Maximum EP size the server can scale to at runtime. Pre-allocates "
+            "active_ranks tensor and backend buffers to this size. Defaults to the "
+            "launch-time world size (no scale headroom).",
         )
 
         # Mamba Cache

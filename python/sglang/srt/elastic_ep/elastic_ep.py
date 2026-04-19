@@ -54,10 +54,16 @@ class ElasticEPStateManager:
             return cls._instance
 
         if server_args.elastic_ep_backend is not None:
-            cls._instance = cls._build_state(ep_size=None, device=None)
-            ep_size = torch.distributed.get_world_size()
-            cls._instance.effective_ep_size = ep_size
-            cls._instance.original_ep_size = ep_size
+            world_size = torch.distributed.get_world_size()
+            # Pre-allocate active_ranks to max_ep_size so scale-up can flip
+            # bits beyond the launch-time world without resizing the tensor.
+            tensor_size = server_args.max_ep_size or world_size
+            assert tensor_size >= world_size, (
+                f"--max-ep-size ({tensor_size}) must be >= world_size ({world_size})."
+            )
+            cls._instance = cls._build_state(ep_size=tensor_size, device=None)
+            cls._instance.effective_ep_size = world_size
+            cls._instance.original_ep_size = world_size
 
             backend = server_args.elastic_ep_backend
             if backend == "nixl":
