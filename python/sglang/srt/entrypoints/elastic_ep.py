@@ -52,8 +52,15 @@ async def scale_elastic_ep(raw_request: Request):
 
 @router.post("/is_scaling_elastic_ep")
 async def is_scaling_elastic_ep(raw_request: Request):
-    from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+    """Query each DP scheduler for its scaling state and OR the results.
 
-    return ORJSONResponse(
-        {"is_scaling_elastic_ep": ElasticEPStateManager.is_scaling()}
-    )
+    The HTTP server runs in the TokenizerManager process which does NOT
+    initialize ElasticEPStateManager (that lives in the scheduler / model
+    worker). We therefore round-trip through the existing get_internal_state
+    pipeline, which returns one dict per DP rank.
+    """
+    from sglang.srt.entrypoints.http_server import _global_state
+
+    states = await _global_state.tokenizer_manager.get_internal_state()
+    is_scaling = any(s.get("is_scaling_elastic_ep", False) for s in states)
+    return ORJSONResponse({"is_scaling_elastic_ep": is_scaling})

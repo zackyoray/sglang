@@ -507,10 +507,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 # For handling case when scheduler skips detokenizer and forwards back to the tokenizer manager, we ignore it.
                 (HealthCheckOutput, lambda x: None),
                 (ActiveRanksOutput, self.update_active_ranks),
-                (
-                    ScaleElasticEPReqOutput,
-                    self._handle_scale_elastic_ep_output,
-                ),
             ]
         )
         self.init_communicators(self.server_args)
@@ -2368,24 +2364,22 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
     async def scale_elastic_ep(
         self, obj: ScaleElasticEPReqInput
     ) -> ScaleElasticEPReqOutput:
-        """Send scaling request to scheduler and wait for result.
+        """Send scaling request to scheduler and aggregate per-DP responses.
 
-        NOTE: single-flight — concurrent calls will clobber the pending future.
-        Callers should serialize scale requests at the orchestrator level, and
-        the scheduler also rejects overlapping scales via is_scaling() guard.
+        Uses the standard _Communicator pattern so all DP schedulers get the
+        request and we wait for all responses. Aggregation rule: if any
+        scheduler reports failure, the call fails with that scheduler's
+        message (validation guards run identically on every scheduler so
+        all should agree).
         """
         self.auto_create_handle_loop()
-        await self.send_to_scheduler.send_pyobj(obj)
-        self._scale_elastic_ep_future = asyncio.Future()
-        return await self._scale_elastic_ep_future
-
-    def _handle_scale_elastic_ep_output(self, recv_obj: ScaleElasticEPReqOutput):
-        # In dp_attention deployments every DP scheduler echoes its own
-        # response, so this handler can fire multiple times per scale call.
-        # Only the first callback resolves the future; the rest are dropped.
-        future = getattr(self, "_scale_elastic_ep_future", None)
-        if future is not None and not future.done():
-            future.set_result(recv_obj)
+        responses: List[ScaleElasticEPReqOutput] = (
+            await self.scale_elastic_ep_communicator(obj)
+        )
+        for res in responses:
+            if not res.success:
+                return res
+        return responses[0]
 
     def _handle_open_session_req_output(self, recv_obj):
         future = self.session_futures.get(recv_obj.session_id)

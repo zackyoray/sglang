@@ -71,6 +71,8 @@ from sglang.srt.managers.io_struct import (
     RemoveExternalCorpusReqOutput,
     ResumeMemoryOccupationReqInput,
     ResumeMemoryOccupationReqOutput,
+    ScaleElasticEPReqInput,
+    ScaleElasticEPReqOutput,
     SendWeightsToRemoteInstanceReqInput,
     SendWeightsToRemoteInstanceReqOutput,
     SetInternalStateReq,
@@ -256,6 +258,9 @@ class TokenizerCommunicatorMixin:
         self.dumper_control_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.scale_elastic_ep_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
 
         self._result_dispatcher += self._get_communicator_dispatcher()
 
@@ -369,6 +374,10 @@ class TokenizerCommunicatorMixin:
                 (
                     DumperControlReqOutput,
                     self.dumper_control_communicator.handle_recv,
+                ),
+                (
+                    ScaleElasticEPReqOutput,
+                    self.scale_elastic_ep_communicator.handle_recv,
                 ),
             ]
         )

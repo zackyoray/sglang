@@ -3240,6 +3240,12 @@ class Scheduler(
         }
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
 
+        if self.server_args.elastic_ep_backend is not None:
+            from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+
+            ret["is_scaling_elastic_ep"] = ElasticEPStateManager.is_scaling()
+            ret["effective_ep_size"] = ElasticEPStateManager.get_effective_ep_size()
+
         if not self.spec_algorithm.is_none() and self.spec_total_num_forward_ct > 0:
             ret["avg_spec_accept_length"] = (
                 self.spec_total_num_accepted_tokens / self.spec_total_num_forward_ct
