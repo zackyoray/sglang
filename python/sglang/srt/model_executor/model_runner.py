@@ -496,7 +496,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     invoked_in_ep_join_path=True
                 )
             )
-            ElasticEPStateManager.instance().reset()
+            if self.server_args.ep_join_mode == "recover":
+                # Recovery: restore all active_ranks to 1 (original world)
+                ElasticEPStateManager.instance().reset()
+            # Scale: active_ranks is set by the state published via
+            # recover_ranks from existing ranks — don't reset to all-1s.
 
         if self.is_multimodal:
             sanity_check_mm_pad_shift_value(self.model_config.vocab_size)
