@@ -1480,13 +1480,28 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # ranks must call it. See RFC open questions re: rank agreement.
         if ranks_to_join and try_recover_ranks(ranks_to_join):
             self.forward_pass_id = 0
-            self.eplb_manager.reset_generator()
+
             broadcast_global_expert_location_metadata(
                 src_rank=self._get_healthy_expert_location_src_rank(
                     invoked_in_ep_join_path=False
                 )
             )
-            ElasticEPStateManager.instance().reset()
+
+            if ElasticEPStateManager.is_recovery_join(ranks_to_join):
+                # Recovery: skip EPLB rebalance due to stale metadata (PR #15771).
+                self.eplb_manager.reset_generator()
+                ElasticEPStateManager.instance().reset()
+            # Scale-up: EPLB fires automatically on active_ranks change.
+
+            # Trigger NIXL buffer connections. Must come AFTER activate_ranks
+            # (which is inside try_recover_ranks) so new ranks are unblocked
+            # and can publish their buffer metadata on first dispatch.
+            if ElasticEPStateManager._on_scale is not None:
+                effective_size = ElasticEPStateManager.get_effective_ep_size()
+                ElasticEPStateManager._on_scale(0, effective_size)
+
+            ElasticEPStateManager.instance().snapshot_active_to_last()
+            ElasticEPStateManager.instance().sync_active_to_cpu()
 
             broadcast_pyobj(
                 [self.server_args.random_seed],

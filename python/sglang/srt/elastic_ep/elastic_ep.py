@@ -42,6 +42,7 @@ class ElasticEPState:
 
 class ElasticEPStateManager:
     _instance: Optional[ElasticEPState] = None
+    _on_scale: Optional[callable] = None
 
     @classmethod
     def instance(cls) -> ElasticEPState:
@@ -57,6 +58,13 @@ class ElasticEPStateManager:
             ep_size = torch.distributed.get_world_size()
             cls._instance.effective_ep_size = ep_size
             cls._instance.original_ep_size = ep_size
+
+            backend = server_args.elastic_ep_backend
+            if backend == "nixl":
+                cls._on_scale = cls._on_scale_nixl
+            elif backend == "mooncake":
+                cls._on_scale = cls._on_scale_mooncake
+
             if server_args.ep_join_mode in ("scale", "recover"):
                 # Mask out peer ranks to perform cuda graph capture on its own
                 cls._instance.active_ranks.zero_()
@@ -108,6 +116,16 @@ class ElasticEPStateManager:
         if inst is None:
             return 0
         return inst.effective_ep_size
+
+    @staticmethod
+    def _on_scale_nixl(from_ep_size: int, to_ep_size: int) -> None:
+        from sglang.srt.layers.moe.token_dispatcher.nixl import NixlEPBuffer
+
+        NixlEPBuffer.on_scale(from_ep_size, to_ep_size)
+
+    @staticmethod
+    def _on_scale_mooncake(from_ep_size: int, to_ep_size: int) -> None:
+        logger.warning("[Elastic EP] Mooncake on_scale not yet implemented")
 
     @classmethod
     def is_recovery_join(cls, rank_ids: List[int]) -> bool:
