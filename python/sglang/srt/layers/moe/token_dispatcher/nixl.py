@@ -63,21 +63,37 @@ class NixlEPBuffer:
         cls._num_experts = num_experts
         cls._num_local_experts = num_local_experts
 
+        rank = dist.get_rank(group)
+        world_size = dist.get_world_size(group)
+
+        # For elastic EP, NIXL needs to allocate buffers for the maximum EP
+        # size up front because update_memory_buffers cannot resize at
+        # runtime. Following vLLM's approach (NixlEPAll2AllManager._init_buffer
+        # in vllm/distributed/device_communicators/all2all.py), we keep
+        # num_experts_per_rank fixed and grow num_experts to match the
+        # max-sized rank table:
+        #     max_num_global_experts = max_ep_size * num_experts_per_rank
+        # so the invariant num_ranks * num_experts_per_rank == num_experts
+        # holds at the NIXL layer regardless of how many ranks are live.
+        # On scale-up, new ranks claim their num_experts_per_rank slice from
+        # the already-allocated pool and connect via _update_connections.
+        from sglang.srt.server_args import get_global_server_args
+
+        max_ep_size = get_global_server_args().max_ep_size or world_size
+
         num_rdma_bytes = 0
         if deepep_mode.enable_normal():
             raise NotImplementedError("Normal mode is not supported for Nixl EP yet.")
         if deepep_mode.enable_low_latency():
             assert num_max_dispatch_tokens_per_rank != -1
             assert num_experts != -1 and num_experts % group.size() == 0
+            max_num_global_experts = max_ep_size * num_local_experts
             num_rdma_bytes = Buffer.get_rdma_size_hint(
                 num_max_dispatch_tokens_per_rank,
                 hidden_size,
-                group.size(),
-                num_experts,
+                max_ep_size,
+                max_num_global_experts,
             )
-
-        rank = dist.get_rank(group)
-        world_size = dist.get_world_size(group)
 
         # Get the global TCPStore for coordination
         tcp_store = get_global_tcp_store()
@@ -88,8 +104,9 @@ class NixlEPBuffer:
             )
 
         logger.info(
-            f"Using NIXL EP (world_size={world_size}, rank={rank}, "
-            f"num_experts={cls._num_experts}, num_experts_per_rank={cls._num_local_experts}) "
+            f"Using NIXL EP (world_size={world_size}, max_ep_size={max_ep_size}, "
+            f"rank={rank}, num_experts={cls._num_experts}, "
+            f"num_experts_per_rank={cls._num_local_experts}) "
         )
 
         cls._buffer = Buffer(
@@ -98,12 +115,16 @@ class NixlEPBuffer:
         )
 
         cls._buffer.update_memory_buffers(
-            num_ranks=world_size,
+            num_ranks=max_ep_size,
             num_experts_per_rank=cls._num_local_experts,
             num_rdma_bytes=num_rdma_bytes,
         )
-        all_ranks = list(range(world_size))
-        cls._buffer.connect_ranks(all_ranks)
+        # Connect only the currently-live ranks; the remaining max_ep_size -
+        # world_size slots are pre-allocated but unconnected. on_scale (in a
+        # follow-up PR) will call connect_ranks(range(world_size, new_ep_size))
+        # to bring scale-up ranks online.
+        live_ranks = list(range(world_size))
+        cls._buffer.connect_ranks(live_ranks)
 
         return cls._buffer
 
