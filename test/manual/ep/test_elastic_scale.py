@@ -140,28 +140,28 @@ class TestElasticScaleServerLaunch(CustomTestCase):
     "puts Mooncake PG into an unstable state where getTransferStatus hits "
     "an internal assertion on 'empty' transfer tasks to the phantom ranks. "
     "The full scale-up flow requires the new ranks to be launched with "
-    "--ep-join-mode scale -- exercised manually per the procedure below, "
-    "not from a single-process pytest."
+    "--ep-join-mode scale -- exercised by run_elastic_scale_up.sh, not "
+    "from a single-process pytest (mirrors PR #15771's Accuracy Tests style)."
 )
 class TestElasticScaleInProgress(CustomTestCase):
     """Full scale-up flow. Requires new ranks to be launched externally.
 
-    Manual end-to-end procedure:
+    Run the standalone script instead of pytest:
 
-        # Terminal A (initial 4 ranks):
-        CUDA_VISIBLE_DEVICES=0,1,2,3 sglang serve <model> \\
-            --tp 4 --dp 4 --enable-dp-attention --max-ep-size 8 \\
-            --elastic-ep-backend mooncake --moe-a2a-backend nixl ...
-        # Terminal B (launch the 4 new ranks BEFORE the scale request):
-        CUDA_VISIBLE_DEVICES=4,5,6,7 sglang serve <model> \\
-            --tp 4 --dp 4 --enable-dp-attention --max-ep-size 8 \\
-            --elastic-ep-backend mooncake --moe-a2a-backend nixl \\
-            --ep-join-mode scale --node-rank 1 ...
-        # Terminal C (kick off the scale once ranks 4..7 are ready):
-        curl -X POST http://127.0.0.1:30000/scale_elastic_ep \\
-             -d '{"new_ep_size": 8}'
-        # Verify on Terminal A: is_scaling flips True briefly then False,
-        # EPLB rebalance log line appears, gsm8k still passes.
+        test/manual/ep/run_elastic_scale_up.sh
+
+    The script:
+      1. launches primary 4-rank cluster on GPUs 0..3 (--node-rank 0),
+      2. launches joining 4-rank group on GPUs 4..7 (--node-rank 1
+         --ep-join-mode scale) that waits in the poll loop,
+      3. POSTs /scale_elastic_ep {"new_ep_size": 8} to the primary,
+      4. verifies /is_scaling_elastic_ep flips True -> False,
+      5. confirms "joined ranks [...] done" appears in the primary log,
+      6. runs a post-scale /generate sanity check.
+
+    This mirrors PR #15771's recovery Accuracy Tests procedure: the
+    multi-process coordination isn't a fit for a single-process pytest,
+    so we document it as a shell-driven procedure.
     """
 
     pass
