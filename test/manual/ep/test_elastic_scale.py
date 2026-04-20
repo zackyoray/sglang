@@ -1,34 +1,36 @@
 """
-Manual smoke test for elastic EP scale-up control plane.
+Manual tests for elastic EP scale-up.
 
-Usage (4 GPUs initial, scale headroom to 8):
+Two test classes:
 
+  TestElasticScaleServerLaunch
+    4-GPU server, validates the HTTP endpoints exist and reject malformed
+    / scale-down / over-max requests. Pure control-plane; does NOT exercise
+    a real scale (no joining ranks are launched).
+
+  TestElasticScaleUpEndToEnd
+    8-GPU full scale-up. Launches primary (node-rank 0, GPUs 0..3) and
+    joining group (node-rank 1 with --ep-join-mode scale, GPUs 4..7) in
+    parallel so torch's init_process_group rendezvous completes. After
+    both are up, POSTs /scale_elastic_ep and verifies is_scaling flips
+    True -> False and post-scale inference works.
+
+Run with:
+
+  # Control plane only (needs 4 GPUs):
   CUDA_VISIBLE_DEVICES=0,1,2,3 python -m pytest \\
-      test/manual/ep/test_elastic_scale.py -v -s
+      test/manual/ep/test_elastic_scale.py::TestElasticScaleServerLaunch \\
+      -v -s
 
-This test launches a 4-GPU server with --max-ep-size 8 and verifies:
-  * the /is_scaling_elastic_ep and /scale_elastic_ep endpoints are
-    mounted and reachable;
-  * HTTP-layer input validation rejects malformed bodies;
-  * scheduler-layer validation rejects scale-down and over-max requests.
-
-What we do NOT cover here (would require launching 4 new processes with
---ep-join-mode scale on additional GPUs, which Mooncake PG doesn't tolerate
-if you call extend_group_size_to without the new ranks being up -- the
-transfer engine aborts with a slice_count assertion on phantom transfers):
-  * the actual /scale_elastic_ep POST succeeding end-to-end;
-  * new ranks joining (active_ranks[4..7] flipping to 1);
-  * EPLB rebalance to the new ranks;
-  * NIXL connect_ranks to the new ranks;
-  * post-scale inference correctness on the larger group.
-
-See TestElasticScaleInProgress below for the manual end-to-end procedure.
+  # Full scale-up (needs 8 GPUs):
+  CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python -m pytest \\
+      test/manual/ep/test_elastic_scale.py::TestElasticScaleUpEndToEnd \\
+      -v -s
 """
 
 import os
 import time
 import unittest
-from types import SimpleNamespace
 
 import requests
 
@@ -39,6 +41,8 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    _launch_server_process,
+    _wait_for_server_health,
     popen_launch_server,
 )
 
@@ -135,36 +139,201 @@ class TestElasticScaleServerLaunch(CustomTestCase):
         self.assertIn("max-ep-size", response.json().get("error", ""))
 
 
-@unittest.skip(
-    "Committing extend_group_size_to without new ranks actually being up "
-    "puts Mooncake PG into an unstable state where getTransferStatus hits "
-    "an internal assertion on 'empty' transfer tasks to the phantom ranks. "
-    "The full scale-up flow requires the new ranks to be launched with "
-    "--ep-join-mode scale -- exercised by run_elastic_scale_up.sh, not "
-    "from a single-process pytest (mirrors PR #15771's Accuracy Tests style)."
+def _count_visible_gpus() -> int:
+    """Return the number of CUDA devices visible to this process."""
+    env = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if env:
+        return len([x for x in env.split(",") if x.strip()])
+    try:
+        import torch
+
+        return torch.cuda.device_count() if torch.cuda.is_available() else 0
+    except Exception:
+        return 0
+
+
+TP_PER_NODE = 4
+TOTAL_EP_SIZE = TP_PER_NODE * 2  # 8
+DIST_INIT_ADDR = os.environ.get("SGLANG_ELASTIC_SCALE_DIST_INIT", "127.0.0.1:24555")
+PORT_A = int(os.environ.get("SGLANG_ELASTIC_SCALE_PORT_A", "21000"))
+PORT_B = int(os.environ.get("SGLANG_ELASTIC_SCALE_PORT_B", "21001"))
+BASE_URL_A = f"http://127.0.0.1:{PORT_A}"
+BASE_URL_B = f"http://127.0.0.1:{PORT_B}"
+
+
+def _scale_up_common_args() -> list[str]:
+    """CLI args shared by both node-rank 0 and node-rank 1 in the scale test."""
+    return [
+        "--trust-remote-code",
+        "--moe-a2a-backend",
+        "nixl",
+        "--deepep-mode",
+        "low_latency",
+        "--tp",
+        str(TP_PER_NODE),
+        "--dp",
+        str(TP_PER_NODE),
+        "--enable-dp-attention",
+        "--elastic-ep-backend",
+        "mooncake",
+        "--mooncake-ib-device",
+        ib_devices,
+        "--enable-eplb",
+        "--ep-num-redundant-experts",
+        "24",
+        "--max-ep-size",
+        str(TOTAL_EP_SIZE),
+        "--mem-fraction-static",
+        "0.5",
+        "--nnodes",
+        "2",
+        "--dist-init-addr",
+        DIST_INIT_ADDR,
+    ]
+
+
+@unittest.skipUnless(
+    _count_visible_gpus() >= TOTAL_EP_SIZE,
+    f"Full scale-up E2E needs {TOTAL_EP_SIZE} GPUs "
+    f"(primary {TP_PER_NODE} + joining {TP_PER_NODE}).",
 )
-class TestElasticScaleInProgress(CustomTestCase):
-    """Full scale-up flow. Requires new ranks to be launched externally.
+class TestElasticScaleUpEndToEnd(CustomTestCase):
+    """End-to-end scale-up with real joining ranks.
 
-    Run the standalone script instead of pytest:
+    Launches primary (node-rank 0, GPUs 0..TP_PER_NODE-1) and joining group
+    (node-rank 1, GPUs TP_PER_NODE..TOTAL_EP_SIZE-1 with --ep-join-mode scale)
+    in PARALLEL. Parallel launch is required because torch's
+    init_process_group rendezvous expects all --nnodes to participate before
+    either process returns; waiting for primary's health before launching the
+    joining group deadlocks.
 
-        test/manual/ep/run_elastic_scale_up.sh
-
-    The script:
-      1. launches primary 4-rank cluster on GPUs 0..3 (--node-rank 0),
-      2. launches joining 4-rank group on GPUs 4..7 (--node-rank 1
-         --ep-join-mode scale) that waits in the poll loop,
-      3. POSTs /scale_elastic_ep {"new_ep_size": 8} to the primary,
-      4. verifies /is_scaling_elastic_ep flips True -> False,
-      5. confirms "joined ranks [...] done" appears in the primary log,
-      6. runs a post-scale /generate sanity check.
-
-    This mirrors PR #15771's recovery Accuracy Tests procedure: the
-    multi-process coordination isn't a fit for a single-process pytest,
-    so we document it as a shell-driven procedure.
+    The joining group stays HTTP-unhealthy until /scale_elastic_ep is POSTed
+    to the primary and the poll loop completes its join. We therefore wait
+    only for the primary's /health_generate; the joining group is launched
+    as a bare subprocess without a health check.
     """
 
-    pass
+    @classmethod
+    def setUpClass(cls):
+        cls.model = TEST_MODEL
+        cls.base_url = BASE_URL_A
+
+        primary_args = _scale_up_common_args() + [
+            "--node-rank",
+            "0",
+        ]
+        joining_args = [
+            "sglang",
+            "serve",
+            "--model-path",
+            cls.model,
+            *_scale_up_common_args(),
+            "--node-rank",
+            "1",
+            "--ep-join-mode",
+            "scale",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(PORT_B),
+            "--device",
+            "cuda",
+        ]
+
+        # Start the joining group first in a background thread so its own
+        # blocking init (model load, cuda graph capture, etc.) runs in
+        # parallel with the primary's launch. It intentionally does NOT
+        # wait for HTTP health -- that only happens after the scale.
+        cls._joining_env = os.environ.copy()
+        cls._joining_env["CUDA_VISIBLE_DEVICES"] = ",".join(
+            str(i) for i in range(TP_PER_NODE, TOTAL_EP_SIZE)
+        )
+        cls._joining_proc = _launch_server_process(
+            joining_args, cls._joining_env, None, cls.model
+        )
+
+        # Launch the primary with popen_launch_server, which handles the
+        # /health_generate wait. By the time the primary finishes torch
+        # init_process_group the joining group will have reached the same
+        # rendezvous, so both unblock together.
+        primary_env = os.environ.copy()
+        primary_env["CUDA_VISIBLE_DEVICES"] = ",".join(
+            str(i) for i in range(TP_PER_NODE)
+        )
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=primary_args,
+            env=primary_env,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        for proc in (getattr(cls, "process", None), getattr(cls, "_joining_proc", None)):
+            if proc is None:
+                continue
+            try:
+                kill_process_tree(proc.pid)
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=15)
+            except Exception:
+                pass
+        time.sleep(2)
+
+    def _post(self, path: str, **kwargs) -> requests.Response:
+        return requests.post(f"{self.base_url}{path}", timeout=60, **kwargs)
+
+    def _is_scaling(self) -> bool:
+        return self._post("/is_scaling_elastic_ep").json()["is_scaling_elastic_ep"]
+
+    def test_scale_up_end_to_end(self):
+        """Full flow: baseline -> POST scale -> wait for join -> verify inference."""
+        # 1. Baseline: primary alone, joining group waiting in poll loop.
+        self.assertFalse(
+            self._is_scaling(), "is_scaling should be False before any scale request"
+        )
+
+        # 2. Trigger the scale.
+        resp = self._post(
+            "/scale_elastic_ep", json={"new_ep_size": TOTAL_EP_SIZE}
+        )
+        self.assertEqual(
+            resp.status_code,
+            200,
+            f"scale request failed: {resp.text}",
+        )
+        body = resp.json()
+        self.assertEqual(body["old_ep_size"], TP_PER_NODE)
+        self.assertEqual(body["new_ep_size"], TOTAL_EP_SIZE)
+
+        # 3. Wait for the join to complete (poll loop flips is_scaling back).
+        join_deadline = time.perf_counter() + 120
+        while time.perf_counter() < join_deadline:
+            if not self._is_scaling():
+                break
+            time.sleep(1)
+        self.assertFalse(
+            self._is_scaling(),
+            "is_scaling never flipped back to False within 120s; "
+            "the joining ranks may have failed to complete join_group",
+        )
+
+        # 4. Post-scale inference sanity check.
+        gen = self._post(
+            "/generate",
+            json={
+                "text": "Hello",
+                "sampling_params": {"max_new_tokens": 8, "temperature": 0.0},
+            },
+        )
+        self.assertEqual(
+            gen.status_code,
+            200,
+            f"post-scale inference failed: {gen.text}",
+        )
 
 
 if __name__ == "__main__":
