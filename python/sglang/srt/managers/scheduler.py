@@ -3536,17 +3536,6 @@ class Scheduler(
             # poll loop in maybe_join_ep_ranks calls _on_scale after the new
             # ranks have published their metadata.
             ElasticEPStateManager.set_effective_ep_size(new_ep_size)
-            # TODO: remove debug log before merge.
-            logger.info(
-                "[Elastic EP][scale] after set_effective_ep_size: "
-                "instance=%s, effective_ep_size=%d, active_ranks=%s",
-                ElasticEPStateManager.instance(),
-                ElasticEPStateManager.get_effective_ep_size(),
-                ElasticEPStateManager.instance().active_ranks.tolist()
-                if ElasticEPStateManager.instance() is not None
-                and ElasticEPStateManager.instance().active_ranks is not None
-                else None,
-            )
 
             return ScaleElasticEPReqOutput(
                 success=True,

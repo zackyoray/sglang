@@ -171,8 +171,16 @@ class _NixlEPDispatcherImplBase:
         # and the logic requires num-tokens-sent-from-one-rank-to-another-rank less than it
         assert self.num_max_dispatch_tokens_per_rank <= 1024
         elastic_state = ElasticEPStateManager.instance()
+        # The manager's active_ranks is pre-allocated to max_ep_size but the
+        # NIXL dispatch / query_mask_buffer only knows about the live world.
+        # Take a shared-storage slice of the first world_size slots so NIXL
+        # only writes there; reserved slots [world_size:] stay untouched
+        # (preserving the 0 init used by is_scaling() and EPLB).
+        world_size = dist.get_world_size(group)
         self.active_ranks = (
-            elastic_state.active_ranks if elastic_state is not None else None
+            elastic_state.active_ranks[:world_size]
+            if elastic_state is not None
+            else None
         )
         self._mask_buffer = (
             torch.zeros_like(self.active_ranks)
