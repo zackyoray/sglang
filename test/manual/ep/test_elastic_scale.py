@@ -32,10 +32,12 @@ import os
 import subprocess
 import time
 import unittest
+from types import SimpleNamespace
 
 import requests
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.disaggregation_fixture import get_rdma_devices_args
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST_MLA,
@@ -149,6 +151,98 @@ def _count_visible_gpus() -> int:
         return torch.cuda.device_count() if torch.cuda.is_available() else 0
     except Exception:
         return 0
+
+
+# ---------------------------------------------------------------------------
+# Cold-start 8-rank smoke test
+# ---------------------------------------------------------------------------
+# Launches all 8 ranks together at world_size=8 with --max-ep-size 8 (i.e. no
+# headroom, max == world). No scaling involved -- this just proves that our
+# --max-ep-size plumbing doesn't break the baseline when everything is
+# cold-started like TestNixlMoeMooncakeElasticEP in test_nixl_ep.py. If this
+# passes but the "real" scale (separate process joining later) doesn't, it
+# confirms the crash is in the Mooncake PG extend-then-join path, not in
+# our infrastructure.
+
+COLD_START_8RANK_ARGS = [
+    "--trust-remote-code",
+    "--moe-a2a-backend",
+    "nixl",
+    "--deepep-mode",
+    "low_latency",
+    "--tp",
+    "8",
+    "--dp",
+    "8",
+    "--enable-dp-attention",
+    "--elastic-ep-backend",
+    "mooncake",
+    "--mooncake-ib-device",
+    ib_devices,
+    "--enable-eplb",
+    "--ep-num-redundant-experts",
+    "24",
+    "--max-ep-size",
+    "8",
+    "--mem-fraction-static",
+    "0.5",
+]
+
+
+@unittest.skipUnless(
+    _count_visible_gpus() >= 8,
+    "Cold-start 8-rank smoke test needs 8 GPUs.",
+)
+class TestElasticScaleColdStart8Ranks(CustomTestCase):
+    """Launch an 8-rank cluster cold-start with --max-ep-size 8.
+
+    This mirrors test_nixl_ep.py::TestNixlMoeMooncakeElasticEP but with our
+    new --max-ep-size flag set. Purpose: prove that simply adding
+    --max-ep-size (even when it equals world_size) doesn't regress baseline
+    serving. No scale API is exercised.
+
+    If this passes, we know:
+      * max_ep_size=world_size path is safe;
+      * active_ranks pre-allocation to 8 slots (with slots [4:] zeroed) is
+        correctly handled by EPLB, the NIXL dispatcher's active_ranks
+        slice, and mlp_sync;
+      * the init_pg / init logging tagged [Elastic EP] doesn't break
+        anything.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = TEST_MODEL
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=COLD_START_8RANK_ARGS,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+        cls.process.wait(timeout=15)
+        time.sleep(2)
+
+    def _run_gsm8k(self):
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
+        )
+        return run_eval(args)
+
+    def test_gsm8k(self):
+        """gsm8k on the 8-rank cold-started cluster with --max-ep-size 8."""
+        metrics = self._run_gsm8k()
+        self.assertGreater(metrics["score"], 0.60)
 
 
 TP_PER_GROUP = 4
