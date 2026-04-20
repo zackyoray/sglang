@@ -156,11 +156,16 @@ TP_PER_GROUP = 4
 TOTAL_EP_SIZE = TP_PER_GROUP * 2  # 8
 # Each --nnodes 1 group needs its OWN torch rendezvous port. Mooncake PG
 # bridges them via its own metadata channel, not torch's init_process_group.
+#
+# IMPORTANT: SGLang derives a cluster of ports from --dist-init-addr:
+#   dist_init_port, port_base=+1, detokenizer=+2, rpc=+3, metrics=+4,
+#   scheduler_input=+5. We leave a 10-port gap so the two groups don't
+#   overlap.
 DIST_INIT_ADDR_A = os.environ.get(
     "SGLANG_ELASTIC_SCALE_DIST_INIT_A", "127.0.0.1:24555"
 )
 DIST_INIT_ADDR_B = os.environ.get(
-    "SGLANG_ELASTIC_SCALE_DIST_INIT_B", "127.0.0.1:24556"
+    "SGLANG_ELASTIC_SCALE_DIST_INIT_B", "127.0.0.1:24570"
 )
 PORT_A = int(os.environ.get("SGLANG_ELASTIC_SCALE_PORT_A", "21000"))
 PORT_B = int(os.environ.get("SGLANG_ELASTIC_SCALE_PORT_B", "21001"))
