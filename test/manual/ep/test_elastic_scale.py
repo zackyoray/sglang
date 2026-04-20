@@ -154,13 +154,20 @@ def _count_visible_gpus() -> int:
 
 TP_PER_GROUP = 4
 TOTAL_EP_SIZE = TP_PER_GROUP * 2  # 8
-DIST_INIT_ADDR = os.environ.get("SGLANG_ELASTIC_SCALE_DIST_INIT", "127.0.0.1:24555")
+# Each --nnodes 1 group needs its OWN torch rendezvous port. Mooncake PG
+# bridges them via its own metadata channel, not torch's init_process_group.
+DIST_INIT_ADDR_A = os.environ.get(
+    "SGLANG_ELASTIC_SCALE_DIST_INIT_A", "127.0.0.1:24555"
+)
+DIST_INIT_ADDR_B = os.environ.get(
+    "SGLANG_ELASTIC_SCALE_DIST_INIT_B", "127.0.0.1:24556"
+)
 PORT_A = int(os.environ.get("SGLANG_ELASTIC_SCALE_PORT_A", "21000"))
 PORT_B = int(os.environ.get("SGLANG_ELASTIC_SCALE_PORT_B", "21001"))
 BASE_URL_A = f"http://127.0.0.1:{PORT_A}"
 
 
-def _scale_up_common_args() -> list[str]:
+def _scale_up_common_args(dist_init_addr: str) -> list[str]:
     """CLI args shared by both primary and joining group in the scale test."""
     return [
         "--trust-remote-code",
@@ -187,7 +194,7 @@ def _scale_up_common_args() -> list[str]:
         "--nnodes",
         "1",
         "--dist-init-addr",
-        DIST_INIT_ADDR,
+        dist_init_addr,
     ]
 
 
@@ -221,7 +228,7 @@ class TestElasticScaleUpEndToEnd(CustomTestCase):
         cls._joining_proc = None
 
         # Step 1: launch primary alone with --nnodes 1, wait for health.
-        primary_args = _scale_up_common_args()
+        primary_args = _scale_up_common_args(DIST_INIT_ADDR_A)
         primary_env = os.environ.copy()
         primary_env["CUDA_VISIBLE_DEVICES"] = ",".join(
             str(i) for i in range(TP_PER_GROUP)
@@ -247,7 +254,7 @@ class TestElasticScaleUpEndToEnd(CustomTestCase):
             "serve",
             "--model-path",
             cls.model,
-            *_scale_up_common_args(),
+            *_scale_up_common_args(DIST_INIT_ADDR_B),
             "--ep-join-mode",
             "scale",
             "--host",
