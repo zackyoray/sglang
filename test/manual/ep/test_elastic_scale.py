@@ -29,6 +29,7 @@ Run with:
 """
 
 import os
+import subprocess
 import time
 import unittest
 
@@ -41,8 +42,6 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
-    _launch_server_process,
-    _wait_for_server_health,
     popen_launch_server,
 )
 
@@ -278,9 +277,9 @@ class TestElasticScaleUpEndToEnd(CustomTestCase):
         PG), torch's init_process_group skips rendezvous and Mooncake PG
         attaches the new ranks to the primary's extended group.
 
-        Called from the test method (not setUp) -- after the primary has
-        already POSTed /scale_elastic_ep so Mooncake PG on the primary
-        side has extended to size 8 and is ready to accept the attach.
+        The subprocess's stdout/stderr go to a file in /tmp so we can
+        diagnose separately from pytest's primary-focused log. The path
+        is printed at launch time for easy access.
         """
         cmd = [
             "sglang",
@@ -306,7 +305,21 @@ class TestElasticScaleUpEndToEnd(CustomTestCase):
         env["CUDA_VISIBLE_DEVICES"] = ",".join(
             str(i) for i in range(TP_PER_GROUP, TOTAL_EP_SIZE)
         )
-        cls._joining_proc = _launch_server_process(cmd, env, None, cls.model)
+        # Route joining-group output to its own file so we can inspect
+        # it after the test; the primary's output stays on pytest stdout.
+        joining_log = os.environ.get(
+            "SGLANG_ELASTIC_SCALE_JOINING_LOG",
+            f"/tmp/elastic_scale_joining_{int(time.time())}.log",
+        )
+        print(f"[TEST] Launching joining group; logs -> {joining_log}")
+        cls._joining_log_path = joining_log
+        cls._joining_log_fh = open(joining_log, "w")
+        cls._joining_proc = subprocess.Popen(
+            cmd,
+            env=env,
+            stdout=cls._joining_log_fh,
+            stderr=subprocess.STDOUT,
+        )
 
     @classmethod
     def tearDownClass(cls):
@@ -324,6 +337,15 @@ class TestElasticScaleUpEndToEnd(CustomTestCase):
                 proc.wait(timeout=15)
             except Exception:
                 pass
+        fh = getattr(cls, "_joining_log_fh", None)
+        if fh is not None:
+            try:
+                fh.close()
+            except Exception:
+                pass
+        joining_log = getattr(cls, "_joining_log_path", None)
+        if joining_log:
+            print(f"[TEST] Joining group log preserved at {joining_log}")
         time.sleep(2)
 
     def _post(self, path: str, **kwargs) -> requests.Response:
