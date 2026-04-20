@@ -283,8 +283,9 @@ def join_process_groups():
     from mooncake import ep as mooncake_ep
 
     def join_backend(label: str, backend) -> None:
-        logger.info("Recovered rank joining Mooncake backend %s", label)
+        logger.info("[Elastic EP][join_pg] calling join_group on %s", label)
         mooncake_ep.join_group(backend)
+        logger.info("[Elastic EP][join_pg] join_group returned on %s", label)
 
     join_backend(
         "default_world",

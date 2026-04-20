@@ -1687,6 +1687,14 @@ def init_distributed_environment(
             pg_options = get_torch_distributed_pg_options()
 
         # this backend is used for WORLD
+        if "mooncake" in backend:
+            logger.info(
+                "[Elastic EP][init_pg] calling init_process_group "
+                "backend=%s world_size=%d rank=%d recovered_rank=%s "
+                "init_method=%s",
+                backend, world_size, rank, recovered_rank,
+                distributed_init_method,
+            )
         torch.distributed.init_process_group(
             backend=backend,
             init_method=distributed_init_method,
@@ -1695,6 +1703,11 @@ def init_distributed_environment(
             timeout=timeout,
             pg_options=pg_options,
         )
+        if "mooncake" in backend:
+            logger.info(
+                "[Elastic EP][init_pg] init_process_group returned "
+                "(rank=%d world_size=%d)", rank, world_size,
+            )
 
         # Create a global TCPStore for coordination (used by NIXL)
         if moe_a2a_backend == "nixl":

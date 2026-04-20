@@ -346,30 +346,44 @@ class TestElasticScaleUpEndToEnd(CustomTestCase):
     def test_scale_up_on_demand(self):
         """The real scale use case: serve on N ranks, then attach N more.
 
-        Order of operations is important:
+        Order of operations:
 
           1. sanity-check primary serves traffic at ep_size=4
-          2. POST /scale_elastic_ep -- primary extends its Mooncake PG
-             internal group to size 8 (slots 4..7 inactive).
-          3. launch joining group -- it calls init_process_group with
-             world_size=8, rank=4..7, recovered_rank=True and attaches
-             to the already-extended group.
-          4. wait for the primary's poll loop to detect ranks 4..7 live
-             and complete the join (EPLB rebalance, NIXL connect).
+          2. launch joining group -- it reaches init_process_group and
+             BLOCKS there. Mooncake PG's recovered_rank=True attach
+             requests ranks 4..7 of an 8-rank group; the primary's
+             Mooncake group is still size 4, so attach waits for extend.
+          3. POST /scale_elastic_ep -- primary's extend_group_size_to(8)
+             grows the group so the joining-side attach unblocks
+             naturally (Mooncake PG rendezvous completes on both sides
+             at the same time).
+          4. wait for the join to complete: joining group finishes model
+             load + cuda graph capture, primary's poll loop detects
+             ranks 4..7 live, EPLB rebalances, NIXL connects.
           5. verify post-scale inference works.
 
-        Scale-BEFORE-launch order (vs the intuitive launch-BEFORE-scale)
-        is required by Mooncake PG: extend_group_size_to must run first
-        so the Mooncake group has real slots for the joining group to
-        claim, otherwise the joining group's recovered_rank=True attach
-        conflicts with the primary's existing slots 0..3.
+        Launch-BEFORE-scale order is required: if we scale BEFORE the
+        joining group is up, the primary's poll loop tries to call
+        get_peer_state on phantom ranks, hitting Mooncake's
+        multi_transport.cpp:148 'task.slice_count' assertion.
         """
         # Step 1: sanity-check that the 4-rank primary serves traffic.
         self._generate_ok("pre-scale (4 ranks)")
 
-        # Step 2: trigger the scale. This runs extend_group_size_to(8)
-        # on the primary's Mooncake PG; slots 4..7 are reserved but
-        # inactive until a joiner claims them.
+        # Step 2: launch the joining group FIRST. It will block in
+        # init_process_group until the primary's Mooncake group is
+        # extended (done in step 3 via POST /scale_elastic_ep).
+        self._launch_joining_group()
+
+        # Give the joining group time to reach init_process_group.
+        # Model weights aren't loaded yet (init_process_group happens
+        # before load_weight in model_runner.__init__), so this should
+        # only take ~10-20 seconds after the subprocess starts.
+        time.sleep(30)
+
+        # Step 3: trigger the scale. This runs extend_group_size_to(8)
+        # on the primary's Mooncake PG, which unblocks the joining
+        # group's init_process_group attach.
         resp = self._post(
             "/scale_elastic_ep", json={"new_ep_size": TOTAL_EP_SIZE}
         )
@@ -382,18 +396,11 @@ class TestElasticScaleUpEndToEnd(CustomTestCase):
         self.assertEqual(body["old_ep_size"], TP_PER_GROUP)
         self.assertEqual(body["new_ep_size"], TOTAL_EP_SIZE)
 
-        # Step 3: launch the joining group. It does not wait for HTTP
-        # health -- that only becomes OK after the join completes.
-        self._launch_joining_group()
-
-        # Step 4: wait for the join to complete. The joining group has
-        # to load the model, capture cuda graphs, call
-        # init_process_group (which attaches to primary's extended
-        # group), broadcast expert metadata, and then the primary's
-        # poll loop has to call try_recover_ranks on [4,5,6,7] and
-        # see them all live. Budget generously -- the joining group
-        # alone takes ~60s for model load + cuda graph capture on
-        # lite fp8.
+        # Step 4: wait for the join to complete. After
+        # init_process_group unblocks, the joining group still has to
+        # finish model load (~20s), cuda graph capture (~30s), and
+        # reach the elastic-EP join path. Meanwhile the primary's poll
+        # loop tries try_recover_ranks every forward pass.
         time.sleep(240)
 
         # Step 5: post-scale inference works.
