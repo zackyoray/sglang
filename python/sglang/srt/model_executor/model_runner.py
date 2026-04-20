@@ -490,7 +490,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.server_args.elastic_ep_backend is not None
             and self.server_args.ep_join_mode in ("scale", "recover")
         ):
+            logger.info(
+                "[Elastic EP][join_rank] mode=%s calling join_process_groups...",
+                self.server_args.ep_join_mode,
+            )
             join_process_groups()
+            logger.info(
+                "[Elastic EP][join_rank] join_process_groups returned. "
+                "Broadcasting expert-location metadata...",
+            )
             broadcast_global_expert_location_metadata(
                 src_rank=self._get_healthy_expert_location_src_rank(
                     invoked_in_ep_join_path=True
@@ -506,6 +514,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             # from existing ranks (which previously published it via
             # recover_ranks inside activate_ranks). Resetting here would
             # mask out genuinely-pending ranks that have not joined yet.
+            inst = ElasticEPStateManager.instance()
+            logger.info(
+                "[Elastic EP][join_rank] ready; active_ranks=%s "
+                "effective_ep_size=%d",
+                inst.active_ranks.tolist() if inst is not None else None,
+                inst.effective_ep_size if inst is not None else -1,
+            )
 
         if self.is_multimodal:
             sanity_check_mm_pad_shift_value(self.model_config.vocab_size)
@@ -1488,6 +1503,27 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             i for i in range(effective_size) if not tp_active_ranks[i]
         ]
 
+        # Log first detection of each target set, plus periodic reminders
+        # while we're still waiting. Keeps the log readable during long
+        # scale-up waits.
+        if ranks_to_join:
+            seen = getattr(self, "_logged_ranks_to_join", None)
+            if seen != tuple(ranks_to_join):
+                logger.info(
+                    "[Elastic EP][poll] detected ranks_to_join=%s "
+                    "effective_ep_size=%d tp_active_ranks=%s",
+                    ranks_to_join, effective_size, tp_active_ranks.tolist(),
+                )
+                self._logged_ranks_to_join = tuple(ranks_to_join)
+                self._last_poll_log_id = self.forward_pass_id
+            elif self.forward_pass_id - getattr(self, "_last_poll_log_id", 0) >= 200:
+                logger.info(
+                    "[Elastic EP][poll] still waiting for ranks_to_join=%s "
+                    "(forward_pass_id=%d)",
+                    ranks_to_join, self.forward_pass_id,
+                )
+                self._last_poll_log_id = self.forward_pass_id
+
         # try_recover_ranks polls peer state via an allreduce — all active
         # ranks must call it. See RFC open questions re: rank agreement.
         if ranks_to_join and try_recover_ranks(ranks_to_join):
@@ -1526,7 +1562,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 get_world_group().cpu_group,
                 src=get_world_group().ranks[0],
             )
-            logger.info(f"joined ranks {ranks_to_join} done")
+            logger.info(
+                "[Elastic EP][poll] joined ranks %s done "
+                "(effective_ep_size=%d, from_ep_size=%d)",
+                ranks_to_join, effective_size, from_ep_size,
+            )
+            self._logged_ranks_to_join = None
 
     def _get_healthy_expert_location_src_rank(
         self, invoked_in_ep_join_path: bool

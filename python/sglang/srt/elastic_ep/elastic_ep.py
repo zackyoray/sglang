@@ -88,6 +88,18 @@ class ElasticEPStateManager:
                 cls._instance.snapshot_active_to_last()
                 cls._instance.sync_active_to_cpu()
 
+            logger.info(
+                "[Elastic EP][init] rank=%d world_size=%d max_ep_size=%s "
+                "effective_ep_size=%d ep_join_mode=%s backend=%s active_ranks=%s",
+                torch.distributed.get_rank(),
+                world_size,
+                server_args.max_ep_size,
+                cls._instance.effective_ep_size,
+                server_args.ep_join_mode,
+                backend,
+                cls._instance.active_ranks.tolist(),
+            )
+
         return cls._instance
 
     @staticmethod

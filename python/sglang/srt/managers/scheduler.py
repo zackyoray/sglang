@@ -3492,6 +3492,12 @@ class Scheduler(
         new_ep_size = recv_req.new_ep_size
         max_ep_size = self.server_args.max_ep_size or old_ep_size
 
+        logger.info(
+            "[Elastic EP][scale] request received: new_ep_size=%d "
+            "old_ep_size=%d max_ep_size=%d",
+            new_ep_size, old_ep_size, max_ep_size,
+        )
+
         # Validate before touching the backend.
         if new_ep_size <= old_ep_size:
             return ScaleElasticEPReqOutput(
@@ -3527,15 +3533,27 @@ class Scheduler(
         try:
             from mooncake import ep as mooncake_ep
 
+            num_groups = 0
             for group in _iter_live_parallel_groups():
                 backend = _get_process_group_backend(group.device_group, "cuda")
+                logger.info(
+                    "[Elastic EP][scale] extend_group_size_to(%d) on %s",
+                    new_ep_size, group.unique_name,
+                )
                 mooncake_ep.extend_group_size_to(backend, new_ep_size)
+                num_groups += 1
 
             # NOTE: do not call _on_scale here — that would block on the NIXL
             # two-sided handshake before new ranks have joined the PG. The
             # poll loop in maybe_join_ep_ranks calls _on_scale after the new
             # ranks have published their metadata.
             ElasticEPStateManager.set_effective_ep_size(new_ep_size)
+            logger.info(
+                "[Elastic EP][scale] extend complete on %d groups; "
+                "set_effective_ep_size(%d). Poll loop will pick up new ranks "
+                "on next forward pass.",
+                num_groups, new_ep_size,
+            )
 
             return ScaleElasticEPReqOutput(
                 success=True,
