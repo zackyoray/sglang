@@ -181,6 +181,15 @@ class ElasticEPStateManager:
         active_count = int(
             inst.active_ranks[: inst.effective_ep_size].sum().item()
         )
+        # TODO: remove debug log before merge. Temporarily verify cross-process state.
+        logger.info(
+            "[Elastic EP][is_scaling] active_ranks=%s effective_ep_size=%d "
+            "active_count=%d result=%s",
+            inst.active_ranks.tolist(),
+            inst.effective_ep_size,
+            active_count,
+            active_count < inst.effective_ep_size,
+        )
         return active_count < inst.effective_ep_size
 
 
