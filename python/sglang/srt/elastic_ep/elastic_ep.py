@@ -149,21 +149,9 @@ class ElasticEPStateManager:
     def _on_scale_nixl(from_ep_size: int, to_ep_size: int) -> None:
         from sglang.srt.layers.moe.token_dispatcher.nixl import NixlEPBuffer
 
-        # NixlEPBuffer.on_scale lands in a follow-up PR that adds the
-        # _scale_to / _connected_ep_size lazy-update path. Until then,
-        # NIXL connections will be set up on first dispatch via the
-        # existing connect-on-demand path; warn so users know scale-up
-        # buffer recapture is deferred.
-        on_scale = getattr(NixlEPBuffer, "on_scale", None)
-        if on_scale is None:
-            logger.warning(
-                "[Elastic EP] NixlEPBuffer.on_scale not available; "
-                "buffer recapture for ranks %d..%d is deferred to first dispatch.",
-                from_ep_size,
-                to_ep_size,
-            )
-            return
-        on_scale(from_ep_size, to_ep_size)
+        # Sets NixlEPBuffer._scale_to so get_nixl_buffer can extend connect_ranks
+        # on dispatch (lazy mesh growth). Must run after joins, not at HTTP scale.
+        NixlEPBuffer.on_scale(from_ep_size, to_ep_size)
 
     @staticmethod
     def _on_scale_mooncake(from_ep_size: int, to_ep_size: int) -> None:

@@ -44,6 +44,36 @@ class NixlEPBuffer:
     _num_max_dispatch_tokens_per_rank: Optional[int] = None
     _num_experts: Optional[int] = None
     _num_local_experts: Optional[int] = None
+    # Exclusive upper bound of EP rank indices already connected via connect_ranks.
+    _connected_ep_size: Optional[int] = None
+    # Target EP frontier for NIXL mesh: set at first buffer init, then updated only
+    # via on_scale() from ElasticEPStateManager._on_scale_nixl after new ranks join
+    # (same timing as RFC — not bumped from HTTP scale alone).
+    _scale_to: Optional[int] = None
+
+    @classmethod
+    def on_scale(cls, from_ep_size: int, to_ep_size: int) -> None:
+        """Called from ElasticEPStateManager._on_scale_nixl after activate_ranks."""
+        cls._scale_to = to_ep_size
+        logger.info(
+            "[Elastic EP][nixl] on_scale(%s -> %s) _scale_to=%s",
+            from_ep_size,
+            to_ep_size,
+            to_ep_size,
+        )
+
+    @classmethod
+    def _update_connections(cls, scale_to: int) -> None:
+        """connect_ranks(range(_connected_ep_size, scale_to)); caller ensures scale_to > _connected_ep_size."""
+        new_ranks = list(range(cls._connected_ep_size, scale_to))
+        logger.info(
+            "[Elastic EP][nixl] update_connections connect_ranks(%s) "
+            "(_connected_ep_size -> %s)",
+            new_ranks,
+            scale_to,
+        )
+        cls._buffer.connect_ranks(new_ranks)
+        cls._connected_ep_size = scale_to
 
     @classmethod
     def get_nixl_buffer(
@@ -56,6 +86,12 @@ class NixlEPBuffer:
         num_local_experts: int = -1,
     ):
         if cls._buffer is not None:
+            if (
+                cls._scale_to is not None
+                and cls._connected_ep_size is not None
+                and cls._scale_to > cls._connected_ep_size
+            ):
+                cls._update_connections(cls._scale_to)
             return cls._buffer
 
         cls._hidden_size = hidden_size
@@ -119,12 +155,18 @@ class NixlEPBuffer:
             num_experts_per_rank=cls._num_local_experts,
             num_rdma_bytes=num_rdma_bytes,
         )
-        # Connect only the currently-live ranks; the remaining max_ep_size -
-        # world_size slots are pre-allocated but unconnected. on_scale (in a
-        # follow-up PR) will call connect_ranks(range(world_size, new_ep_size))
-        # to bring scale-up ranks online.
+        # Initial mesh: current PG only. Further growth: _scale_to vs _connected_ep_size
+        # on each get_nixl_buffer after on_scale() sets _scale_to.
         live_ranks = list(range(world_size))
+        logger.info(
+            "[Elastic EP][nixl] initial connect_ranks(%s) (world_size=%s, max_ep_size=%s)",
+            live_ranks,
+            world_size,
+            max_ep_size,
+        )
         cls._buffer.connect_ranks(live_ranks)
+        cls._connected_ep_size = world_size
+        cls._scale_to = world_size
 
         return cls._buffer
 
