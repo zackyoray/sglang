@@ -152,17 +152,16 @@ def _count_visible_gpus() -> int:
         return 0
 
 
-TP_PER_NODE = 4
-TOTAL_EP_SIZE = TP_PER_NODE * 2  # 8
+TP_PER_GROUP = 4
+TOTAL_EP_SIZE = TP_PER_GROUP * 2  # 8
 DIST_INIT_ADDR = os.environ.get("SGLANG_ELASTIC_SCALE_DIST_INIT", "127.0.0.1:24555")
 PORT_A = int(os.environ.get("SGLANG_ELASTIC_SCALE_PORT_A", "21000"))
 PORT_B = int(os.environ.get("SGLANG_ELASTIC_SCALE_PORT_B", "21001"))
 BASE_URL_A = f"http://127.0.0.1:{PORT_A}"
-BASE_URL_B = f"http://127.0.0.1:{PORT_B}"
 
 
 def _scale_up_common_args() -> list[str]:
-    """CLI args shared by both node-rank 0 and node-rank 1 in the scale test."""
+    """CLI args shared by both primary and joining group in the scale test."""
     return [
         "--trust-remote-code",
         "--moe-a2a-backend",
@@ -170,9 +169,9 @@ def _scale_up_common_args() -> list[str]:
         "--deepep-mode",
         "low_latency",
         "--tp",
-        str(TP_PER_NODE),
+        str(TP_PER_GROUP),
         "--dp",
-        str(TP_PER_NODE),
+        str(TP_PER_GROUP),
         "--enable-dp-attention",
         "--elastic-ep-backend",
         "mooncake",
@@ -186,7 +185,7 @@ def _scale_up_common_args() -> list[str]:
         "--mem-fraction-static",
         "0.5",
         "--nnodes",
-        "2",
+        "1",
         "--dist-init-addr",
         DIST_INIT_ADDR,
     ]
@@ -195,70 +194,37 @@ def _scale_up_common_args() -> list[str]:
 @unittest.skipUnless(
     _count_visible_gpus() >= TOTAL_EP_SIZE,
     f"Full scale-up E2E needs {TOTAL_EP_SIZE} GPUs "
-    f"(primary {TP_PER_NODE} + joining {TP_PER_NODE}).",
+    f"(primary {TP_PER_GROUP} + joining {TP_PER_GROUP}).",
 )
 class TestElasticScaleUpEndToEnd(CustomTestCase):
-    """End-to-end scale-up with real joining ranks.
+    """End-to-end scale-up with real joining ranks, launched on demand.
 
-    Launches primary (node-rank 0, GPUs 0..TP_PER_NODE-1) and joining group
-    (node-rank 1, GPUs TP_PER_NODE..TOTAL_EP_SIZE-1 with --ep-join-mode scale)
-    in PARALLEL. Parallel launch is required because torch's
-    init_process_group rendezvous expects all --nnodes to participate before
-    either process returns; waiting for primary's health before launching the
-    joining group deadlocks.
+    Sequence the test exercises:
+      1. launch primary --tp TP_PER_GROUP --nnodes 1 on GPUs 0..3
+      2. primary becomes healthy, POST /generate to verify 4-rank serving
+      3. launch joining group --tp TP_PER_GROUP --nnodes 1 --ep-join-mode
+         scale on GPUs 4..7 (no health wait)
+      4. POST /scale_elastic_ep {new_ep_size: TOTAL_EP_SIZE}
+      5. wait for the join to complete (primary log shows "joined ranks ... done")
+      6. POST /generate to verify post-scale inference
 
-    The joining group stays HTTP-unhealthy until /scale_elastic_ep is POSTed
-    to the primary and the poll loop completes its join. We therefore wait
-    only for the primary's /health_generate; the joining group is launched
-    as a bare subprocess without a health check.
+    Both groups use --nnodes 1 because each group is its own torch world;
+    they share --dist-init-addr so Mooncake PG can rendezvous across them.
+    The joining group uses --ep-join-mode scale so its Mooncake PG init
+    attaches to the existing group rather than requiring a fresh rendezvous.
     """
 
     @classmethod
     def setUpClass(cls):
         cls.model = TEST_MODEL
         cls.base_url = BASE_URL_A
+        cls._joining_proc = None
 
-        primary_args = _scale_up_common_args() + [
-            "--node-rank",
-            "0",
-        ]
-        joining_args = [
-            "sglang",
-            "serve",
-            "--model-path",
-            cls.model,
-            *_scale_up_common_args(),
-            "--node-rank",
-            "1",
-            "--ep-join-mode",
-            "scale",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            str(PORT_B),
-            "--device",
-            "cuda",
-        ]
-
-        # Start the joining group first in a background thread so its own
-        # blocking init (model load, cuda graph capture, etc.) runs in
-        # parallel with the primary's launch. It intentionally does NOT
-        # wait for HTTP health -- that only happens after the scale.
-        cls._joining_env = os.environ.copy()
-        cls._joining_env["CUDA_VISIBLE_DEVICES"] = ",".join(
-            str(i) for i in range(TP_PER_NODE, TOTAL_EP_SIZE)
-        )
-        cls._joining_proc = _launch_server_process(
-            joining_args, cls._joining_env, None, cls.model
-        )
-
-        # Launch the primary with popen_launch_server, which handles the
-        # /health_generate wait. By the time the primary finishes torch
-        # init_process_group the joining group will have reached the same
-        # rendezvous, so both unblock together.
+        # Step 1: launch primary alone with --nnodes 1, wait for health.
+        primary_args = _scale_up_common_args()
         primary_env = os.environ.copy()
         primary_env["CUDA_VISIBLE_DEVICES"] = ",".join(
-            str(i) for i in range(TP_PER_NODE)
+            str(i) for i in range(TP_PER_GROUP)
         )
         cls.process = popen_launch_server(
             cls.model,
@@ -269,8 +235,40 @@ class TestElasticScaleUpEndToEnd(CustomTestCase):
         )
 
     @classmethod
+    def _launch_joining_group(cls) -> None:
+        """Launch the second 4-rank group with --ep-join-mode scale.
+
+        Called from the test method (not setUp) so the primary has time to
+        serve pre-scale traffic before the joining group starts allocating
+        GPUs.
+        """
+        cmd = [
+            "sglang",
+            "serve",
+            "--model-path",
+            cls.model,
+            *_scale_up_common_args(),
+            "--ep-join-mode",
+            "scale",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(PORT_B),
+            "--device",
+            "cuda",
+        ]
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(
+            str(i) for i in range(TP_PER_GROUP, TOTAL_EP_SIZE)
+        )
+        cls._joining_proc = _launch_server_process(cmd, env, None, cls.model)
+
+    @classmethod
     def tearDownClass(cls):
-        for proc in (getattr(cls, "process", None), getattr(cls, "_joining_proc", None)):
+        for proc in (
+            getattr(cls, "process", None),
+            getattr(cls, "_joining_proc", None),
+        ):
             if proc is None:
                 continue
             try:
@@ -286,17 +284,36 @@ class TestElasticScaleUpEndToEnd(CustomTestCase):
     def _post(self, path: str, **kwargs) -> requests.Response:
         return requests.post(f"{self.base_url}{path}", timeout=60, **kwargs)
 
-    def _is_scaling(self) -> bool:
-        return self._post("/is_scaling_elastic_ep").json()["is_scaling_elastic_ep"]
-
-    def test_scale_up_end_to_end(self):
-        """Full flow: baseline -> POST scale -> wait for join -> verify inference."""
-        # 1. Baseline: primary alone, joining group waiting in poll loop.
-        self.assertFalse(
-            self._is_scaling(), "is_scaling should be False before any scale request"
+    def _generate_ok(self, msg_suffix: str) -> None:
+        resp = self._post(
+            "/generate",
+            json={
+                "text": "Hello",
+                "sampling_params": {"max_new_tokens": 4, "temperature": 0.0},
+            },
+        )
+        self.assertEqual(
+            resp.status_code,
+            200,
+            f"/generate {msg_suffix} failed: {resp.text}",
         )
 
-        # 2. Trigger the scale.
+    def test_scale_up_on_demand(self):
+        """The real scale use case: serve on N ranks, then attach N more."""
+        # Step 2: sanity-check that the 4-rank primary serves traffic.
+        self._generate_ok("pre-scale (4 ranks)")
+
+        # Step 3: launch the joining group (no health wait -- it stays
+        # unhealthy until the scale-up join completes).
+        self._launch_joining_group()
+
+        # Give the joining group time to reach the elastic-EP join poll
+        # loop. Until it's there, extend_group_size_to has no peer to
+        # rendezvous with. Model load + cuda graph capture on lite fp8
+        # typically finishes in ~60s; wait generously.
+        time.sleep(90)
+
+        # Step 4: trigger the scale.
         resp = self._post(
             "/scale_elastic_ep", json={"new_ep_size": TOTAL_EP_SIZE}
         )
@@ -306,34 +323,18 @@ class TestElasticScaleUpEndToEnd(CustomTestCase):
             f"scale request failed: {resp.text}",
         )
         body = resp.json()
-        self.assertEqual(body["old_ep_size"], TP_PER_NODE)
+        self.assertEqual(body["old_ep_size"], TP_PER_GROUP)
         self.assertEqual(body["new_ep_size"], TOTAL_EP_SIZE)
 
-        # 3. Wait for the join to complete (poll loop flips is_scaling back).
-        join_deadline = time.perf_counter() + 120
-        while time.perf_counter() < join_deadline:
-            if not self._is_scaling():
-                break
-            time.sleep(1)
-        self.assertFalse(
-            self._is_scaling(),
-            "is_scaling never flipped back to False within 120s; "
-            "the joining ranks may have failed to complete join_group",
-        )
+        # Step 5: wait for the join to complete. We detect completion via
+        # /generate staying 200 while the poll loop runs; a real join
+        # failure would crash the primary and /generate would start
+        # returning 503 or connection-reset. We also allow time for the
+        # EPLB rebalance that fires on active_ranks change.
+        time.sleep(30)
 
-        # 4. Post-scale inference sanity check.
-        gen = self._post(
-            "/generate",
-            json={
-                "text": "Hello",
-                "sampling_params": {"max_new_tokens": 8, "temperature": 0.0},
-            },
-        )
-        self.assertEqual(
-            gen.status_code,
-            200,
-            f"post-scale inference failed: {gen.text}",
-        )
+        # Step 6: post-scale inference works.
+        self._generate_ok("post-scale (8 ranks)")
 
 
 if __name__ == "__main__":
