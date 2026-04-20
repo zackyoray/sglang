@@ -172,8 +172,26 @@ PORT_B = int(os.environ.get("SGLANG_ELASTIC_SCALE_PORT_B", "21001"))
 BASE_URL_A = f"http://127.0.0.1:{PORT_A}"
 
 
-def _scale_up_common_args(dist_init_addr: str) -> list[str]:
-    """CLI args shared by both primary and joining group in the scale test."""
+def _scale_up_common_args(
+    dist_init_addr: str,
+    tp_size: int,
+    nnodes: int,
+    node_rank: int,
+) -> list[str]:
+    """CLI args shared by both primary and joining group in the scale test.
+
+    Primary uses `tp_size=TP_PER_GROUP, nnodes=1, node_rank=0` -- a standalone
+    small cluster.
+
+    Joining group uses `tp_size=TOTAL_EP_SIZE, nnodes=2, node_rank=1` so
+    SGLang computes its ranks as tp_size*pp_rank + tp_rank = 4..7 (the new
+    slots in the extended post-scale world). torch's init_process_group
+    receives world_size=TOTAL_EP_SIZE, rank=4..7; Mooncake PG's
+    recovered_rank=True skips the rendezvous and attaches to the primary's
+    extended group. Mooncake's get_world_size() currently still reports 4
+    after extend (known limitation, a fix is planned on the Mooncake side),
+    but that shouldn't block attach semantics.
+    """
     return [
         "--trust-remote-code",
         "--moe-a2a-backend",
@@ -181,9 +199,9 @@ def _scale_up_common_args(dist_init_addr: str) -> list[str]:
         "--deepep-mode",
         "low_latency",
         "--tp",
-        str(TP_PER_GROUP),
+        str(tp_size),
         "--dp",
-        str(TP_PER_GROUP),
+        str(tp_size),
         "--enable-dp-attention",
         "--elastic-ep-backend",
         "mooncake",
@@ -197,7 +215,9 @@ def _scale_up_common_args(dist_init_addr: str) -> list[str]:
         "--mem-fraction-static",
         "0.5",
         "--nnodes",
-        "1",
+        str(nnodes),
+        "--node-rank",
+        str(node_rank),
         "--dist-init-addr",
         dist_init_addr,
     ]
@@ -233,7 +253,9 @@ class TestElasticScaleUpEndToEnd(CustomTestCase):
         cls._joining_proc = None
 
         # Step 1: launch primary alone with --nnodes 1, wait for health.
-        primary_args = _scale_up_common_args(DIST_INIT_ADDR_A)
+        primary_args = _scale_up_common_args(
+            DIST_INIT_ADDR_A, tp_size=TP_PER_GROUP, nnodes=1, node_rank=0
+        )
         primary_env = os.environ.copy()
         primary_env["CUDA_VISIBLE_DEVICES"] = ",".join(
             str(i) for i in range(TP_PER_GROUP)
@@ -250,16 +272,27 @@ class TestElasticScaleUpEndToEnd(CustomTestCase):
     def _launch_joining_group(cls) -> None:
         """Launch the second 4-rank group with --ep-join-mode scale.
 
-        Called from the test method (not setUp) so the primary has time to
-        serve pre-scale traffic before the joining group starts allocating
-        GPUs.
+        Uses --nnodes 2 --tp TOTAL_EP_SIZE --node-rank 1 so SGLang computes
+        this group's ranks as 4..7 of an 8-rank world. Combined with
+        --ep-join-mode scale (which sets recovered_rank=True on Mooncake
+        PG), torch's init_process_group skips rendezvous and Mooncake PG
+        attaches the new ranks to the primary's extended group.
+
+        Called from the test method (not setUp) -- after the primary has
+        already POSTed /scale_elastic_ep so Mooncake PG on the primary
+        side has extended to size 8 and is ready to accept the attach.
         """
         cmd = [
             "sglang",
             "serve",
             "--model-path",
             cls.model,
-            *_scale_up_common_args(DIST_INIT_ADDR_B),
+            *_scale_up_common_args(
+                DIST_INIT_ADDR_B,
+                tp_size=TOTAL_EP_SIZE,
+                nnodes=2,
+                node_rank=1,
+            ),
             "--ep-join-mode",
             "scale",
             "--host",
@@ -311,21 +344,32 @@ class TestElasticScaleUpEndToEnd(CustomTestCase):
         )
 
     def test_scale_up_on_demand(self):
-        """The real scale use case: serve on N ranks, then attach N more."""
-        # Step 2: sanity-check that the 4-rank primary serves traffic.
+        """The real scale use case: serve on N ranks, then attach N more.
+
+        Order of operations is important:
+
+          1. sanity-check primary serves traffic at ep_size=4
+          2. POST /scale_elastic_ep -- primary extends its Mooncake PG
+             internal group to size 8 (slots 4..7 inactive).
+          3. launch joining group -- it calls init_process_group with
+             world_size=8, rank=4..7, recovered_rank=True and attaches
+             to the already-extended group.
+          4. wait for the primary's poll loop to detect ranks 4..7 live
+             and complete the join (EPLB rebalance, NIXL connect).
+          5. verify post-scale inference works.
+
+        Scale-BEFORE-launch order (vs the intuitive launch-BEFORE-scale)
+        is required by Mooncake PG: extend_group_size_to must run first
+        so the Mooncake group has real slots for the joining group to
+        claim, otherwise the joining group's recovered_rank=True attach
+        conflicts with the primary's existing slots 0..3.
+        """
+        # Step 1: sanity-check that the 4-rank primary serves traffic.
         self._generate_ok("pre-scale (4 ranks)")
 
-        # Step 3: launch the joining group (no health wait -- it stays
-        # unhealthy until the scale-up join completes).
-        self._launch_joining_group()
-
-        # Give the joining group time to reach the elastic-EP join poll
-        # loop. Until it's there, extend_group_size_to has no peer to
-        # rendezvous with. Model load + cuda graph capture on lite fp8
-        # typically finishes in ~60s; wait generously.
-        time.sleep(90)
-
-        # Step 4: trigger the scale.
+        # Step 2: trigger the scale. This runs extend_group_size_to(8)
+        # on the primary's Mooncake PG; slots 4..7 are reserved but
+        # inactive until a joiner claims them.
         resp = self._post(
             "/scale_elastic_ep", json={"new_ep_size": TOTAL_EP_SIZE}
         )
@@ -338,14 +382,21 @@ class TestElasticScaleUpEndToEnd(CustomTestCase):
         self.assertEqual(body["old_ep_size"], TP_PER_GROUP)
         self.assertEqual(body["new_ep_size"], TOTAL_EP_SIZE)
 
-        # Step 5: wait for the join to complete. We detect completion via
-        # /generate staying 200 while the poll loop runs; a real join
-        # failure would crash the primary and /generate would start
-        # returning 503 or connection-reset. We also allow time for the
-        # EPLB rebalance that fires on active_ranks change.
-        time.sleep(30)
+        # Step 3: launch the joining group. It does not wait for HTTP
+        # health -- that only becomes OK after the join completes.
+        self._launch_joining_group()
 
-        # Step 6: post-scale inference works.
+        # Step 4: wait for the join to complete. The joining group has
+        # to load the model, capture cuda graphs, call
+        # init_process_group (which attaches to primary's extended
+        # group), broadcast expert metadata, and then the primary's
+        # poll loop has to call try_recover_ranks on [4,5,6,7] and
+        # see them all live. Budget generously -- the joining group
+        # alone takes ~60s for model load + cuda graph capture on
+        # lite fp8.
+        time.sleep(240)
+
+        # Step 5: post-scale inference works.
         self._generate_ok("post-scale (8 ranks)")
 
 
