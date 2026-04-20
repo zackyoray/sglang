@@ -171,17 +171,16 @@ class _NixlEPDispatcherImplBase:
         # and the logic requires num-tokens-sent-from-one-rank-to-another-rank less than it
         assert self.num_max_dispatch_tokens_per_rank <= 1024
         elastic_state = ElasticEPStateManager.instance()
-        # The manager's active_ranks is pre-allocated to max_ep_size but the
-        # NIXL dispatch / query_mask_buffer only knows about the live world.
-        # Take a shared-storage slice of the first world_size slots so NIXL
-        # only writes there; reserved slots [world_size:] stay untouched
-        # (preserving the 0 init used by is_scaling() and EPLB).
-        world_size = dist.get_world_size(group)
         self.active_ranks = (
-            elastic_state.active_ranks[:world_size]
-            if elastic_state is not None
-            else None
+            elastic_state.active_ranks if elastic_state is not None else None
         )
+        # NIXL's query_mask_buffer requires the mask tensor numel to equal
+        # the buffer's max_num_ranks (which we pre-allocate to max_ep_size).
+        # So the mask AND active_ranks must be sized to max_ep_size. NIXL
+        # populates only the live-world slots; the rest get a sentinel
+        # (not 0), so we track the live portion separately to preserve the
+        # "reserved slots stay at 0" invariant required by is_scaling().
+        self._active_world_size = dist.get_world_size(group)
         self._mask_buffer = (
             torch.zeros_like(self.active_ranks)
             if self.active_ranks is not None
@@ -353,7 +352,11 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
         )
         if self._mask_buffer is not None:
             buffer.query_mask_buffer(self._mask_buffer)
-            self.active_ranks.copy_(1 - self._mask_buffer)
+            # Only update the live-world slots from NIXL's mask. NIXL fills
+            # reserved slots (max_ep_size > world_size) with a sentinel that
+            # would corrupt is_scaling() / EPLB if we wrote it through.
+            n = self._active_world_size
+            self.active_ranks[:n].copy_(1 - self._mask_buffer[:n])
 
         self.packed_recv_count = self.handle = None
         return combined_hidden_states, event, hook
