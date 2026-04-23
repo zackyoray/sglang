@@ -8,7 +8,7 @@ Two test classes:
     / scale-down / over-max requests. Pure control-plane; does NOT exercise
     a real scale (no joining ranks are launched).
 
-  TestElasticScaleColdStartThenScale (alias TestElasticScaleColdStart8Ranks)
+  TestElasticScaleColdStartThenScale
     8-GPU gsm8k smoke with --max-ep-size 8 (baseline elastic / NIXL plumbing).
 
   TestElasticScaleUpEndToEnd
@@ -241,9 +241,6 @@ class TestElasticScaleColdStartThenScale(CustomTestCase):
         """gsm8k on the 8-rank cold-started cluster with --max-ep-size 8."""
         metrics = self._run_gsm8k()
         self.assertGreater(metrics["score"], 0.60)
-
-
-TestElasticScaleColdStart8Ranks = TestElasticScaleColdStartThenScale
 
 
 TP_PER_GROUP = 4
