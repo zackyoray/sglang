@@ -21,6 +21,10 @@ class ElasticEPState:
     active_ranks_cpu: Optional[torch.Tensor]
     effective_ep_size: int = 0
     original_ep_size: int = 0
+    # Global EP rank offset for joiner processes (see --ep-join-rank-offset).
+    # Local torch rank r maps to global EP rank r + ep_join_rank_offset for
+    # elastic EP bookkeeping. 0 on non-joiners.
+    ep_join_rank_offset: int = 0
 
     def is_active_equal_last(self) -> bool:
         return torch.equal(self.active_ranks, self.last_active_ranks)
@@ -88,14 +92,20 @@ class ElasticEPStateManager:
                 cls._instance.snapshot_active_to_last()
                 cls._instance.sync_active_to_cpu()
 
+            cls._instance.ep_join_rank_offset = (
+                getattr(server_args, "ep_join_rank_offset", 0) or 0
+            )
+
             logger.info(
                 "[Elastic EP][init] rank=%d world_size=%d max_ep_size=%s "
-                "effective_ep_size=%d ep_join_mode=%s backend=%s active_ranks=%s",
+                "effective_ep_size=%d ep_join_mode=%s ep_join_rank_offset=%d "
+                "backend=%s active_ranks=%s",
                 torch.distributed.get_rank(),
                 world_size,
                 server_args.max_ep_size,
                 cls._instance.effective_ep_size,
                 server_args.ep_join_mode,
+                cls._instance.ep_join_rank_offset,
                 backend,
                 cls._instance.active_ranks.tolist(),
             )
@@ -144,6 +154,13 @@ class ElasticEPStateManager:
         if inst is None:
             return 0
         return inst.effective_ep_size
+
+    @classmethod
+    def get_ep_join_rank_offset(cls) -> int:
+        inst = cls._instance
+        if inst is None:
+            return 0
+        return inst.ep_join_rank_offset
 
     @staticmethod
     def _on_scale_nixl(from_ep_size: int, to_ep_size: int) -> None:

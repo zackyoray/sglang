@@ -553,6 +553,7 @@ class ServerArgs:
     enable_elastic_expert_backup: bool = False
     mooncake_ib_device: Optional[str] = None
     ep_join_mode: Optional[Literal["scale", "recover"]] = None
+    ep_join_rank_offset: int = 0
     max_ep_size: Optional[int] = None
     elastic_ep_rejoin: bool = False
 
@@ -3004,6 +3005,13 @@ class ServerArgs:
             assert (
                 self.elastic_ep_backend is not None
             ), "--ep-join-mode requires --elastic-ep-backend to be set."
+        if self.ep_join_rank_offset != 0:
+            assert self.ep_join_mode is not None, (
+                "--ep-join-rank-offset requires --ep-join-mode."
+            )
+            assert (
+                self.ep_join_rank_offset >= 0
+            ), "--ep-join-rank-offset must be >= 0."
         if self.max_ep_size is not None:
             assert (
                 self.elastic_ep_backend is not None
@@ -5451,6 +5459,16 @@ class ServerArgs:
             help="Join mode for elastic EP. 'recover' rejoins an existing slot after a fault "
             "(replaces --elastic-ep-rejoin from PR #15771). 'scale' joins as a brand-new "
             "rank beyond the original group size.",
+        )
+        parser.add_argument(
+            "--ep-join-rank-offset",
+            type=int,
+            default=ServerArgs.ep_join_rank_offset,
+            help="Global EP rank offset for joiner processes. A joiner launched with "
+            "--nnodes 1 --tp N computes local ranks 0..N-1; this offset shifts them "
+            "to global ranks [offset, offset+N) for elastic EP bookkeeping "
+            "(active_ranks, EPLB, NIXL connect_ranks). Default 0. "
+            "Requires --ep-join-mode.",
         )
         parser.add_argument(
             "--elastic-ep-rejoin",
