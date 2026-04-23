@@ -8,6 +8,9 @@ Two test classes:
     / scale-down / over-max requests. Pure control-plane; does NOT exercise
     a real scale (no joining ranks are launched).
 
+  TestElasticScaleColdStartThenScale (alias TestElasticScaleColdStart8Ranks)
+    8-GPU gsm8k smoke with --max-ep-size 8 (baseline elastic / NIXL plumbing).
+
   TestElasticScaleUpEndToEnd
     8-GPU full scale-up. Launches primary (node-rank 0, GPUs 0..3) and
     joining group (node-rank 1 with --ep-join-mode scale, GPUs 4..7) in
@@ -20,6 +23,11 @@ Run with:
   # Control plane only (needs 4 GPUs):
   CUDA_VISIBLE_DEVICES=0,1,2,3 python -m pytest \\
       test/manual/ep/test_elastic_scale.py::TestElasticScaleServerLaunch \\
+      -v -s
+
+  # 8-GPU gsm8k baseline:
+  CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python -m pytest \\
+      test/manual/ep/test_elastic_scale.py::TestElasticScaleColdStartThenScale \\
       -v -s
 
   # Full scale-up (needs 8 GPUs):
@@ -193,21 +201,11 @@ COLD_START_8RANK_ARGS = [
     _count_visible_gpus() >= 8,
     "Cold-start 8-rank smoke test needs 8 GPUs.",
 )
-class TestElasticScaleColdStart8Ranks(CustomTestCase):
-    """Launch an 8-rank cluster cold-start with --max-ep-size 8.
+class TestElasticScaleColdStartThenScale(CustomTestCase):
+    """8-GPU cold-start gsm8k with --max-ep-size 8 (baseline smoke).
 
-    This mirrors test_nixl_ep.py::TestNixlMoeMooncakeElasticEP but with our
-    new --max-ep-size flag set. Purpose: prove that simply adding
-    --max-ep-size (even when it equals world_size) doesn't regress baseline
-    serving. No scale API is exercised.
-
-    If this passes, we know:
-      * max_ep_size=world_size path is safe;
-      * active_ranks pre-allocation to 8 slots (with slots [4:] zeroed) is
-        correctly handled by EPLB, the NIXL dispatcher's active_ranks
-        slice, and mlp_sync;
-      * the init_pg / init logging tagged [Elastic EP] doesn't break
-        anything.
+    Same as TestNixlMoeMooncakeElasticEP plus --max-ep-size; does not POST
+    /scale_elastic_ep.
     """
 
     @classmethod
@@ -243,6 +241,9 @@ class TestElasticScaleColdStart8Ranks(CustomTestCase):
         """gsm8k on the 8-rank cold-started cluster with --max-ep-size 8."""
         metrics = self._run_gsm8k()
         self.assertGreater(metrics["score"], 0.60)
+
+
+TestElasticScaleColdStart8Ranks = TestElasticScaleColdStartThenScale
 
 
 TP_PER_GROUP = 4
