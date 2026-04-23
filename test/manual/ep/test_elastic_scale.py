@@ -11,12 +11,12 @@ Two test classes:
   TestElasticScaleColdStartThenScale
     8-GPU gsm8k smoke with --max-ep-size 8 (baseline elastic / NIXL plumbing).
 
-  TestElasticScaleUpEndToEnd
-    8-GPU full scale-up. Launches primary (node-rank 0, GPUs 0..3) and
-    joining group (node-rank 1 with --ep-join-mode scale, GPUs 4..7) in
-    parallel so torch's init_process_group rendezvous completes. After
-    both are up, POSTs /scale_elastic_ep and verifies is_scaling flips
-    True -> False and post-scale inference works.
+  TestElasticScaleUpEndToEndNodes2 / TestElasticScaleUpEndToEndNodes1
+    8-GPU full scale-up. Primary runs on GPUs 0..3; the joiner on GPUs 4..7
+    differs only in how it is invoked:
+      * Nodes2: --nnodes 2 --tp 8 --node-rank 1  (SGLang cross-node mode)
+      * Nodes1: --nnodes 1 --tp 4 --node-rank 0  (SGLang single-node mode)
+    Both kept so we can A/B compare Mooncake PG joiner-attach semantics.
 
 Run with:
 
@@ -30,9 +30,12 @@ Run with:
       test/manual/ep/test_elastic_scale.py::TestElasticScaleColdStartThenScale \\
       -v -s
 
-  # Full scale-up (needs 8 GPUs):
+  # Scale-up variants (need 8 GPUs):
   CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python -m pytest \\
-      test/manual/ep/test_elastic_scale.py::TestElasticScaleUpEndToEnd \\
+      test/manual/ep/test_elastic_scale.py::TestElasticScaleUpEndToEndNodes2 \\
+      -v -s
+  CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python -m pytest \\
+      test/manual/ep/test_elastic_scale.py::TestElasticScaleUpEndToEndNodes1 \\
       -v -s
 """
 
@@ -269,19 +272,9 @@ def _scale_up_common_args(
     nnodes: int,
     node_rank: int,
 ) -> list[str]:
-    """CLI args shared by both primary and joining group in the scale test.
-
-    Primary uses `tp_size=TP_PER_GROUP, nnodes=1, node_rank=0` -- a standalone
-    small cluster.
-
-    Joining group uses `tp_size=TOTAL_EP_SIZE, nnodes=2, node_rank=1` so
-    SGLang computes its ranks as tp_size*pp_rank + tp_rank = 4..7 (the new
-    slots in the extended post-scale world). torch's init_process_group
-    receives world_size=TOTAL_EP_SIZE, rank=4..7; Mooncake PG's
-    recovered_rank=True skips the rendezvous and attaches to the primary's
-    extended group. Mooncake's get_world_size() currently still reports 4
-    after extend (known limitation, a fix is planned on the Mooncake side),
-    but that shouldn't block attach semantics.
+    """Shared CLI for primary + joiner. Varies: tp_size, nnodes, node_rank,
+    dist_init_addr. Joiner shape (nnodes=2 vs nnodes=1) is chosen by the
+    concrete TestElasticScaleUpEndToEnd* subclass.
     """
     return [
         "--trust-remote-code",
@@ -314,43 +307,24 @@ def _scale_up_common_args(
     ]
 
 
-@unittest.skip(
-    "Full scale-up E2E currently blocked on a Mooncake PG limitation: "
-    "after extend_group_size_to(N), the primary's poll loop calls "
-    "get_peer_state on the new ranks, which submits transfer tasks to "
-    "peers that the Mooncake transfer engine hasn't yet registered "
-    "(the joining group's init_process_group hasn't finished). This "
-    "hits an assertion in mooncake-transfer-engine/multi_transport.cpp "
-    "line 148 ('task.slice_count' failed) and aborts all primary "
-    "schedulers. Per the RFC thread, the Mooncake team is planning a "
-    "fix on their side. Until then, all control-plane behavior is "
-    "covered by TestElasticScaleServerLaunch and the manual "
-    "run_elastic_scale_up.sh script exercises what the primary side "
-    "does correctly (extend_group_size_to returns 200 before the "
-    "crash, proving the scheduler / ZMQ / HTTP stack is sound)."
-)
-@unittest.skipUnless(
-    _count_visible_gpus() >= TOTAL_EP_SIZE,
-    f"Full scale-up E2E needs {TOTAL_EP_SIZE} GPUs "
-    f"(primary {TP_PER_GROUP} + joining {TP_PER_GROUP}).",
-)
-class TestElasticScaleUpEndToEnd(CustomTestCase):
-    """End-to-end scale-up with real joining ranks, launched on demand.
+class _ElasticScaleUpEndToEndBase(CustomTestCase):
+    """Shared scale-up E2E plumbing (not collected — leading underscore).
 
-    Sequence the test exercises:
+    Subclasses set `JOIN_TP`, `JOIN_NNODES`, `JOIN_NODE_RANK` and pytest
+    collects them as TestElasticScaleUpEndToEndNodes{1,2}.
+
+    Sequence:
       1. launch primary --tp TP_PER_GROUP --nnodes 1 on GPUs 0..3
-      2. primary becomes healthy, POST /generate to verify 4-rank serving
-      3. launch joining group --tp TP_PER_GROUP --nnodes 1 --ep-join-mode
-         scale on GPUs 4..7 (no health wait)
+      2. primary healthy, /generate sanity-check at ep_size=4
+      3. launch joiner on GPUs 4..7 (subclass-specific shape)
       4. POST /scale_elastic_ep {new_ep_size: TOTAL_EP_SIZE}
-      5. wait for the join to complete (primary log shows "joined ranks ... done")
-      6. POST /generate to verify post-scale inference
-
-    Both groups use --nnodes 1 because each group is its own torch world;
-    they share --dist-init-addr so Mooncake PG can rendezvous across them.
-    The joining group uses --ep-join-mode scale so its Mooncake PG init
-    attaches to the existing group rather than requiring a fresh rendezvous.
+      5. wait for join
+      6. /generate post-scale
     """
+
+    JOIN_TP: int
+    JOIN_NNODES: int
+    JOIN_NODE_RANK: int
 
     @classmethod
     def setUpClass(cls):
@@ -358,7 +332,6 @@ class TestElasticScaleUpEndToEnd(CustomTestCase):
         cls.base_url = BASE_URL_A
         cls._joining_proc = None
 
-        # Step 1: launch primary alone with --nnodes 1, wait for health.
         primary_args = _scale_up_common_args(
             DIST_INIT_ADDR_A, tp_size=TP_PER_GROUP, nnodes=1, node_rank=0
         )
@@ -376,18 +349,6 @@ class TestElasticScaleUpEndToEnd(CustomTestCase):
 
     @classmethod
     def _launch_joining_group(cls) -> None:
-        """Launch the second 4-rank group with --ep-join-mode scale.
-
-        Uses --nnodes 2 --tp TOTAL_EP_SIZE --node-rank 1 so SGLang computes
-        this group's ranks as 4..7 of an 8-rank world. Combined with
-        --ep-join-mode scale (which sets recovered_rank=True on Mooncake
-        PG), torch's init_process_group skips rendezvous and Mooncake PG
-        attaches the new ranks to the primary's extended group.
-
-        The subprocess's stdout/stderr go to a file in /tmp so we can
-        diagnose separately from pytest's primary-focused log. The path
-        is printed at launch time for easy access.
-        """
         cmd = [
             "sglang",
             "serve",
@@ -395,9 +356,9 @@ class TestElasticScaleUpEndToEnd(CustomTestCase):
             cls.model,
             *_scale_up_common_args(
                 DIST_INIT_ADDR_B,
-                tp_size=TOTAL_EP_SIZE,
-                nnodes=2,
-                node_rank=1,
+                tp_size=cls.JOIN_TP,
+                nnodes=cls.JOIN_NNODES,
+                node_rank=cls.JOIN_NODE_RANK,
             ),
             "--ep-join-mode",
             "scale",
@@ -412,13 +373,14 @@ class TestElasticScaleUpEndToEnd(CustomTestCase):
         env["CUDA_VISIBLE_DEVICES"] = ",".join(
             str(i) for i in range(TP_PER_GROUP, TOTAL_EP_SIZE)
         )
-        # Route joining-group output to its own file so we can inspect
-        # it after the test; the primary's output stays on pytest stdout.
         joining_log = os.environ.get(
             "SGLANG_ELASTIC_SCALE_JOINING_LOG",
-            f"/tmp/elastic_scale_joining_{int(time.time())}.log",
+            f"/tmp/elastic_scale_joining_nnodes{cls.JOIN_NNODES}_{int(time.time())}.log",
         )
-        print(f"[TEST] Launching joining group; logs -> {joining_log}")
+        print(
+            f"[TEST] Launching joiner (nnodes={cls.JOIN_NNODES}, "
+            f"tp={cls.JOIN_TP}, node_rank={cls.JOIN_NODE_RANK}); logs -> {joining_log}"
+        )
         cls._joining_log_path = joining_log
         cls._joining_log_fh = open(joining_log, "w")
         cls._joining_proc = subprocess.Popen(
@@ -534,6 +496,52 @@ class TestElasticScaleUpEndToEnd(CustomTestCase):
 
         # Step 5: post-scale inference works.
         self._generate_ok("post-scale (8 ranks)")
+
+
+_SCALE_SKIP_REASON = (
+    "Full scale-up E2E blocked on Mooncake PG joiner-attach + phantom-slot "
+    "poll (see elastic_ep_scale_rfc_v2_recovery_based.md, questions to the "
+    "Mooncake team). Both joiner shapes kept as repros so we can A/B."
+)
+
+
+@unittest.skip(_SCALE_SKIP_REASON)
+@unittest.skipUnless(
+    _count_visible_gpus() >= TOTAL_EP_SIZE,
+    f"Full scale-up E2E needs {TOTAL_EP_SIZE} GPUs.",
+)
+class TestElasticScaleUpEndToEndNodes2(_ElasticScaleUpEndToEndBase):
+    """Joiner as nnodes=2, tp=8, node_rank=1 (current behavior).
+
+    SGLang computes joiner ranks as 4..7 via _calculate_rank_ranges. torch
+    init_process_group(world_size=8, rank=4..7) relies on Mooncake
+    recovered_rank=True to skip the TCP-store rendezvous. Triggers
+    SGLang's cross-node code paths (ZMQ/DP-attention/tensor transport).
+    """
+
+    JOIN_TP = TOTAL_EP_SIZE
+    JOIN_NNODES = 2
+    JOIN_NODE_RANK = 1
+
+
+@unittest.skip(_SCALE_SKIP_REASON)
+@unittest.skipUnless(
+    _count_visible_gpus() >= TOTAL_EP_SIZE,
+    f"Full scale-up E2E needs {TOTAL_EP_SIZE} GPUs.",
+)
+class TestElasticScaleUpEndToEndNodes1(_ElasticScaleUpEndToEndBase):
+    """Joiner as nnodes=1, tp=4, node_rank=0 (alternative shape).
+
+    torch init_process_group rendezvous completes locally (4-of-4 on the
+    joiner's own TCP store). Mooncake join_group(recovered_rank=True)
+    blocks waiting for the primary's extend_group_size_to(N); local ranks
+    0..3 must be remapped to global 4..7 by Mooncake at attach. Keeps
+    SGLang on the single-node code path (no cross-node DP handshake).
+    """
+
+    JOIN_TP = TP_PER_GROUP
+    JOIN_NNODES = 1
+    JOIN_NODE_RANK = 0
 
 
 if __name__ == "__main__":
