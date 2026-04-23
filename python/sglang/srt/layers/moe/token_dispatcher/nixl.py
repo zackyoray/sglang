@@ -101,6 +101,9 @@ class NixlEPBuffer:
 
         rank = dist.get_rank(group)
         world_size = dist.get_world_size(group)
+        # Joiners with --ep-join-rank-offset N use global EP rank r + N.
+        offset = ElasticEPStateManager.get_ep_join_rank_offset()
+        global_rank = rank + offset
 
         # For elastic EP, NIXL needs to allocate buffers for the maximum EP
         # size up front because update_memory_buffers cannot resize at
@@ -141,12 +144,13 @@ class NixlEPBuffer:
 
         logger.info(
             f"Using NIXL EP (world_size={world_size}, max_ep_size={max_ep_size}, "
-            f"rank={rank}, num_experts={cls._num_experts}, "
+            f"rank={rank}, global_rank={global_rank}, offset={offset}, "
+            f"num_experts={cls._num_experts}, "
             f"num_experts_per_rank={cls._num_local_experts}) "
         )
 
         cls._buffer = Buffer(
-            rank=rank,
+            rank=global_rank,
             tcp_store_group=tcp_store,
         )
 
@@ -155,18 +159,22 @@ class NixlEPBuffer:
             num_experts_per_rank=cls._num_local_experts,
             num_rdma_bytes=num_rdma_bytes,
         )
-        # Initial mesh: current PG only. Further growth: _scale_to vs _connected_ep_size
-        # on each get_nixl_buffer after on_scale() sets _scale_to.
-        live_ranks = list(range(world_size))
+        # Initial mesh: local live EP slice, shifted by offset on the joiner.
+        # Further growth: _scale_to vs _connected_ep_size on each get_nixl_buffer
+        # after on_scale() sets _scale_to.
+        live_ranks = list(range(offset, offset + world_size))
+        scale_to = offset + world_size
         logger.info(
-            "[Elastic EP][nixl] initial connect_ranks(%s) (world_size=%s, max_ep_size=%s)",
+            "[Elastic EP][nixl] initial connect_ranks(%s) "
+            "(world_size=%s, offset=%s, max_ep_size=%s)",
             live_ranks,
             world_size,
+            offset,
             max_ep_size,
         )
         cls._buffer.connect_ranks(live_ranks)
-        cls._connected_ep_size = world_size
-        cls._scale_to = world_size
+        cls._connected_ep_size = scale_to
+        cls._scale_to = scale_to
 
         return cls._buffer
 
@@ -223,6 +231,9 @@ class _NixlEPDispatcherImplBase:
         # (not 0), so we track the live portion separately to preserve the
         # "reserved slots stay at 0" invariant required by is_scaling().
         self._active_world_size = dist.get_world_size(group)
+        # Joiner with --ep-join-rank-offset N writes its dispatcher mask into
+        # active_ranks[N : N + world_size] rather than [:world_size].
+        self._active_rank_offset = ElasticEPStateManager.get_ep_join_rank_offset()
         self._mask_buffer = (
             torch.zeros_like(self.active_ranks)
             if self.active_ranks is not None
@@ -398,7 +409,10 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
             # reserved slots (max_ep_size > world_size) with a sentinel that
             # would corrupt is_scaling() / EPLB if we wrote it through.
             n = self._active_world_size
-            self.active_ranks[:n].copy_(1 - self._mask_buffer[:n])
+            off = self._active_rank_offset
+            self.active_ranks[off : off + n].copy_(
+                1 - self._mask_buffer[off : off + n]
+            )
 
         self.packed_recv_count = self.handle = None
         return combined_hidden_states, event, hook

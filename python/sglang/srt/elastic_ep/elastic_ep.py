@@ -85,16 +85,20 @@ class ElasticEPStateManager:
             elif backend == "mooncake":
                 cls._on_scale = cls._on_scale_mooncake
 
-            if server_args.ep_join_mode in ("scale", "recover"):
-                # Mask out peer ranks to perform cuda graph capture on its own
-                cls._instance.active_ranks.zero_()
-                cls._instance.active_ranks[torch.distributed.get_rank()] = 1
-                cls._instance.snapshot_active_to_last()
-                cls._instance.sync_active_to_cpu()
-
             cls._instance.ep_join_rank_offset = (
                 getattr(server_args, "ep_join_rank_offset", 0) or 0
             )
+
+            if server_args.ep_join_mode in ("scale", "recover"):
+                # Joiner's local torch rank + offset = its global EP index.
+                # Mark only that slot so cuda graph capture runs standalone.
+                global_rank = (
+                    torch.distributed.get_rank() + cls._instance.ep_join_rank_offset
+                )
+                cls._instance.active_ranks.zero_()
+                cls._instance.active_ranks[global_rank] = 1
+                cls._instance.snapshot_active_to_last()
+                cls._instance.sync_active_to_cpu()
 
             logger.info(
                 "[Elastic EP][init] rank=%d world_size=%d max_ep_size=%s "
