@@ -325,6 +325,7 @@ class _ElasticScaleUpEndToEndBase(CustomTestCase):
     JOIN_TP: int
     JOIN_NNODES: int
     JOIN_NODE_RANK: int
+    JOIN_RANK_OFFSET: int = 0
 
     @classmethod
     def setUpClass(cls):
@@ -362,6 +363,8 @@ class _ElasticScaleUpEndToEndBase(CustomTestCase):
             ),
             "--ep-join-mode",
             "scale",
+            "--ep-join-rank-offset",
+            str(cls.JOIN_RANK_OFFSET),
             "--host",
             "127.0.0.1",
             "--port",
@@ -530,18 +533,19 @@ class TestElasticScaleUpEndToEndNodes2(_ElasticScaleUpEndToEndBase):
     f"Full scale-up E2E needs {TOTAL_EP_SIZE} GPUs.",
 )
 class TestElasticScaleUpEndToEndNodes1(_ElasticScaleUpEndToEndBase):
-    """Joiner as nnodes=1, tp=4, node_rank=0 (alternative shape).
+    """Joiner as nnodes=1, tp=4, node_rank=0 with --ep-join-rank-offset 4.
 
     torch init_process_group rendezvous completes locally (4-of-4 on the
     joiner's own TCP store). Mooncake join_group(recovered_rank=True)
-    blocks waiting for the primary's extend_group_size_to(N); local ranks
-    0..3 must be remapped to global 4..7 by Mooncake at attach. Keeps
+    attaches to the primary's extended group, and local torch ranks 0..3
+    are mapped to global EP ranks 4..7 via --ep-join-rank-offset. Keeps
     SGLang on the single-node code path (no cross-node DP handshake).
     """
 
     JOIN_TP = TP_PER_GROUP
     JOIN_NNODES = 1
     JOIN_NODE_RANK = 0
+    JOIN_RANK_OFFSET = TP_PER_GROUP
 
 
 if __name__ == "__main__":
