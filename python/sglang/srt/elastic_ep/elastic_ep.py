@@ -90,11 +90,9 @@ class ElasticEPStateManager:
             )
 
             if server_args.ep_join_mode in ("scale", "recover"):
-                # Joiner's local torch rank + offset = its global EP index.
-                # Mark only that slot so cuda graph capture runs standalone.
-                global_rank = (
-                    torch.distributed.get_rank() + cls._instance.ep_join_rank_offset
-                )
+                # The PG rank already includes ep_join_rank_offset (set in
+                # model_runner), so it IS the global EP index.
+                global_rank = torch.distributed.get_rank()
                 cls._instance.active_ranks.zero_()
                 cls._instance.active_ranks[global_rank] = 1
                 cls._instance.snapshot_active_to_last()
