@@ -1709,8 +1709,10 @@ def init_distributed_environment(
                 "(rank=%d world_size=%d)", rank, world_size,
             )
 
-        # Create a global TCPStore for coordination (used by NIXL)
-        if moe_a2a_backend == "nixl":
+        # Create a global TCPStore for coordination (used by NIXL).
+        # Skip for elastic EP joiners: the broadcast uses src=0 which is
+        # the primary (not in this PG), so it would hang/crash.
+        if moe_a2a_backend == "nixl" and not recovered_rank:
             _create_global_tcp_store(rank, world_size)
 
     # set the local rank
