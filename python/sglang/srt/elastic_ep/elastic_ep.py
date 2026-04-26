@@ -271,24 +271,29 @@ def try_recover_ranks(global_ranks: List[int]) -> bool:
 
     new_group_size = ElasticEPStateManager.get_effective_ep_size()
 
-    # Sub-groups: extend + recover without polling.  We already confirmed
-    # readiness on the WORLD group, and joiners are blocked in join_group
-    # on these sub-groups waiting for recover_ranks.  Polling get_peer_state
-    # here would deadlock because the joiner can't publish sub-group
-    # metadata until recover_ranks unblocks it on the WORLD group (which
-    # already happened), but it still needs the sub-group recover to
-    # proceed past join_group on the sub-group.
+    # Extend all sub-groups first, then recover them.  Extending all at
+    # once lets the joiner proceed through join_group on each sub-group
+    # as soon as it unblocks from the WORLD recover.  If we interleave
+    # extend+recover per group, the joiner may not have entered
+    # join_group on a later sub-group yet when we try to recover it.
+    sub_groups = []
     for group in _iter_live_parallel_groups():
         group_local_ranks = _map_global_to_group_local_ranks(group.ranks, global_ranks)
         if not group_local_ranks:
             continue
 
         device_backend = _get_process_group_backend(group.device_group, "cuda")
-        mooncake_ep.extend_group_size_to(device_backend, new_group_size)
-        mooncake_ep.recover_ranks(device_backend, group_local_ranks)
-
         cpu_backend = _get_process_group_backend(group.cpu_group, "cpu")
+        mooncake_ep.extend_group_size_to(device_backend, new_group_size)
         mooncake_ep.extend_group_size_to(cpu_backend, new_group_size)
+        sub_groups.append((group, group_local_ranks, device_backend, cpu_backend))
+
+    # Brief pause to let joiners enter join_group on sub-groups after
+    # their WORLD join_group returned.
+    time.sleep(1)
+
+    for group, group_local_ranks, device_backend, cpu_backend in sub_groups:
+        mooncake_ep.recover_ranks(device_backend, group_local_ranks)
         mooncake_ep.recover_ranks(cpu_backend, group_local_ranks)
         _maybe_create_message_queue(group)
 
