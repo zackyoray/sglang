@@ -1550,8 +1550,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if seen != tuple(ranks_to_join):
                 logger.info(
                     "[Elastic EP][poll] detected ranks_to_join=%s "
-                    "effective_ep_size=%d tp_active_ranks=%s",
-                    ranks_to_join, effective_size, tp_active_ranks.tolist(),
+                    "effective_ep_size=%d active_ranks=%s",
+                    ranks_to_join, effective_size, active.tolist(),
                 )
                 self._logged_ranks_to_join = tuple(ranks_to_join)
                 self._last_poll_log_id = self.forward_pass_id
