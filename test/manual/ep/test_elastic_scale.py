@@ -459,28 +459,19 @@ class _ElasticScaleUpEndToEndBase(CustomTestCase):
              ranks 4..7 live, EPLB rebalances, NIXL connects.
           5. verify post-scale inference works.
 
-        Launch-BEFORE-scale order is required: if we scale BEFORE the
-        joining group is up, the primary's poll loop tries to call
-        get_peer_state on phantom ranks, hitting Mooncake's
-        multi_transport.cpp:148 'task.slice_count' assertion.
+        Scale-BEFORE-launch order follows the Mooncake confirmed protocol:
+          extend_group_size_to → joiner init → joiner join_group →
+          primary get_peer_state → primary recover_ranks.
+        Mooncake PR #1968 makes get_peer_state return False for slots
+        that haven't joined yet, so polling before the joiner is up
+        is safe (no crash, just returns False).
         """
         # Step 1: sanity-check that the 4-rank primary serves traffic.
         self._generate_ok("pre-scale (4 ranks)")
 
-        # Step 2: launch the joining group FIRST. It will block in
-        # init_process_group until the primary's Mooncake group is
-        # extended (done in step 3 via POST /scale_elastic_ep).
-        self._launch_joining_group()
-
-        # Give the joining group time to reach init_process_group.
-        # Model weights aren't loaded yet (init_process_group happens
-        # before load_weight in model_runner.__init__), so this should
-        # only take ~10-20 seconds after the subprocess starts.
-        time.sleep(30)
-
-        # Step 3: trigger the scale. This runs extend_group_size_to(8)
-        # on the primary's Mooncake PG, which unblocks the joining
-        # group's init_process_group attach.
+        # Step 2: trigger the scale FIRST.  extend_group_size_to(8) on
+        # the primary grows the PG so new slots exist.  get_peer_state
+        # on empty slots returns False (Mooncake PR #1968).
         resp = self._post(
             "/scale_elastic_ep", json={"new_ep_size": TOTAL_EP_SIZE}
         )
@@ -492,6 +483,11 @@ class _ElasticScaleUpEndToEndBase(CustomTestCase):
         body = resp.json()
         self.assertEqual(body["old_ep_size"], TP_PER_GROUP)
         self.assertEqual(body["new_ep_size"], TOTAL_EP_SIZE)
+
+        # Step 3: launch the joining group.  It will init_process_group
+        # (extension mode), load model, skip CUDA graphs, then call
+        # join_group() which blocks until recover_ranks().
+        self._launch_joining_group()
 
         # Step 4: wait for the join to complete.  The primary's poll
         # loop (maybe_join_ep_ranks) runs at the end of every forward
