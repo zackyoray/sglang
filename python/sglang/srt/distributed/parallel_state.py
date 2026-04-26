@@ -1795,8 +1795,15 @@ def initialize_model_parallel(
     """
     # Get world size and rank. Ensure some consistencies.
     assert torch.distributed.is_initialized()
-    world_size: int = torch.distributed.get_world_size()
     backend = backend or torch.distributed.get_backend(get_world_group().device_group)
+
+    # Elastic EP joiners have PG world_size=max_ep_size (e.g. 8) but only
+    # tp_size*pp_size local ranks (e.g. 4). Use the local size for parallel
+    # group construction; the extended PG size is only for Mooncake metadata.
+    if recovered_rank:
+        world_size = tensor_model_parallel_size * pipeline_model_parallel_size
+    else:
+        world_size: int = torch.distributed.get_world_size()
 
     if world_size != tensor_model_parallel_size * pipeline_model_parallel_size:
         raise RuntimeError(
