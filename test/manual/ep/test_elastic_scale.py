@@ -308,10 +308,13 @@ def _scale_up_common_args(
 
 
 class _ElasticScaleUpEndToEndBase(CustomTestCase):
-    """Shared scale-up E2E plumbing (not collected — leading underscore).
+    """Shared scale-up E2E plumbing — abstract base, not collected directly.
 
     Subclasses set `JOIN_TP`, `JOIN_NNODES`, `JOIN_NODE_RANK` and pytest
     collects them as TestElasticScaleUpEndToEndNodes{1,2}.
+
+    The __init_subclass__ hook ensures pytest skips this base class
+    when it lacks the required JOIN_* attributes.
 
     Sequence:
       1. launch primary --tp TP_PER_GROUP --nnodes 1 on GPUs 0..3
@@ -327,8 +330,14 @@ class _ElasticScaleUpEndToEndBase(CustomTestCase):
     JOIN_NODE_RANK: int
     JOIN_RANK_OFFSET: int = 0
 
+    def setUp(self):
+        if not hasattr(type(self), "JOIN_TP") or type(self) is _ElasticScaleUpEndToEndBase:
+            self.skipTest("Abstract base — run a concrete subclass instead")
+
     @classmethod
     def setUpClass(cls):
+        if cls is _ElasticScaleUpEndToEndBase:
+            raise unittest.SkipTest("Abstract base — run a concrete subclass instead")
         cls.model = TEST_MODEL
         cls.base_url = BASE_URL_A
         cls._joining_proc = None
