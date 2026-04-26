@@ -1533,18 +1533,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         joining beyond the original group). Runs at the end of every forward
         pass when --elastic-ep-backend is set.
         """
-        if self.tp_group.active_ranks.all() and self.tp_group.active_ranks_cpu.all():
+        if not ElasticEPStateManager.is_scaling():
             return
 
-        tp_active_ranks = self.tp_group.active_ranks.detach().cpu().numpy()
-        tp_active_ranks_cpu = self.tp_group.active_ranks_cpu.detach().numpy()
-        tp_active_ranks &= tp_active_ranks_cpu
-        # NOTE: `ranks_to_join` uses indices in `tp_group`. For the current
-        # Mooncake elastic EP implementation we assume `--pp-size=1`, so the
-        # tp-group index is the same as the global rank index.
         effective_size = ElasticEPStateManager.get_effective_ep_size()
+        active = ElasticEPStateManager.instance().active_ranks_cpu.detach().numpy()
         ranks_to_join = [
-            i for i in range(effective_size) if not tp_active_ranks[i]
+            i for i in range(effective_size) if not active[i]
         ]
 
         # Log first detection of each target set, plus periodic reminders
