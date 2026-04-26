@@ -310,8 +310,12 @@ class DataParallelController:
         Returns:
             List of worker ports (same on all nodes after broadcast).
         """
-        # Determine the endpoint for inter-node communication
-        if server_args.dist_init_addr is None:
+        # Determine the endpoint for inter-node communication.
+        # Elastic EP joiners share the primary's dist_init_addr for the PG
+        # Store, but derive DP-handshake and ZMQ ports from their own HTTP
+        # port to avoid collisions with the primary.
+        is_joiner = server_args.ep_join_mode in ("scale", "recover")
+        if server_args.dist_init_addr is None or is_joiner:
             na = NetworkAddress(
                 server_args.host or "127.0.0.1",
                 server_args.port + DP_ATTENTION_HANDSHAKE_PORT_DELTA,

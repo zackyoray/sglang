@@ -7093,7 +7093,14 @@ class PortArgs:
 
             dist_init_host = na.host
             dist_init_port = na.port
-            port_base = dist_init_port + 1
+
+            # Elastic EP joiners share the primary's dist_init_addr (for the
+            # Mooncake PG Store), but must not collide on ZMQ ports.  Derive
+            # ZMQ ports from the joiner's own HTTP port instead.
+            if server_args.ep_join_mode in ("scale", "recover"):
+                port_base = server_args.port + ZMQ_TCP_PORT_DELTA
+            else:
+                port_base = dist_init_port + 1
             detokenizer_port = port_base + 1
             rpc_port = port_base + 2
             metrics_port = port_base + 3
@@ -7104,9 +7111,11 @@ class PortArgs:
                 assert worker_ports is not None
                 scheduler_input_port = worker_ports[dp_rank]
 
+            is_joiner = server_args.ep_join_mode in ("scale", "recover")
             try:
                 if dp_rank is None:
-                    wait_port_available(dist_init_port, "dist_init_port")
+                    if not is_joiner:
+                        wait_port_available(dist_init_port, "dist_init_port")
                     wait_port_available(port_base, "port_base")
                     wait_port_available(detokenizer_port, "detokenizer_port")
                     wait_port_available(nccl_port, "nccl_port")

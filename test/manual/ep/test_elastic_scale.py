@@ -248,18 +248,12 @@ class TestElasticScaleColdStartThenScale(CustomTestCase):
 
 TP_PER_GROUP = 4
 TOTAL_EP_SIZE = TP_PER_GROUP * 2  # 8
-# Each --nnodes 1 group needs its OWN torch rendezvous port. Mooncake PG
-# bridges them via its own metadata channel, not torch's init_process_group.
-#
-# IMPORTANT: SGLang derives a cluster of ports from --dist-init-addr:
-#   dist_init_port, port_base=+1, detokenizer=+2, rpc=+3, metrics=+4,
-#   scheduler_input=+5. We leave a 10-port gap so the two groups don't
-#   overlap.
-DIST_INIT_ADDR_A = os.environ.get(
-    "SGLANG_ELASTIC_SCALE_DIST_INIT_A", "127.0.0.1:24555"
-)
-DIST_INIT_ADDR_B = os.environ.get(
-    "SGLANG_ELASTIC_SCALE_DIST_INIT_B", "127.0.0.1:24570"
+# Primary and joiner share the SAME dist_init_addr so their Mooncake PG
+# metadata lands on the same Store.  ZMQ / DP-handshake port collisions
+# are avoided because joiners (--ep-join-mode scale) derive those ports
+# from their own --port (PORT_B) instead of from dist_init_addr.
+DIST_INIT_ADDR = os.environ.get(
+    "SGLANG_ELASTIC_SCALE_DIST_INIT", "127.0.0.1:24555"
 )
 PORT_A = int(os.environ.get("SGLANG_ELASTIC_SCALE_PORT_A", "21000"))
 PORT_B = int(os.environ.get("SGLANG_ELASTIC_SCALE_PORT_B", "21001"))
@@ -343,7 +337,7 @@ class _ElasticScaleUpEndToEndBase(CustomTestCase):
         cls._joining_proc = None
 
         primary_args = _scale_up_common_args(
-            DIST_INIT_ADDR_A, tp_size=TP_PER_GROUP, nnodes=1, node_rank=0
+            DIST_INIT_ADDR, tp_size=TP_PER_GROUP, nnodes=1, node_rank=0
         )
         primary_env = os.environ.copy()
         primary_env["CUDA_VISIBLE_DEVICES"] = ",".join(
@@ -365,7 +359,7 @@ class _ElasticScaleUpEndToEndBase(CustomTestCase):
             "--model-path",
             cls.model,
             *_scale_up_common_args(
-                DIST_INIT_ADDR_B,
+                DIST_INIT_ADDR,
                 tp_size=cls.JOIN_TP,
                 nnodes=cls.JOIN_NNODES,
                 node_rank=cls.JOIN_NODE_RANK,
@@ -510,14 +504,6 @@ class _ElasticScaleUpEndToEndBase(CustomTestCase):
         self._generate_ok("post-scale (8 ranks)")
 
 
-_SCALE_SKIP_REASON = (
-    "Full scale-up E2E blocked on Mooncake PG joiner-attach + phantom-slot "
-    "poll (see elastic_ep_scale_rfc_v2_recovery_based.md, questions to the "
-    "Mooncake team). Both joiner shapes kept as repros so we can A/B."
-)
-
-
-@unittest.skip(_SCALE_SKIP_REASON)
 @unittest.skipUnless(
     _count_visible_gpus() >= TOTAL_EP_SIZE,
     f"Full scale-up E2E needs {TOTAL_EP_SIZE} GPUs.",
@@ -536,7 +522,6 @@ class TestElasticScaleUpEndToEndNodes2(_ElasticScaleUpEndToEndBase):
     JOIN_NODE_RANK = 1
 
 
-@unittest.skip(_SCALE_SKIP_REASON)
 @unittest.skipUnless(
     _count_visible_gpus() >= TOTAL_EP_SIZE,
     f"Full scale-up E2E needs {TOTAL_EP_SIZE} GPUs.",
