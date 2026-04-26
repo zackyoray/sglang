@@ -268,16 +268,20 @@ def try_recover_ranks(global_ranks: List[int]) -> bool:
     # using ranks mapped into that group's local rank space.
     mooncake_ep.recover_ranks(world_backend, global_ranks)
 
+    new_group_size = ElasticEPStateManager.get_effective_ep_size()
+
     for group in _iter_live_parallel_groups():
         group_local_ranks = _map_global_to_group_local_ranks(group.ranks, global_ranks)
         if not group_local_ranks:
             continue
 
         device_backend = _get_process_group_backend(group.device_group, "cuda")
+        mooncake_ep.extend_group_size_to(device_backend, new_group_size)
         _wait_for_peer_state(mooncake_ep, device_backend, group_local_ranks)
         mooncake_ep.recover_ranks(device_backend, group_local_ranks)
 
         cpu_backend = _get_process_group_backend(group.cpu_group, "cpu")
+        mooncake_ep.extend_group_size_to(cpu_backend, new_group_size)
         _wait_for_peer_state(mooncake_ep, cpu_backend, group_local_ranks)
         mooncake_ep.recover_ranks(cpu_backend, group_local_ranks)
         _maybe_create_message_queue(group)
