@@ -522,6 +522,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 inst.effective_ep_size if inst is not None else -1,
             )
 
+            # Now that join_group is done and NIXL connections can be
+            # established, capture CUDA graphs (skipped during init).
+            if self.device in ("cuda", "musa") and not self.server_args.disable_cuda_graph:
+                logger.info("[Elastic EP][join_rank] Capturing CUDA graphs post-join")
+                self.init_device_graphs()
+                self.init_piecewise_cuda_graphs()
+
         if self.is_multimodal:
             sanity_check_mm_pad_shift_value(self.model_config.vocab_size)
 
@@ -1605,6 +1612,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 ranks_to_join, effective_size, from_ep_size,
             )
             self._logged_ranks_to_join = None
+
+            # Recapture CUDA graphs: the old graphs were captured with
+            # the previous EP topology and are now invalid.
+            if self.graph_runner is not None:
+                logger.info(
+                    "[Elastic EP][poll] Recapturing CUDA graphs for new "
+                    "EP topology (ep_size=%d)", effective_size,
+                )
+                self.init_device_graphs()
+            if self.piecewise_cuda_graph_runner is not None:
+                self.init_piecewise_cuda_graphs()
 
     def _get_healthy_expert_location_src_rank(
         self, invoked_in_ep_join_path: bool
