@@ -757,14 +757,31 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # runs with aux hidden state capture enabled.
         self.init_aux_hidden_state_capture()
 
+        # Elastic EP joiners skip CUDA graph capture during init because
+        # NIXL connections aren't established yet (no peers to dispatch to).
+        # Graphs will be captured after join_group() + activation.
+        skip_graphs = self.server_args.ep_join_mode in ("scale", "recover")
+
         if self.device == "cuda" or self.device == "musa":
             self.init_cublas()
             self.init_attention_backend()
             self.kernel_warmup()
-            self.init_device_graphs()
+            if not skip_graphs:
+                self.init_device_graphs()
+            else:
+                self.graph_runner = None
+                self.graph_mem_usage = 0
+                logger.info(
+                    "[Elastic EP] Skipping CUDA graph capture for joiner "
+                    "(will capture after join_group + activation)"
+                )
         elif self.device in ["npu", "cpu"]:
             self.init_attention_backend()
-            self.init_device_graphs()
+            if not skip_graphs:
+                self.init_device_graphs()
+            else:
+                self.graph_runner = None
+                self.graph_mem_usage = 0
         else:
             self.graph_runner = None
             self.graph_mem_usage = 0
@@ -773,8 +790,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if server_args.forward_hooks:
             register_forward_hooks(self.model, server_args.forward_hooks)
 
-        # Initialize piecewise CUDA graph
-        self.init_piecewise_cuda_graphs()
+        # Initialize piecewise CUDA graph (skip for elastic EP joiners)
+        if not skip_graphs:
+            self.init_piecewise_cuda_graphs()
+        else:
+            self.piecewise_cuda_graph_runner = None
 
         self.prealloc_symmetric_memory_pool()
 
