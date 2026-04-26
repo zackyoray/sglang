@@ -253,7 +253,8 @@ def _maybe_create_message_queue(group) -> None:
 def _refresh_ep_members() -> None:
     from sglang.srt.layers.moe.token_dispatcher.mooncake import EPBuffer
 
-    EPBuffer._buffer.update_ep_member()
+    if EPBuffer._buffer is not None:
+        EPBuffer._buffer.update_ep_member()
 
 
 def try_recover_ranks(global_ranks: List[int]) -> bool:
