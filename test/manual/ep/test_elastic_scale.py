@@ -529,11 +529,9 @@ class TestElasticScaleUpEndToEndNodes2(_ElasticScaleUpEndToEndBase):
 class TestElasticScaleUpEndToEndNodes1(_ElasticScaleUpEndToEndBase):
     """Joiner as nnodes=1, tp=4, node_rank=0 with --ep-join-rank-offset 4.
 
-    torch init_process_group rendezvous completes locally (4-of-4 on the
-    joiner's own TCP store). Mooncake join_group(recovered_rank=True)
-    attaches to the primary's extended group, and local torch ranks 0..3
-    are mapped to global EP ranks 4..7 via --ep-join-rank-offset. Keeps
-    SGLang on the single-node code path (no cross-node DP handshake).
+    Mooncake Shape (A): init_process_group(world_size=8, rank=4..7).
+    The --ep-join-rank-offset shifts local ranks 0..3 to global 4..7
+    and sets world_size=max_ep_size. Stays on single-node code path.
     """
 
     JOIN_TP = TP_PER_GROUP

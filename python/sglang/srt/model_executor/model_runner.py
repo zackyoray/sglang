@@ -1093,15 +1093,30 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     )
 
             # Only initialize the distributed environment on the target model worker.
+            # Elastic EP joiners must use Shape (A): world_size=max_ep_size,
+            # rank=ep_join_rank_offset+local_rank so the Mooncake PG Store
+            # sees them as global ranks (e.g. 4..7 in a 4→8 scale).
+            is_ep_joiner = self.server_args.ep_join_mode in ("scale", "recover")
+            if is_ep_joiner and self.server_args.ep_join_rank_offset > 0:
+                pg_world_size = self.server_args.max_ep_size
+                pg_rank = (
+                    self.server_args.ep_join_rank_offset
+                    + self.tp_size * self.pp_rank
+                    + self.tp_rank
+                )
+            else:
+                pg_world_size = self.tp_size * self.pp_size
+                pg_rank = self.tp_size * self.pp_rank + self.tp_rank
+
             init_distributed_environment(
                 backend=backend,
-                world_size=self.tp_size * self.pp_size,
-                rank=self.tp_size * self.pp_rank + self.tp_rank,
+                world_size=pg_world_size,
+                rank=pg_rank,
                 local_rank=self.gpu_id,
                 distributed_init_method=dist_init_method,
                 timeout=self.server_args.dist_timeout,
                 moe_a2a_backend=self.server_args.moe_a2a_backend,
-                recovered_rank=self.server_args.ep_join_mode in ("scale", "recover"),
+                recovered_rank=is_ep_joiner,
             )
             initialize_model_parallel(
                 tensor_model_parallel_size=self.tp_size,
