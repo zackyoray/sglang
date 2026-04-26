@@ -1591,55 +1591,65 @@ def get_default_distributed_backend(device: str) -> str:
 
 
 def _create_global_tcp_store(
-    rank: int, world_size: int, src_rank: int = 0
+    rank: int,
+    world_size: int,
+    dist_init_addr: Optional[str] = None,
+    recovered_rank: bool = False,
 ) -> None:
     """Create a global TCPStore for coordination across ranks.
 
     This function creates a TCPStore that all ranks can use for coordination
     (e.g., for NIXL buffer setup).
 
-    Args:
-        src_rank: rank that broadcasts the master IP.  Default 0 (primary).
-            Elastic EP joiners pass their lowest rank (e.g. 4) so the
-            broadcast stays within their PG.
+    When ``dist_init_addr`` is provided (always the case for elastic EP),
+    the master IP is derived directly from it -- no broadcast collective
+    needed.  This lets elastic EP joiners create their own TCPStore client
+    that connects to the primary's existing master store.
+
+    The primary's rank 0 creates the master store; all other ranks
+    (including joiners) connect as clients.
     """
     from torch.distributed import TCPStore
 
-    master_ip = os.environ.get("MASTER_ADDR")
+    base_store_port = envs.SGLANG_TCP_STORE_PORT.get()
 
+    # Determine master IP without a collective when possible.
+    master_ip = os.environ.get("MASTER_ADDR")
+    if not master_ip and dist_init_addr:
+        # dist_init_addr is "tcp://host:port" or "host:port"
+        addr = dist_init_addr
+        if addr.startswith("tcp://"):
+            addr = addr[len("tcp://"):]
+        master_ip = addr.rsplit(":", 1)[0]
     if not master_ip:
         logger.warning(
             "Could not determine master IP for global TCPStore. "
-            "Broadcasting from rank %d to all ranks.", src_rank,
+            "Broadcasting from rank 0 to all ranks.",
         )
-
-    base_store_port = envs.SGLANG_TCP_STORE_PORT.get()
-
-    # src_rank gets its local IP and broadcasts it to all ranks
-    if not master_ip:
-        if rank == src_rank:
+        if rank == 0:
             master_ip = get_local_ip_auto()
             ip_list = [master_ip]
         else:
             ip_list = [None]
-
-        torch.distributed.broadcast_object_list(ip_list, src=src_rank)
+        torch.distributed.broadcast_object_list(ip_list, src=0)
         master_ip = ip_list[0]
+
+    is_master = rank == 0 and not recovered_rank
 
     try:
         tcp_store = TCPStore(
             host_name=master_ip,
             port=base_store_port,
-            world_size=world_size,
-            is_master=(rank == 0),
+            is_master=is_master,
+            wait_for_workers=False,
         )
         set_global_tcp_store(tcp_store)
         logger.info(
-            "Created global TCPStore at %s:%d (rank=%d, world_size=%d)",
+            "Created global TCPStore at %s:%d (rank=%d, is_master=%s)",
             master_ip,
             base_store_port,
             rank,
-            world_size,
+            is_master,
         )
     except Exception as e:
         logger.warning(
@@ -1724,10 +1734,16 @@ def init_distributed_environment(
             )
 
         # Create a global TCPStore for coordination (used by NIXL).
-        # For elastic EP joiners, use the lowest joiner rank as broadcast
-        # source (not global rank 0, which is the primary's PG).
+        # When dist_init_addr is known, the master IP is derived directly
+        # from it -- no broadcast collective needed (critical for elastic EP
+        # joiners whose PG doesn't include the primary's rank 0).
         if moe_a2a_backend == "nixl":
-            _create_global_tcp_store(rank, world_size, src_rank=rank_offset)
+            _create_global_tcp_store(
+                rank,
+                world_size,
+                dist_init_addr=distributed_init_method,
+                recovered_rank=recovered_rank,
+            )
 
     # set the local rank
     # local_rank is not available in torch ProcessGroup,
