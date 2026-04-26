@@ -1117,6 +1117,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 timeout=self.server_args.dist_timeout,
                 moe_a2a_backend=self.server_args.moe_a2a_backend,
                 recovered_rank=is_ep_joiner,
+                rank_offset=self.server_args.ep_join_rank_offset,
             )
             initialize_model_parallel(
                 tensor_model_parallel_size=self.tp_size,

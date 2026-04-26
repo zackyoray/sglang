@@ -1590,11 +1590,18 @@ def get_default_distributed_backend(device: str) -> str:
     return _DEVICE_TO_DISTRIBUTED_BACKEND.get(device, "gloo")
 
 
-def _create_global_tcp_store(rank: int, world_size: int) -> None:
+def _create_global_tcp_store(
+    rank: int, world_size: int, src_rank: int = 0
+) -> None:
     """Create a global TCPStore for coordination across ranks.
 
     This function creates a TCPStore that all ranks can use for coordination
     (e.g., for NIXL buffer setup).
+
+    Args:
+        src_rank: rank that broadcasts the master IP.  Default 0 (primary).
+            Elastic EP joiners pass their lowest rank (e.g. 4) so the
+            broadcast stays within their PG.
     """
     from torch.distributed import TCPStore
 
@@ -1603,21 +1610,20 @@ def _create_global_tcp_store(rank: int, world_size: int) -> None:
     if not master_ip:
         logger.warning(
             "Could not determine master IP for global TCPStore. "
-            "Broadcasting from rank 0 to all ranks."
+            "Broadcasting from rank %d to all ranks.", src_rank,
         )
 
     base_store_port = envs.SGLANG_TCP_STORE_PORT.get()
 
-    # Rank 0 gets its local IP and broadcasts it to all ranks
-    # Use broadcast_object_list which works with any backend (handles CPU/GPU automatically)
+    # src_rank gets its local IP and broadcasts it to all ranks
     if not master_ip:
-        if rank == 0:
+        if rank == src_rank:
             master_ip = get_local_ip_auto()
             ip_list = [master_ip]
         else:
             ip_list = [None]
 
-        torch.distributed.broadcast_object_list(ip_list, src=0)
+        torch.distributed.broadcast_object_list(ip_list, src=src_rank)
         master_ip = ip_list[0]
 
     try:
@@ -1654,6 +1660,7 @@ def init_distributed_environment(
     timeout: Optional[int] = None,
     moe_a2a_backend: Optional[str] = None,
     recovered_rank: bool = False,
+    rank_offset: int = 0,
 ):
     logger.debug(
         "world_size=%d rank=%d local_rank=%d " "distributed_init_method=%s backend=%s",
@@ -1717,10 +1724,10 @@ def init_distributed_environment(
             )
 
         # Create a global TCPStore for coordination (used by NIXL).
-        # Skip for elastic EP joiners: the broadcast uses src=0 which is
-        # the primary (not in this PG), so it would hang/crash.
-        if moe_a2a_backend == "nixl" and not recovered_rank:
-            _create_global_tcp_store(rank, world_size)
+        # For elastic EP joiners, use the lowest joiner rank as broadcast
+        # source (not global rank 0, which is the primary's PG).
+        if moe_a2a_backend == "nixl":
+            _create_global_tcp_store(rank, world_size, src_rank=rank_offset)
 
     # set the local rank
     # local_rank is not available in torch ProcessGroup,
