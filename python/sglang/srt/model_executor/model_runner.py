@@ -1127,7 +1127,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 moe_data_model_parallel_size=self.moe_dp_size,
                 duplicate_tp_group=self.server_args.enable_pdmux,
                 enable_symm_mem=self.server_args.enable_symm_mem,
-                recovered_rank=self.server_args.ep_join_mode in ("scale", "recover"),
+                recovered_rank=is_ep_joiner,
+                rank_offset=self.server_args.ep_join_rank_offset,
             )
             initialize_dp_attention(
                 server_args=self.server_args,

@@ -247,6 +247,7 @@ class GroupCoordinator:
         group_name: Optional[str] = None,
         gloo_timeout: timedelta = timedelta(seconds=120 * 60),
         recovered_rank: bool = False,
+        rank_offset: int = 0,
     ):
         # Set group info
         group_name = group_name or "anonymous"
@@ -254,7 +255,11 @@ class GroupCoordinator:
         _register_group(self)
 
         # Set rank info
+        # For elastic EP joiners, the PG rank is global (e.g. 4..7) but
+        # group_ranks are local (e.g. 0..3).  Offset them to match.
         self.rank = torch.distributed.get_rank()
+        if rank_offset > 0:
+            group_ranks = [[r + rank_offset for r in ranks] for ranks in group_ranks]
         self.local_rank = local_rank
         self.device_group = None
         self.cpu_group = None
@@ -1406,6 +1411,7 @@ def init_model_parallel_group(
     use_mscclpp_allreduce: Optional[bool] = None,
     use_torch_symm_mem_allreduce: Optional[bool] = None,
     recovered_rank: bool = False,
+    rank_offset: int = 0,
 ) -> GroupCoordinator:
     if use_custom_allreduce is None:
         use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
@@ -1431,6 +1437,7 @@ def init_model_parallel_group(
         use_message_queue_broadcaster=use_message_queue_broadcaster,
         group_name=group_name,
         recovered_rank=recovered_rank,
+        rank_offset=rank_offset,
     )
 
 
@@ -1748,6 +1755,7 @@ def initialize_model_parallel(
     duplicate_tp_group: bool = False,
     enable_symm_mem: bool = False,
     recovered_rank: bool = False,
+    rank_offset: int = 0,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -1834,6 +1842,7 @@ def initialize_model_parallel(
         use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
         group_name="tp",
         recovered_rank=recovered_rank,
+        rank_offset=rank_offset,
     )
 
     if duplicate_tp_group:
@@ -1848,6 +1857,7 @@ def initialize_model_parallel(
             use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
             group_name="pdmux_prefill_tp",
             recovered_rank=recovered_rank,
+            rank_offset=rank_offset,
         )
         if _TP.pynccl_comm:
             _TP.pynccl_comm.disabled = False
@@ -1887,6 +1897,7 @@ def initialize_model_parallel(
             use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
             group_name="attn_cp",
             recovered_rank=recovered_rank,
+            rank_offset=rank_offset,
         )
 
     from sglang.srt.layers.sampler import SYNC_TOKEN_IDS_ACROSS_TP
@@ -1922,6 +1933,7 @@ def initialize_model_parallel(
             use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
             group_name="attention_tp",
             recovered_rank=recovered_rank,
+            rank_offset=rank_offset,
         )
 
     moe_ep_size = expert_model_parallel_size
@@ -1949,6 +1961,7 @@ def initialize_model_parallel(
             backend,
             group_name="moe_dp",
             recovered_rank=recovered_rank,
+            rank_offset=rank_offset,
         )
 
     global _MOE_EP
@@ -1976,6 +1989,7 @@ def initialize_model_parallel(
             use_custom_allreduce=False,
             group_name="moe_ep",
             recovered_rank=recovered_rank,
+            rank_offset=rank_offset,
         )
 
     global _MOE_TP
@@ -2004,6 +2018,7 @@ def initialize_model_parallel(
             use_custom_allreduce=False,
             group_name="moe_tp",
             recovered_rank=recovered_rank,
+            rank_offset=rank_offset,
         )
 
     # Build the pipeline model-parallel groups.
@@ -2024,6 +2039,7 @@ def initialize_model_parallel(
         use_custom_allreduce=False,
         group_name="pp",
         recovered_rank=recovered_rank,
+        rank_offset=rank_offset,
     )
 
 
