@@ -493,12 +493,30 @@ class _ElasticScaleUpEndToEndBase(CustomTestCase):
         self.assertEqual(body["old_ep_size"], TP_PER_GROUP)
         self.assertEqual(body["new_ep_size"], TOTAL_EP_SIZE)
 
-        # Step 4: wait for the join to complete. After
-        # init_process_group unblocks, the joining group still has to
-        # finish model load (~20s), cuda graph capture (~30s), and
-        # reach the elastic-EP join path. Meanwhile the primary's poll
-        # loop tries try_recover_ranks every forward pass.
-        time.sleep(240)
+        # Step 4: wait for the join to complete.  The primary's poll
+        # loop (maybe_join_ep_ranks) runs at the end of every forward
+        # pass, so we must keep sending requests to drive forward
+        # passes -- without traffic the poll never fires.
+        deadline = time.time() + 300
+        while time.time() < deadline:
+            resp = self._post("/is_scaling_elastic_ep")
+            if resp.ok and not resp.json().get("is_scaling_elastic_ep", True):
+                print("[TEST] Scaling complete!")
+                break
+            # Drive a forward pass so the poll loop runs on all ranks.
+            try:
+                self._post(
+                    "/generate",
+                    json={
+                        "text": "ping",
+                        "sampling_params": {"max_new_tokens": 1, "temperature": 0.0},
+                    },
+                )
+            except Exception:
+                pass
+            time.sleep(2)
+        else:
+            self.fail("Timed out waiting for scaling to complete (300s)")
 
         # Step 5: post-scale inference works.
         self._generate_ok("post-scale (8 ranks)")
