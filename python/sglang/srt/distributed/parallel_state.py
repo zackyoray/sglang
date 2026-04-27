@@ -282,12 +282,15 @@ class GroupCoordinator:
         self.device_module = torch.get_device_module(self.device)
 
         for ranks in group_ranks:
-            active_ranks = torch.ones(len(ranks), dtype=torch.int32, device=self.device)
-            active_ranks_cpu = torch.ones(len(ranks), dtype=torch.int32)
             if "mooncake" in torch_distributed_backend:
                 from mooncake.ep import MooncakeBackendOptions
 
                 max_ws = max_world_size if max_world_size and max_world_size > len(ranks) else 0
+                ar_size = max_ws if max_ws > 0 else len(ranks)
+                active_ranks = torch.zeros(ar_size, dtype=torch.int32, device=self.device)
+                active_ranks[:len(ranks)] = 1
+                active_ranks_cpu = torch.zeros(ar_size, dtype=torch.int32)
+                active_ranks_cpu[:len(ranks)] = 1
                 device_group = torch.distributed.new_group(
                     ranks,
                     backend="mooncake",
@@ -299,6 +302,8 @@ class GroupCoordinator:
                     pg_options=MooncakeBackendOptions(active_ranks_cpu, recovered_rank, max_ws),
                 )
             else:
+                active_ranks = torch.ones(len(ranks), dtype=torch.int32, device=self.device)
+                active_ranks_cpu = torch.ones(len(ranks), dtype=torch.int32)
                 pg_options = get_torch_distributed_pg_options(group_name)
                 device_group = torch.distributed.new_group(
                     ranks, backend=torch_distributed_backend, pg_options=pg_options
@@ -1710,10 +1715,12 @@ def init_distributed_environment(
             from mooncake.ep import MooncakeBackendOptions
 
             # Setting "cuda" as device here is safe, as it is guarded under the mooncake case
-            active_ranks = torch.ones(world_size, dtype=torch.int32, device="cuda")
-            # max_world_size pre-sizes internal metadata so healthy ranks can
-            # observe joiners via get_peer_state without extend_group_size_to.
+            # When max_world_size is set, active_ranks must be sized to it.
+            # Slots [0..world_size) are active (1), slots [world_size..max_world_size) are reserved (0).
             max_ws = max_world_size if max_world_size and max_world_size > world_size else 0
+            ar_size = max_ws if max_ws > 0 else world_size
+            active_ranks = torch.zeros(ar_size, dtype=torch.int32, device="cuda")
+            active_ranks[:world_size] = 1
             pg_options = MooncakeBackendOptions(active_ranks, recovered_rank, max_ws)
         else:
             pg_options = get_torch_distributed_pg_options()
