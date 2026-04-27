@@ -292,6 +292,7 @@ def _scale_up_common_args(
         str(TOTAL_EP_SIZE),
         "--mem-fraction-static",
         "0.5",
+        "--disable-cuda-graph",
         "--nnodes",
         str(nnodes),
         "--node-rank",
