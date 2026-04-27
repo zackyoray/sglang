@@ -285,6 +285,8 @@ class GroupCoordinator:
             if "mooncake" in torch_distributed_backend:
                 from mooncake.ep import MooncakeBackendOptions
 
+                # Sub-groups use max_world_size so Mooncake pre-sizes
+                # metadata for joiner ranks. active_ranks must match.
                 max_ws = max_world_size if max_world_size and max_world_size > len(ranks) else 0
                 ar_size = max_ws if max_ws > 0 else len(ranks)
                 active_ranks = torch.zeros(ar_size, dtype=torch.int32, device=self.device)
@@ -301,6 +303,10 @@ class GroupCoordinator:
                     backend="mooncake-cpu",
                     pg_options=MooncakeBackendOptions(active_ranks_cpu, recovered_rank, max_ws),
                 )
+                # Trim active_ranks back to group size for SGLang consumers
+                # (NIXL dispatcher, EPLB) that use active_ranks.size() for shapes.
+                active_ranks = active_ranks[:len(ranks)]
+                active_ranks_cpu = active_ranks_cpu[:len(ranks)]
             else:
                 active_ranks = torch.ones(len(ranks), dtype=torch.int32, device=self.device)
                 active_ranks_cpu = torch.ones(len(ranks), dtype=torch.int32)
