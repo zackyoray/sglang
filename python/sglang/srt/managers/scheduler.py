@@ -3531,27 +3531,9 @@ class Scheduler(
             )
 
         try:
-            from mooncake import ep as mooncake_ep
-
-            # Only extend the WORLD group now.  Extending sub-groups
-            # (attention_tp, attn_cp, etc.) would make their all-reduce
-            # expect 8 participants while only 4 are present, hanging
-            # every forward pass.  Sub-groups are extended later inside
-            # try_recover_ranks after joiners are activated.
-            world_backend = _get_process_group_backend(
-                torch.distributed.group.WORLD, "cuda"
-            )
-            logger.info(
-                "[Elastic EP][scale] extend_group_size_to(%d) on WORLD",
-                new_ep_size,
-            )
-            mooncake_ep.extend_group_size_to(world_backend, new_ep_size)
-            num_groups = 1
-
-            # NOTE: do not call _on_scale here — that would block on the NIXL
-            # two-sided handshake before new ranks have joined the PG. The
-            # poll loop in maybe_join_ep_ranks calls _on_scale after the new
-            # ranks have published their metadata.
+            # With max_world_size in MooncakeBackendOptions, all groups are
+            # pre-sized at init.  No extend_group_size_to needed — healthy
+            # ranks can observe joiners via get_peer_state immediately.
             ElasticEPStateManager.set_effective_ep_size(new_ep_size)
             logger.info(
                 "[Elastic EP][scale] extend complete on %d groups; "

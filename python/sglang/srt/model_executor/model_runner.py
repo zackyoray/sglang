@@ -1145,6 +1145,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 moe_a2a_backend=self.server_args.moe_a2a_backend,
                 recovered_rank=is_ep_joiner,
                 rank_offset=self.server_args.ep_join_rank_offset,
+                max_world_size=self.server_args.max_ep_size,
             )
             initialize_model_parallel(
                 tensor_model_parallel_size=self.tp_size,
@@ -1157,6 +1158,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 enable_symm_mem=self.server_args.enable_symm_mem,
                 recovered_rank=is_ep_joiner,
                 rank_offset=self.server_args.ep_join_rank_offset,
+                max_world_size=self.server_args.max_ep_size,
             )
             initialize_dp_attention(
                 server_args=self.server_args,

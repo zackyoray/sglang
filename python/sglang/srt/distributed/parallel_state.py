@@ -248,6 +248,7 @@ class GroupCoordinator:
         gloo_timeout: timedelta = timedelta(seconds=120 * 60),
         recovered_rank: bool = False,
         rank_offset: int = 0,
+        max_world_size: Optional[int] = None,
     ):
         # Set group info
         group_name = group_name or "anonymous"
@@ -286,15 +287,16 @@ class GroupCoordinator:
             if "mooncake" in torch_distributed_backend:
                 from mooncake.ep import MooncakeBackendOptions
 
+                max_ws = max_world_size if max_world_size and max_world_size > len(ranks) else 0
                 device_group = torch.distributed.new_group(
                     ranks,
                     backend="mooncake",
-                    pg_options=MooncakeBackendOptions(active_ranks, recovered_rank),
+                    pg_options=MooncakeBackendOptions(active_ranks, recovered_rank, max_ws),
                 )
                 cpu_group = torch.distributed.new_group(
                     ranks,
                     backend="mooncake-cpu",
-                    pg_options=MooncakeBackendOptions(active_ranks_cpu, recovered_rank),
+                    pg_options=MooncakeBackendOptions(active_ranks_cpu, recovered_rank, max_ws),
                 )
             else:
                 pg_options = get_torch_distributed_pg_options(group_name)
@@ -1412,6 +1414,7 @@ def init_model_parallel_group(
     use_torch_symm_mem_allreduce: Optional[bool] = None,
     recovered_rank: bool = False,
     rank_offset: int = 0,
+    max_world_size: Optional[int] = None,
 ) -> GroupCoordinator:
     if use_custom_allreduce is None:
         use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
@@ -1438,6 +1441,7 @@ def init_model_parallel_group(
         group_name=group_name,
         recovered_rank=recovered_rank,
         rank_offset=rank_offset,
+        max_world_size=max_world_size,
     )
 
 
@@ -1671,6 +1675,7 @@ def init_distributed_environment(
     moe_a2a_backend: Optional[str] = None,
     recovered_rank: bool = False,
     rank_offset: int = 0,
+    max_world_size: Optional[int] = None,
 ):
     logger.debug(
         "world_size=%d rank=%d local_rank=%d " "distributed_init_method=%s backend=%s",
@@ -1706,7 +1711,10 @@ def init_distributed_environment(
 
             # Setting "cuda" as device here is safe, as it is guarded under the mooncake case
             active_ranks = torch.ones(world_size, dtype=torch.int32, device="cuda")
-            pg_options = MooncakeBackendOptions(active_ranks, recovered_rank)
+            # max_world_size pre-sizes internal metadata so healthy ranks can
+            # observe joiners via get_peer_state without extend_group_size_to.
+            max_ws = max_world_size if max_world_size and max_world_size > world_size else 0
+            pg_options = MooncakeBackendOptions(active_ranks, recovered_rank, max_ws)
         else:
             pg_options = get_torch_distributed_pg_options()
 
@@ -1779,6 +1787,7 @@ def initialize_model_parallel(
     enable_symm_mem: bool = False,
     recovered_rank: bool = False,
     rank_offset: int = 0,
+    max_world_size: Optional[int] = None,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -1866,6 +1875,7 @@ def initialize_model_parallel(
         group_name="tp",
         recovered_rank=recovered_rank,
         rank_offset=rank_offset,
+        max_world_size=max_world_size,
     )
 
     if duplicate_tp_group:
@@ -1881,6 +1891,7 @@ def initialize_model_parallel(
             group_name="pdmux_prefill_tp",
             recovered_rank=recovered_rank,
             rank_offset=rank_offset,
+            max_world_size=max_world_size,
         )
         if _TP.pynccl_comm:
             _TP.pynccl_comm.disabled = False
@@ -1921,6 +1932,7 @@ def initialize_model_parallel(
             group_name="attn_cp",
             recovered_rank=recovered_rank,
             rank_offset=rank_offset,
+            max_world_size=max_world_size,
         )
 
     from sglang.srt.layers.sampler import SYNC_TOKEN_IDS_ACROSS_TP
@@ -1957,6 +1969,7 @@ def initialize_model_parallel(
             group_name="attention_tp",
             recovered_rank=recovered_rank,
             rank_offset=rank_offset,
+            max_world_size=max_world_size,
         )
 
     moe_ep_size = expert_model_parallel_size
@@ -1985,6 +1998,7 @@ def initialize_model_parallel(
             group_name="moe_dp",
             recovered_rank=recovered_rank,
             rank_offset=rank_offset,
+            max_world_size=max_world_size,
         )
 
     global _MOE_EP
@@ -2013,6 +2027,7 @@ def initialize_model_parallel(
             group_name="moe_ep",
             recovered_rank=recovered_rank,
             rank_offset=rank_offset,
+            max_world_size=max_world_size,
         )
 
     global _MOE_TP
@@ -2042,6 +2057,7 @@ def initialize_model_parallel(
             group_name="moe_tp",
             recovered_rank=recovered_rank,
             rank_offset=rank_offset,
+            max_world_size=max_world_size,
         )
 
     # Build the pipeline model-parallel groups.
@@ -2063,6 +2079,7 @@ def initialize_model_parallel(
         group_name="pp",
         recovered_rank=recovered_rank,
         rank_offset=rank_offset,
+        max_world_size=max_world_size,
     )
 
 
