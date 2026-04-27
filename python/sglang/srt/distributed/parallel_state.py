@@ -281,16 +281,28 @@ class GroupCoordinator:
             self.device = torch.device("cpu")
         self.device_module = torch.get_device_module(self.device)
 
+        # SGLANG_MAX_WS_WORLD_ONLY=1 → only pass max_world_size to WORLD,
+        # not sub-groups. For testing whether sub-group max_ws causes the crash.
+        skip_subgroup_max_ws = os.environ.get("SGLANG_MAX_WS_WORLD_ONLY", "") == "1"
+
         for ranks in group_ranks:
             if "mooncake" in torch_distributed_backend:
                 from mooncake.ep import MooncakeBackendOptions
 
                 use_max_ws = max_world_size and max_world_size > len(ranks)
+                if skip_subgroup_max_ws:
+                    use_max_ws = False
                 ar_size = max_world_size if use_max_ws else len(ranks)
                 active_ranks = torch.zeros(ar_size, dtype=torch.int32, device=self.device)
                 active_ranks[:len(ranks)] = 1
                 active_ranks_cpu = torch.zeros(ar_size, dtype=torch.int32)
                 active_ranks_cpu[:len(ranks)] = 1
+                logger.info(
+                    "[DEBUG][sub-group %s] ranks=%s ar.shape=%s use_max_ws=%s "
+                    "max_world_size=%s skip_subgroup=%s",
+                    group_name, ranks, active_ranks.shape,
+                    use_max_ws, max_world_size, skip_subgroup_max_ws,
+                )
                 if use_max_ws:
                     dev_opts = MooncakeBackendOptions(active_ranks, recovered_rank, max_world_size)
                     cpu_opts = MooncakeBackendOptions(active_ranks_cpu, recovered_rank, max_world_size)
@@ -1726,6 +1738,12 @@ def init_distributed_environment(
             ar_size = max_world_size if use_max_ws else world_size
             active_ranks = torch.zeros(ar_size, dtype=torch.int32, device="cuda")
             active_ranks[:world_size] = 1
+            logger.info(
+                "[DEBUG][WORLD] active_ranks.shape=%s active_ranks=%s "
+                "use_max_ws=%s max_world_size=%s world_size=%d",
+                active_ranks.shape, active_ranks.tolist(),
+                use_max_ws, max_world_size, world_size,
+            )
             if use_max_ws:
                 pg_options = MooncakeBackendOptions(active_ranks, recovered_rank, max_world_size)
             else:
