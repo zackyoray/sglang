@@ -285,26 +285,25 @@ class GroupCoordinator:
             if "mooncake" in torch_distributed_backend:
                 from mooncake.ep import MooncakeBackendOptions
 
-                # Sub-groups use max_world_size so Mooncake pre-sizes
-                # metadata for joiner ranks. active_ranks must match.
-                max_ws = max_world_size if max_world_size and max_world_size > len(ranks) else 0
-                ar_size = max_ws if max_ws > 0 else len(ranks)
+                use_max_ws = max_world_size and max_world_size > len(ranks)
+                ar_size = max_world_size if use_max_ws else len(ranks)
                 active_ranks = torch.zeros(ar_size, dtype=torch.int32, device=self.device)
                 active_ranks[:len(ranks)] = 1
                 active_ranks_cpu = torch.zeros(ar_size, dtype=torch.int32)
                 active_ranks_cpu[:len(ranks)] = 1
+                if use_max_ws:
+                    dev_opts = MooncakeBackendOptions(active_ranks, recovered_rank, max_world_size)
+                    cpu_opts = MooncakeBackendOptions(active_ranks_cpu, recovered_rank, max_world_size)
+                else:
+                    dev_opts = MooncakeBackendOptions(active_ranks, recovered_rank)
+                    cpu_opts = MooncakeBackendOptions(active_ranks_cpu, recovered_rank)
                 device_group = torch.distributed.new_group(
-                    ranks,
-                    backend="mooncake",
-                    pg_options=MooncakeBackendOptions(active_ranks, recovered_rank, max_ws),
+                    ranks, backend="mooncake", pg_options=dev_opts,
                 )
                 cpu_group = torch.distributed.new_group(
-                    ranks,
-                    backend="mooncake-cpu",
-                    pg_options=MooncakeBackendOptions(active_ranks_cpu, recovered_rank, max_ws),
+                    ranks, backend="mooncake-cpu", pg_options=cpu_opts,
                 )
                 # Trim active_ranks back to group size for SGLang consumers
-                # (NIXL dispatcher, EPLB) that use active_ranks.size() for shapes.
                 active_ranks = active_ranks[:len(ranks)]
                 active_ranks_cpu = active_ranks_cpu[:len(ranks)]
             else:
@@ -1723,11 +1722,14 @@ def init_distributed_environment(
             # Setting "cuda" as device here is safe, as it is guarded under the mooncake case
             # When max_world_size is set, active_ranks must be sized to it.
             # Slots [0..world_size) are active (1), slots [world_size..max_world_size) are reserved (0).
-            max_ws = max_world_size if max_world_size and max_world_size > world_size else 0
-            ar_size = max_ws if max_ws > 0 else world_size
+            use_max_ws = max_world_size and max_world_size > world_size
+            ar_size = max_world_size if use_max_ws else world_size
             active_ranks = torch.zeros(ar_size, dtype=torch.int32, device="cuda")
             active_ranks[:world_size] = 1
-            pg_options = MooncakeBackendOptions(active_ranks, recovered_rank, max_ws)
+            if use_max_ws:
+                pg_options = MooncakeBackendOptions(active_ranks, recovered_rank, max_world_size)
+            else:
+                pg_options = MooncakeBackendOptions(active_ranks, recovered_rank)
         else:
             pg_options = get_torch_distributed_pg_options()
 
