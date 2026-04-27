@@ -269,20 +269,29 @@ def try_recover_ranks(global_ranks: List[int]) -> bool:
     # using ranks mapped into that group's local rank space.
     mooncake_ep.recover_ranks(world_backend, global_ranks)
 
-    # With max_world_size, sub-groups are pre-sized — no extend needed.
-    # Brief pause for joiners to enter join_group on sub-groups after
-    # their WORLD join_group returned.
-    time.sleep(1)
+    # WORLD group uses max_world_size so no extend needed.
+    # Sub-groups do NOT have max_world_size, so they need extend first.
+    # Extend all sub-groups, pause for joiners to enter join_group,
+    # then recover all.
+    new_group_size = ElasticEPStateManager.get_effective_ep_size()
 
+    sub_groups = []
     for group in _iter_live_parallel_groups():
         group_local_ranks = _map_global_to_group_local_ranks(group.ranks, global_ranks)
         if not group_local_ranks:
             continue
 
         device_backend = _get_process_group_backend(group.device_group, "cuda")
-        mooncake_ep.recover_ranks(device_backend, group_local_ranks)
-
         cpu_backend = _get_process_group_backend(group.cpu_group, "cpu")
+        mooncake_ep.extend_group_size_to(device_backend, new_group_size)
+        mooncake_ep.extend_group_size_to(cpu_backend, new_group_size)
+        sub_groups.append((group, group_local_ranks, device_backend, cpu_backend))
+
+    # Brief pause for joiners to enter join_group on sub-groups
+    time.sleep(2)
+
+    for group, group_local_ranks, device_backend, cpu_backend in sub_groups:
+        mooncake_ep.recover_ranks(device_backend, group_local_ranks)
         mooncake_ep.recover_ranks(cpu_backend, group_local_ranks)
         _maybe_create_message_queue(group)
 

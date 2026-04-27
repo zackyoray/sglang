@@ -3531,15 +3531,14 @@ class Scheduler(
             )
 
         try:
-            # With max_world_size in MooncakeBackendOptions, all groups are
-            # pre-sized at init.  No extend_group_size_to needed — healthy
-            # ranks can observe joiners via get_peer_state immediately.
+            # WORLD group has max_world_size — no extend needed.
+            # Sub-groups will be extended in try_recover_ranks after
+            # get_peer_state confirms joiners are ready.
             ElasticEPStateManager.set_effective_ep_size(new_ep_size)
             logger.info(
-                "[Elastic EP][scale] extend complete on %d groups; "
-                "set_effective_ep_size(%d). Poll loop will pick up new ranks "
-                "on next forward pass.",
-                num_groups, new_ep_size,
+                "[Elastic EP][scale] set_effective_ep_size(%d). "
+                "Poll loop will pick up new ranks on next forward pass.",
+                new_ep_size,
             )
 
             return ScaleElasticEPReqOutput(
