@@ -285,13 +285,26 @@ class GroupCoordinator:
             if "mooncake" in torch_distributed_backend:
                 from mooncake.ep import MooncakeBackendOptions
 
-                # Sub-groups (TP, attention, MoE, PP) NEVER get max_world_size.
-                # Only the WORLD group (handled in init_distributed_environment)
-                # needs it. Sub-groups don't scale independently.
-                active_ranks = torch.ones(len(ranks), dtype=torch.int32, device=self.device)
-                active_ranks_cpu = torch.ones(len(ranks), dtype=torch.int32)
-                dev_opts = MooncakeBackendOptions(active_ranks, recovered_rank)
-                cpu_opts = MooncakeBackendOptions(active_ranks_cpu, recovered_rank)
+                # Sub-groups also get max_world_size so they can observe
+                # joiner ranks without extend_group_size_to.  Only the
+                # PRIMARY side passes it (joiner's world_size already
+                # covers the full range).
+                is_primary = not recovered_rank
+                use_max_ws = is_primary and max_world_size and max_world_size > len(ranks)
+                ar_size = max_world_size if use_max_ws else len(ranks)
+                active_ranks = torch.zeros(ar_size, dtype=torch.int32, device=self.device)
+                active_ranks[:len(ranks)] = 1
+                active_ranks_cpu = torch.zeros(ar_size, dtype=torch.int32)
+                active_ranks_cpu[:len(ranks)] = 1
+                if use_max_ws:
+                    dev_opts = MooncakeBackendOptions(active_ranks, recovered_rank, max_world_size)
+                    cpu_opts = MooncakeBackendOptions(active_ranks_cpu, recovered_rank, max_world_size)
+                else:
+                    dev_opts = MooncakeBackendOptions(active_ranks, recovered_rank)
+                    cpu_opts = MooncakeBackendOptions(active_ranks_cpu, recovered_rank)
+                # Trim for SGLang consumers that use active_ranks.size() for shapes
+                active_ranks = active_ranks[:len(ranks)]
+                active_ranks_cpu = active_ranks_cpu[:len(ranks)]
                 device_group = torch.distributed.new_group(
                     ranks, backend="mooncake", pg_options=dev_opts,
                 )
