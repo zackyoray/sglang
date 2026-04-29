@@ -429,18 +429,12 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
                 NixlEPBuffer._scale_to,
             )
             self._last_logged_cep = _cep
-        # NIXL routes: rank = physical_id // (num_experts_for_dispatch // group_size).
-        # We need each rank to own num_local_experts slots, so:
-        #   num_experts_for_dispatch // group_size == num_local_experts
-        #   num_experts_for_dispatch == num_local_experts * group_size
-        # This is ONLY for the dispatch call; self.num_experts stays unchanged.
-        nixl_num_experts = NixlEPBuffer._num_local_experts * buffer.group_size
         packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
             buffer.dispatch(
                 hidden_states,
                 topk_idx,
                 self.num_max_dispatch_tokens_per_rank,
-                nixl_num_experts,
+                self.num_experts,
                 use_fp8=use_fp8,
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
