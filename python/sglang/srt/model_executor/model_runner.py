@@ -516,10 +516,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             # mask out genuinely-pending ranks that have not joined yet.
             inst = ElasticEPStateManager.instance()
             logger.info(
-                "[Elastic EP][join_rank] ready; active_ranks=%s "
-                "effective_ep_size=%d",
+                "[Elastic EP][JOINER] ready; active_ranks=%s "
+                "effective_ep_size=%d is_scaling=%s",
                 inst.active_ranks.tolist() if inst is not None else None,
                 inst.effective_ep_size if inst is not None else -1,
+                ElasticEPStateManager.is_scaling(),
             )
 
             # Now that join_group is done and NIXL connections can be
@@ -1591,6 +1592,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 for r in ranks_to_join:
                     inst.active_ranks[r] = 1
                 inst.sync_active_to_cpu()
+                logger.info(
+                    "[Elastic EP][PRIMARY] after scale-up: active_ranks=%s "
+                    "is_scaling=%s effective_ep_size=%d",
+                    inst.active_ranks.tolist(),
+                    ElasticEPStateManager.is_scaling(),
+                    ElasticEPStateManager.get_effective_ep_size(),
+                )
             # Scale-up: EPLB fires automatically on active_ranks change.
 
             # Trigger NIXL buffer connections. Must come AFTER activate_ranks
