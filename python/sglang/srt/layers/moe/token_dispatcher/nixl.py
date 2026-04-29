@@ -74,6 +74,10 @@ class NixlEPBuffer:
         )
         cls._buffer.connect_ranks(new_ranks)
         cls._connected_ep_size = scale_to
+        logger.info(
+            "[Elastic EP][nixl] after connect_ranks: buffer.group_size=%s",
+            cls._buffer.group_size,
+        )
 
     @classmethod
     def get_nixl_buffer(
@@ -353,6 +357,15 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
         use_fp8 = not envs.SGLANG_NIXL_EP_BF16_DISPATCH.get()
 
         buffer = self._get_buffer()
+        if not hasattr(self, "_last_logged_group_size") or self._last_logged_group_size != buffer.group_size:
+            logger.info(
+                "[Elastic EP][nixl] dispatch group_size=%s "
+                "(connected_ep_size=%s, scale_to=%s)",
+                buffer.group_size,
+                NixlEPBuffer._connected_ep_size,
+                NixlEPBuffer._scale_to,
+            )
+            self._last_logged_group_size = buffer.group_size
         packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
             buffer.dispatch(
                 hidden_states,
