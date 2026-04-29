@@ -259,9 +259,10 @@ class GroupCoordinator:
         # For elastic EP joiners, the PG rank is global (e.g. 4..7) but
         # group_ranks are local (e.g. 0..3).  Offset them to match.
         self.rank = torch.distributed.get_rank()
-        # With split-ranks pattern, joiner's group_ranks already use full
-        # membership (e.g. [0..7]), so rank_offset shifting is not needed.
-        # The joiner's PG rank (4-7) matches directly.
+        # For elastic EP joiners, the PG rank is global (e.g. 4..7) but
+        # group_ranks are local (e.g. 0..3).  Offset them to match.
+        if rank_offset > 0:
+            group_ranks = [[r + rank_offset for r in ranks] for ranks in group_ranks]
         self.local_rank = local_rank
         self.device_group = None
         self.cpu_group = None
@@ -1867,31 +1868,25 @@ def initialize_model_parallel(
     assert torch.distributed.is_initialized()
     backend = backend or torch.distributed.get_backend(get_world_group().device_group)
 
-    # Elastic EP joiners use the FULL eventual world_size (max_world_size)
-    # for sub-group construction — the "split-ranks" pattern.  Primary uses
-    # only its current membership; joiner uses full eventual membership so
-    # join_group attaches to the primary's group after recover_ranks.
-    #
-    # Critical: joiner must also use tensor_model_parallel_size=max_world_size
-    # so it creates ONE group [0..7] matching the primary's ONE group [0..3].
-    # If joiner used tp=4 with ws=8, it would create TWO groups ([0..3],[4..7])
-    # and the new_group call count wouldn't match the primary.
-    if recovered_rank and max_world_size:
-        world_size = max_world_size
-        tensor_model_parallel_size = max_world_size
+    # Option (b): Joiner creates IDENTICAL group structure as primary.
+    # Both use world_size=tp_size (e.g. 4), same rank lists, same call order.
+    # The joiner's PG rank is 4-7 (via Shape A), so it won't be a "member"
+    # of groups listed as [0,1,2,3] — but new_group still participates in
+    # the store protocol to keep backendIndex_ aligned.  join_group then
+    # attaches the joiner to the matching primary group.
+    if recovered_rank:
+        world_size = tensor_model_parallel_size * pipeline_model_parallel_size
     else:
         world_size: int = torch.distributed.get_world_size()
 
-    if not recovered_rank:
-        if world_size != tensor_model_parallel_size * pipeline_model_parallel_size:
-            raise RuntimeError(
-                f"world_size ({world_size}) is not equal to "
-                f"tensor_model_parallel_size ({tensor_model_parallel_size}) x "
-                f"pipeline_model_parallel_size ({pipeline_model_parallel_size})"
-            )
+    if world_size != tensor_model_parallel_size * pipeline_model_parallel_size:
+        raise RuntimeError(
+            f"world_size ({world_size}) is not equal to "
+            f"tensor_model_parallel_size ({tensor_model_parallel_size}) x "
+            f"pipeline_model_parallel_size ({pipeline_model_parallel_size})"
+        )
 
     # Build the tensor model-parallel groups.
-    # Both primary and joiner: num_groups=1, one TP group covering all ranks.
     num_tensor_model_parallel_groups: int = world_size // tensor_model_parallel_size
     global _TP
     assert _TP is None, "tensor model parallel group is already initialized"
