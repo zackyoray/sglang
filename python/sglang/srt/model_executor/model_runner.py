@@ -1585,6 +1585,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 # Recovery: skip EPLB rebalance due to stale metadata (PR #15771).
                 self.eplb_manager.reset_generator()
                 ElasticEPStateManager.instance().reset()
+            else:
+                # Scale-up: mark joined ranks as active.
+                inst = ElasticEPStateManager.instance()
+                for r in ranks_to_join:
+                    inst.active_ranks[r] = 1
+                inst.sync_active_to_cpu()
             # Scale-up: EPLB fires automatically on active_ranks change.
 
             # Trigger NIXL buffer connections. Must come AFTER activate_ranks
