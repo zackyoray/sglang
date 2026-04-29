@@ -278,13 +278,20 @@ def try_recover_ranks(global_ranks: List[int]) -> bool:
     mooncake_ep.recover_ranks(world_backend, global_ranks)
     logger.info("[Elastic EP][recover] WORLD recover_ranks done. Processing sub-groups...")
 
-    # All groups have max_world_size — no extend_group_size_to needed.
-    # Per Mooncake team: joiner MUST be in join_group on a sub-group
-    # before recover_ranks is called on it.  Poll get_peer_state per
-    # sub-group (same two-phase protocol as WORLD).
+    # In dp_attention mode, all multi-rank sub-groups (TP, MOE_EP) are
+    # equivalent to WORLD — same rank set.  WORLD recover is sufficient.
+    # Skip sub-group recover entirely to avoid backendIndex mismatch
+    # between separate primary/joiner processes.
+    # TODO: For non-dp_attention modes with true sub-groups (e.g. tp=2
+    # within a larger world), implement split-ranks pattern per Mooncake.
+    logger.info("[Elastic EP][recover] Skipping sub-group recover (dp_attention: sub-groups == WORLD)")
+    _refresh_ep_members()
+    return True
+
+    # Dead code below — kept for future non-dp_attention implementation
     for group in _iter_live_parallel_groups():
         if group.world_size <= 1:
-            continue  # Single-rank groups (e.g. attention_tp in dp_attention) don't scale
+            continue
 
         # With max_world_size, sub-groups have capacity beyond their current
         # membership. Joiner ranks 4-7 map to local indices 4-7 in the
@@ -328,6 +335,13 @@ def join_process_groups():
         _get_process_group_backend(torch.distributed.group.WORLD, "cuda"),
     )
 
+    # In dp_attention mode, all multi-rank sub-groups are equivalent to
+    # WORLD. Skip sub-group join — WORLD join is sufficient.
+    # TODO: For non-dp_attention with true sub-groups, implement split-ranks.
+    logger.info("[Elastic EP][join_pg] Skipping sub-group joins (dp_attention: sub-groups == WORLD)")
+    return
+
+    # Dead code below — kept for future non-dp_attention implementation
     for group in _iter_live_parallel_groups():
         if group.world_size <= 1:
             continue
