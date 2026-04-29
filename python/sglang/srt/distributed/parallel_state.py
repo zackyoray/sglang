@@ -259,8 +259,9 @@ class GroupCoordinator:
         # For elastic EP joiners, the PG rank is global (e.g. 4..7) but
         # group_ranks are local (e.g. 0..3).  Offset them to match.
         self.rank = torch.distributed.get_rank()
-        if rank_offset > 0:
-            group_ranks = [[r + rank_offset for r in ranks] for ranks in group_ranks]
+        # With split-ranks pattern, joiner's group_ranks already use full
+        # membership (e.g. [0..7]), so rank_offset shifting is not needed.
+        # The joiner's PG rank (4-7) matches directly.
         self.local_rank = local_rank
         self.device_group = None
         self.cpu_group = None
@@ -1866,22 +1867,26 @@ def initialize_model_parallel(
     assert torch.distributed.is_initialized()
     backend = backend or torch.distributed.get_backend(get_world_group().device_group)
 
-    # Elastic EP joiners have PG world_size=max_ep_size (e.g. 8) but only
-    # tp_size*pp_size local ranks (e.g. 4). Use the local size for parallel
-    # group construction; the extended PG size is only for Mooncake metadata.
-    if recovered_rank:
-        world_size = tensor_model_parallel_size * pipeline_model_parallel_size
+    # Elastic EP joiners use the FULL eventual world_size (max_world_size)
+    # for sub-group construction — the "split-ranks" pattern.  Primary uses
+    # only its current membership; joiner uses full eventual membership so
+    # join_group attaches to the primary's group after recover_ranks.
+    if recovered_rank and max_world_size:
+        world_size = max_world_size
     else:
         world_size: int = torch.distributed.get_world_size()
 
-    if world_size != tensor_model_parallel_size * pipeline_model_parallel_size:
-        raise RuntimeError(
-            f"world_size ({world_size}) is not equal to "
-            f"tensor_model_parallel_size ({tensor_model_parallel_size}) x "
-            f"pipeline_model_parallel_size ({pipeline_model_parallel_size})"
-        )
+    if not recovered_rank:
+        if world_size != tensor_model_parallel_size * pipeline_model_parallel_size:
+            raise RuntimeError(
+                f"world_size ({world_size}) is not equal to "
+                f"tensor_model_parallel_size ({tensor_model_parallel_size}) x "
+                f"pipeline_model_parallel_size ({pipeline_model_parallel_size})"
+            )
 
     # Build the tensor model-parallel groups.
+    # For joiners: world_size=max_world_size, so group_ranks = [[0..7]]
+    # For primary: world_size=tp_size, so group_ranks = [[0..3]]
     num_tensor_model_parallel_groups: int = world_size // tensor_model_parallel_size
     global _TP
     assert _TP is None, "tensor model parallel group is already initialized"
