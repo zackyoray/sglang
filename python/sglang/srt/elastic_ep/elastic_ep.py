@@ -112,7 +112,7 @@ class ElasticEPStateManager:
                 cls._instance.effective_ep_size,
                 server_args.ep_join_mode,
                 cls._instance.ep_join_rank_offset,
-                backend,
+                server_args.elastic_ep_backend,
                 cls._instance.active_ranks.tolist(),
             )
 
