@@ -518,6 +518,23 @@ class _ElasticScaleUpEndToEndBase(CustomTestCase):
         # Step 5: post-scale inference works.
         self._generate_ok("post-scale (8 ranks)")
 
+        # Step 6: accuracy check — run GSM8K to verify no silent corruption.
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=50,
+            num_threads=32,
+        )
+        metrics = run_eval(args)
+        print(f"[TEST] Post-scale GSM8K accuracy: {metrics['score']:.2%}")
+        self.assertGreater(
+            metrics["score"], 0.50,
+            f"Post-scale GSM8K accuracy too low: {metrics['score']:.2%}"
+        )
+
 
 @unittest.skipUnless(
     _count_visible_gpus() >= TOTAL_EP_SIZE,
