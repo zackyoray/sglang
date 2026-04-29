@@ -51,10 +51,65 @@ class NixlEPBuffer:
     # (same timing as RFC — not bumped from HTTP scale alone).
     _scale_to: Optional[int] = None
 
+    # Expert ID remapping tables (following vLLM's approach).
+    # NIXL routes expert_id to rank via: rank = expert_id // (num_experts // num_ranks)
+    # With num_ranks = max_ep_size (8) and num_experts = 96, that gives 12 per rank.
+    # But the model loaded with ep_size=4 has 24 experts per rank. The remapping
+    # converts global router IDs → physical IDs so that contiguous blocks of
+    # num_local_experts land on each active rank.
+    _global_to_physical: Optional[torch.Tensor] = None
+    _physical_to_global: Optional[torch.Tensor] = None
+    _ep_size: Optional[int] = None
+
+    @classmethod
+    def _build_routing_tables(cls, num_experts: int, ep_size: int) -> None:
+        """Build global↔physical expert ID mapping for NIXL dispatch.
+
+        NIXL routes: rank = physical_id // (num_experts // num_ranks).
+        With num_ranks = max_ep_size, each rank gets num_experts // max_ep_size
+        physical slots. We want each of the ep_size active ranks to own
+        num_local_experts = num_experts // ep_size slots.
+
+        The mapping assigns global expert i to:
+          owner_rank  = i % ep_size
+          local_index = i // ep_size
+          physical_id = owner_rank * (num_experts // ep_size) + local_index
+
+        This makes global experts 0, ep_size, 2*ep_size, ... (all owned by rank 0)
+        map to physical IDs 0, 1, 2, ... (contiguous block on rank 0).
+        """
+        device = "cuda"
+        g = torch.arange(num_experts, dtype=torch.long, device=device)
+        owner = g % ep_size
+        local_idx = g // ep_size
+        num_local = num_experts // ep_size
+        physical = owner * num_local + local_idx
+
+        cls._global_to_physical = physical
+        cls._physical_to_global = torch.empty_like(physical)
+        cls._physical_to_global[physical] = g
+        cls._ep_size = ep_size
+        logger.info(
+            "[Elastic EP][nixl] built routing tables: num_experts=%d ep_size=%d "
+            "num_local=%d (sample: global[0,1,2,3]→physical%s)",
+            num_experts, ep_size, num_local,
+            physical[:4].tolist(),
+        )
+
+    @classmethod
+    def map_global_to_physical(cls, topk_ids: torch.Tensor) -> torch.Tensor:
+        if cls._global_to_physical is None:
+            return topk_ids
+        mask = topk_ids >= 0
+        result = torch.where(mask, cls._global_to_physical[topk_ids.clamp(min=0)], topk_ids)
+        return result
+
     @classmethod
     def on_scale(cls, from_ep_size: int, to_ep_size: int) -> None:
         """Called from ElasticEPStateManager._on_scale_nixl after activate_ranks."""
         cls._scale_to = to_ep_size
+        if cls._num_experts is not None:
+            cls._build_routing_tables(cls._num_experts, to_ep_size)
         logger.info(
             "[Elastic EP][nixl] on_scale(%s -> %s) _scale_to=%s",
             from_ep_size,
@@ -183,6 +238,8 @@ class NixlEPBuffer:
         cls._connected_ep_size = scale_to
         cls._scale_to = scale_to
 
+        cls._build_routing_tables(num_experts, world_size)
+
         return cls._buffer
 
     @classmethod
@@ -303,13 +360,15 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
         buffer = self._get_buffer()
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
         topk_ids = topk_ids.to(torch.int64)
+        ep_size = NixlEPBuffer._ep_size or buffer.group_size
         expected_m = (
-            hidden_states.shape[0] * buffer.group_size * topk_ids.shape[1]
+            hidden_states.shape[0] * ep_size * topk_ids.shape[1]
             + self.num_experts
         ) // self.num_experts
+        dispatch_topk_ids = NixlEPBuffer.map_global_to_physical(topk_ids)
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,
-            topk_ids,
+            dispatch_topk_ids,
         )
         return (
             hidden_states,
@@ -393,9 +452,10 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
+        combine_topk_ids = NixlEPBuffer.map_global_to_physical(topk_ids)
         hidden_states, event, hook = self._combine_core(
             hidden_states,
-            topk_ids,
+            combine_topk_ids,
             topk_weights,
         )
         return hidden_states, event, hook
