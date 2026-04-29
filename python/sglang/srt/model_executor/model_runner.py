@@ -509,12 +509,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 # active so cuda graphs and routing immediately resume the
                 # full topology after rejoin.
                 ElasticEPStateManager.instance().reset()
-            # Scale: do NOT reset to all-1s. The new rank's active_ranks is
-            # seeded by the sync state that mooncake_pg.join_group() reads
-            # from existing ranks (which previously published it via
-            # recover_ranks inside activate_ranks). Resetting here would
-            # mask out genuinely-pending ranks that have not joined yet.
+            # After join_process_groups returns, all ranks (primary + joiner) are
+            # confirmed active. Set active_ranks to all-ones so the joiner doesn't
+            # falsely detect "rank faults" and trigger spurious EPLB rebalance.
             inst = ElasticEPStateManager.instance()
+            if inst is not None:
+                inst.active_ranks.fill_(1)
+                inst.snapshot_active_to_last()
+                inst.sync_active_to_cpu()
             logger.info(
                 "[Elastic EP][JOINER] ready; active_ranks=%s "
                 "effective_ep_size=%d is_scaling=%s",
@@ -3102,9 +3104,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 split_forward_count,
             )
             elastic_ep_state = ElasticEPStateManager.instance()
+            is_joiner = (
+                self.server_args.ep_join_mode in ("scale", "recover")
+            )
             if (
                 elastic_ep_state is not None
                 and not elastic_ep_state.is_active_equal_last()
+                and not is_joiner
             ):
                 elastic_ep_state.snapshot_active_to_last()
                 elastic_ep_state.sync_active_to_cpu()
