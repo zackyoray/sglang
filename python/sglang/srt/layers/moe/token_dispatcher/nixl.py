@@ -239,7 +239,7 @@ class NixlEPBuffer:
         cls._connected_ep_size = scale_to
         cls._scale_to = scale_to
 
-        cls._build_routing_tables(num_experts, world_size)
+        cls._build_routing_tables(num_experts, scale_to)
 
         return cls._buffer
 
