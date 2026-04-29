@@ -79,10 +79,14 @@ class ElasticEPStateManager:
                 cls._instance.snapshot_active_to_last()
                 cls._instance.sync_active_to_cpu()
 
-            backend = server_args.elastic_ep_backend
-            if backend == "nixl":
+            # _on_scale triggers NIXL connect_ranks for new ranks.
+            # Use nixl handler whenever NIXL is the MoE transport,
+            # regardless of which PG backend (mooncake/nixl) handles coordination.
+            if server_args.moe_a2a_backend == "nixl":
                 cls._on_scale = cls._on_scale_nixl
-            elif backend == "mooncake":
+            elif server_args.elastic_ep_backend == "nixl":
+                cls._on_scale = cls._on_scale_nixl
+            elif server_args.elastic_ep_backend == "mooncake":
                 cls._on_scale = cls._on_scale_mooncake
 
             cls._instance.ep_join_rank_offset = (
