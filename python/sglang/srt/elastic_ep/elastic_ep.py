@@ -283,9 +283,11 @@ def try_recover_ranks(global_ranks: List[int]) -> bool:
     # before recover_ranks is called on it.  Poll get_peer_state per
     # sub-group (same two-phase protocol as WORLD).
     for group in _iter_live_parallel_groups():
-        group_local_ranks = _map_global_to_group_local_ranks(group.ranks, global_ranks)
-        if not group_local_ranks:
-            continue
+        # With max_world_size, sub-groups have capacity beyond their current
+        # membership. Joiner ranks 4-7 map to local indices 4-7 in the
+        # sub-group (same as their global rank, since all sub-groups share
+        # the same rank space with max_world_size).
+        group_local_ranks = global_ranks  # direct: global == local in max_world_size groups
         logger.info(
             "[Elastic EP][recover] sub-group %s: group.ranks=%s "
             "group_local_ranks=%s — polling get_peer_state...",
