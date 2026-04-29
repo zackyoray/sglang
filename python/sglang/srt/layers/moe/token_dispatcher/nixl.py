@@ -303,10 +303,11 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
         buffer = self._get_buffer()
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
         topk_ids = topk_ids.to(torch.int64)
+        nixl_num_experts = NixlEPBuffer._num_local_experts * buffer.group_size
         expected_m = (
             hidden_states.shape[0] * buffer.group_size * topk_ids.shape[1]
-            + self.num_experts
-        ) // self.num_experts
+            + nixl_num_experts
+        ) // nixl_num_experts
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,
             topk_ids,
@@ -370,12 +371,17 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
                 NixlEPBuffer._scale_to,
             )
             self._last_logged_cep = _cep
+        # num_experts for NIXL dispatch must equal num_experts_per_rank * group_size
+        # so each rank gets the correct number of expert slots. With elastic EP,
+        # group_size may exceed the original ep_size used when loading the model,
+        # so we derive from the buffer config rather than self.num_experts.
+        nixl_num_experts = NixlEPBuffer._num_local_experts * buffer.group_size
         packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
             buffer.dispatch(
                 hidden_states,
                 topk_idx,
                 self.num_max_dispatch_tokens_per_rank,
-                self.num_experts,
+                nixl_num_experts,
                 use_fp8=use_fp8,
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
