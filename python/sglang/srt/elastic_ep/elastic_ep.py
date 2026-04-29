@@ -270,13 +270,13 @@ def try_recover_ranks(global_ranks: List[int]) -> bool:
     from mooncake import ep as mooncake_ep
 
     world_backend = _get_process_group_backend(torch.distributed.group.WORLD, "cuda")
+    logger.info("[Elastic EP][recover] polling WORLD get_peer_state(%s)...", global_ranks)
     if not all(mooncake_ep.get_peer_state(world_backend, global_ranks)):
-        # The relaunched ranks have not finished initializing yet.
         return False
 
-    # Recover the world backend first, then recover each derived process group
-    # using ranks mapped into that group's local rank space.
+    logger.info("[Elastic EP][recover] WORLD get_peer_state returned True! Calling recover_ranks...")
     mooncake_ep.recover_ranks(world_backend, global_ranks)
+    logger.info("[Elastic EP][recover] WORLD recover_ranks done. Processing sub-groups...")
 
     # All groups have max_world_size — no extend_group_size_to needed.
     # Per Mooncake team: joiner MUST be in join_group on a sub-group
@@ -286,16 +286,26 @@ def try_recover_ranks(global_ranks: List[int]) -> bool:
         group_local_ranks = _map_global_to_group_local_ranks(group.ranks, global_ranks)
         if not group_local_ranks:
             continue
+        logger.info(
+            "[Elastic EP][recover] sub-group %s: group.ranks=%s "
+            "group_local_ranks=%s — polling get_peer_state...",
+            group.unique_name, group.ranks, group_local_ranks,
+        )
 
         device_backend = _get_process_group_backend(group.device_group, "cuda")
         _wait_for_peer_state(mooncake_ep, device_backend, group_local_ranks)
+        logger.info("[Elastic EP][recover] %s:device peer ready, calling recover_ranks...", group.unique_name)
         mooncake_ep.recover_ranks(device_backend, group_local_ranks)
+        logger.info("[Elastic EP][recover] %s:device recover done", group.unique_name)
 
         cpu_backend = _get_process_group_backend(group.cpu_group, "cpu")
         _wait_for_peer_state(mooncake_ep, cpu_backend, group_local_ranks)
+        logger.info("[Elastic EP][recover] %s:cpu peer ready, calling recover_ranks...", group.unique_name)
         mooncake_ep.recover_ranks(cpu_backend, group_local_ranks)
+        logger.info("[Elastic EP][recover] %s:cpu recover done", group.unique_name)
         _maybe_create_message_queue(group)
 
+    logger.info("[Elastic EP][recover] ALL sub-groups recovered!")
     _refresh_ep_members()
     return True
 
