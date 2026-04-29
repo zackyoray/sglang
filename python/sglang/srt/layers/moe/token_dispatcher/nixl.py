@@ -52,11 +52,10 @@ class NixlEPBuffer:
     _scale_to: Optional[int] = None
 
     # Expert ID remapping tables (following vLLM's approach).
-    # NIXL routes expert_id to rank via: rank = expert_id // (num_experts // num_ranks)
-    # With num_ranks = max_ep_size (8) and num_experts = 96, that gives 12 per rank.
-    # But the model loaded with ep_size=4 has 24 experts per rank. The remapping
-    # converts global router IDs → physical IDs so that contiguous blocks of
-    # num_local_experts land on each active rank.
+    # NIXL routes: rank = physical_id // (nixl_num_experts // num_connected_ranks).
+    # We pass nixl_num_experts = num_local_experts * ep_size to dispatch so each
+    # rank gets exactly num_local_experts slots. The remapping packs global router
+    # IDs [0..num_model_experts-1] into contiguous per-rank blocks of num_local_experts.
     _global_to_physical: Optional[torch.Tensor] = None
     _physical_to_global: Optional[torch.Tensor] = None
     _ep_size: Optional[int] = None
@@ -65,34 +64,36 @@ class NixlEPBuffer:
     def _build_routing_tables(cls, num_experts: int, ep_size: int) -> None:
         """Build global↔physical expert ID mapping for NIXL dispatch.
 
-        NIXL routes: rank = physical_id // (num_experts // num_ranks).
-        With num_ranks = max_ep_size, each rank gets num_experts // max_ep_size
-        physical slots. We want each of the ep_size active ranks to own
-        num_local_experts = num_experts // ep_size slots.
+        Each rank owns a contiguous block of num_local_experts physical IDs.
+        nixl_num_experts = num_local_experts * ep_size is passed to dispatch,
+        so NIXL routes: rank = physical_id // num_local_experts.
 
-        The mapping assigns global expert i to:
-          owner_rank  = i % ep_size
-          local_index = i // ep_size
-          physical_id = owner_rank * (num_experts // ep_size) + local_index
+        Global expert i is owned by rank (i % ep_size) and is the
+        (i // ep_size)-th expert on that rank:
+          physical_id = owner_rank * num_local_experts + local_index
 
-        This makes global experts 0, ep_size, 2*ep_size, ... (all owned by rank 0)
-        map to physical IDs 0, 1, 2, ... (contiguous block on rank 0).
+        Pre-scale (ep_size=4):  physical range [0..95],  nixl_num_experts=96
+        Post-scale (ep_size=8): physical range [0..179], nixl_num_experts=192
         """
+        num_local = cls._num_local_experts
         device = "cuda"
         g = torch.arange(num_experts, dtype=torch.long, device=device)
         owner = g % ep_size
         local_idx = g // ep_size
-        num_local = num_experts // ep_size
         physical = owner * num_local + local_idx
 
+        nixl_total = num_local * ep_size
         cls._global_to_physical = physical
-        cls._physical_to_global = torch.empty_like(physical)
+        cls._physical_to_global = torch.zeros(
+            nixl_total, dtype=torch.long, device=device
+        )
         cls._physical_to_global[physical] = g
         cls._ep_size = ep_size
         logger.info(
             "[Elastic EP][nixl] built routing tables: num_experts=%d ep_size=%d "
-            "num_local=%d (sample: global[0,1,2,3]→physical%s)",
-            num_experts, ep_size, num_local,
+            "num_local=%d nixl_num_experts=%d "
+            "(sample: global[0,1,2,3]→physical%s)",
+            num_experts, ep_size, num_local, nixl_total,
             physical[:4].tolist(),
         )
 
@@ -429,12 +430,15 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
                 NixlEPBuffer._scale_to,
             )
             self._last_logged_cep = _cep
+        # nixl_num_experts = num_local_experts * ep_size so NIXL routes
+        # num_local_experts per rank: pre-scale 24*4=96, post-scale 24*8=192.
+        nixl_num_experts = NixlEPBuffer._num_local_experts * NixlEPBuffer._ep_size
         packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
             buffer.dispatch(
                 hidden_states,
                 topk_idx,
                 self.num_max_dispatch_tokens_per_rank,
-                self.num_experts,
+                nixl_num_experts,
                 use_fp8=use_fp8,
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
