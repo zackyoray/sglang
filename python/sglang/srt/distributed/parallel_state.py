@@ -1871,8 +1871,14 @@ def initialize_model_parallel(
     # for sub-group construction — the "split-ranks" pattern.  Primary uses
     # only its current membership; joiner uses full eventual membership so
     # join_group attaches to the primary's group after recover_ranks.
+    #
+    # Critical: joiner must also use tensor_model_parallel_size=max_world_size
+    # so it creates ONE group [0..7] matching the primary's ONE group [0..3].
+    # If joiner used tp=4 with ws=8, it would create TWO groups ([0..3],[4..7])
+    # and the new_group call count wouldn't match the primary.
     if recovered_rank and max_world_size:
         world_size = max_world_size
+        tensor_model_parallel_size = max_world_size
     else:
         world_size: int = torch.distributed.get_world_size()
 
@@ -1885,8 +1891,7 @@ def initialize_model_parallel(
             )
 
     # Build the tensor model-parallel groups.
-    # For joiners: world_size=max_world_size, so group_ranks = [[0..7]]
-    # For primary: world_size=tp_size, so group_ranks = [[0..3]]
+    # Both primary and joiner: num_groups=1, one TP group covering all ranks.
     num_tensor_model_parallel_groups: int = world_size // tensor_model_parallel_size
     global _TP
     assert _TP is None, "tensor model parallel group is already initialized"
