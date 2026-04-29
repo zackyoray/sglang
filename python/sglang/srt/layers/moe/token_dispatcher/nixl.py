@@ -392,12 +392,6 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
     ):
         hook() if self.return_recv_hook else event.current_stream_wait()
 
-        # masked_m from NIXL dispatch may have more entries than num_local_experts
-        # when nixl_num_experts > self.num_experts (elastic EP with max_ep_size).
-        # Truncate to num_local_experts for both EPLB and the MoE GEMM.
-        if masked_m.shape[0] > self.num_local_experts:
-            masked_m = masked_m[:self.num_local_experts]
-
         get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency(
             masked_m
         )
@@ -435,17 +429,12 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
                 NixlEPBuffer._scale_to,
             )
             self._last_logged_cep = _cep
-        # NIXL routes: rank = physical_id // (num_experts_arg // group_size).
-        # We need each rank to own num_local_experts (24) slots, so pass
-        # num_local_experts * group_size to dispatch. self.num_experts stays
-        # unchanged for expected_m, EPLB, and the rest of the pipeline.
-        nixl_num_experts = NixlEPBuffer._num_local_experts * buffer.group_size
         packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
             buffer.dispatch(
                 hidden_states,
                 topk_idx,
                 self.num_max_dispatch_tokens_per_rank,
-                nixl_num_experts,
+                self.num_experts,
                 use_fp8=use_fp8,
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
