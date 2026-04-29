@@ -1624,10 +1624,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def _get_healthy_expert_location_src_rank(
         self, invoked_in_ep_join_path: bool
     ) -> int:
+        # For elastic EP joiners: skip the all_gather_object collective.
+        # The joiner's WORLD cpu_group may not be aligned with the primary's
+        # for collectives yet.  The primary (rank 0) always has healthy metadata.
+        if invoked_in_ep_join_path:
+            return 0
+
         world_group = get_world_group()
-        # NOTE: do not key off `self.server_args.ep_join_mode` here.
-        # A rank that was started as a join rank may later act as a healthy
-        # rank in a subsequent recovery cycle.
         local_rejoin_flag = bool(invoked_in_ep_join_path)
         gathered_rejoin_flags = world_group.all_gather_object(local_rejoin_flag)
 
