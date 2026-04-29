@@ -1570,11 +1570,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if ranks_to_join and try_recover_ranks(ranks_to_join):
             self.forward_pass_id = 0
 
-            broadcast_global_expert_location_metadata(
-                src_rank=self._get_healthy_expert_location_src_rank(
-                    invoked_in_ep_join_path=False
-                )
-            )
+            # Use src_rank=0 directly. The all_gather_object in
+            # _get_healthy_expert_location_src_rank would deadlock because
+            # joiners skip it (they call broadcast directly).
+            broadcast_global_expert_location_metadata(src_rank=0)
 
             # Snapshot the pre-join active count for _on_scale before reset()
             # below clobbers last_active_ranks.
