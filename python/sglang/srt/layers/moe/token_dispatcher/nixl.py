@@ -163,10 +163,13 @@ class NixlEPBuffer:
             num_experts_per_rank=cls._num_local_experts,
             num_rdma_bytes=num_rdma_bytes,
         )
-        # Initial mesh: local live EP slice, shifted by offset on the joiner.
+        # Initial mesh: connect to all known live ranks.
+        # Primary (offset=0): connects to [0..world_size-1].
+        # Joiner (offset=N): connects to [0..offset+world_size-1] so it can
+        # exchange tokens with the primary ranks as well as its own peers.
         # Further growth: _scale_to vs _connected_ep_size on each get_nixl_buffer
         # after on_scale() sets _scale_to.
-        live_ranks = list(range(offset, offset + world_size))
+        live_ranks = list(range(offset + world_size))
         scale_to = offset + world_size
         logger.info(
             "[Elastic EP][nixl] initial connect_ranks(%s) "
@@ -357,15 +360,16 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
         use_fp8 = not envs.SGLANG_NIXL_EP_BF16_DISPATCH.get()
 
         buffer = self._get_buffer()
-        if not hasattr(self, "_last_logged_group_size") or self._last_logged_group_size != buffer.group_size:
+        _cep = NixlEPBuffer._connected_ep_size
+        if not hasattr(self, "_last_logged_cep") or self._last_logged_cep != _cep:
             logger.info(
                 "[Elastic EP][nixl] dispatch group_size=%s "
                 "(connected_ep_size=%s, scale_to=%s)",
                 buffer.group_size,
-                NixlEPBuffer._connected_ep_size,
+                _cep,
                 NixlEPBuffer._scale_to,
             )
-            self._last_logged_group_size = buffer.group_size
+            self._last_logged_cep = _cep
         packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
             buffer.dispatch(
                 hidden_states,
