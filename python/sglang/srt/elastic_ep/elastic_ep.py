@@ -232,10 +232,19 @@ def _map_global_to_group_local_ranks(
     return [rank_to_local[rank] for rank in global_ranks if rank in rank_to_local]
 
 
-def _wait_for_peer_state(mooncake_ep, backend, ranks: List[int]) -> None:
-    # Relaunched ranks become recoverable asynchronously, so we poll until the
-    # target backend reports all requested peers as ready.
+def _wait_for_peer_state(
+    mooncake_ep, backend, ranks: List[int], timeout_s: float = 60.0
+) -> None:
+    # Poll until all requested peers are ready (joiner in join_group).
+    # get_peer_state is a collective — all active ranks must call it.
+    deadline = time.time() + timeout_s
     while not all(mooncake_ep.get_peer_state(backend, ranks)):
+        if time.time() > deadline:
+            logger.warning(
+                "[Elastic EP] _wait_for_peer_state timed out after %.0fs "
+                "waiting for ranks %s", timeout_s, ranks,
+            )
+            return
         time.sleep(_PEER_STATE_POLL_INTERVAL_SEC)
 
 
@@ -269,20 +278,21 @@ def try_recover_ranks(global_ranks: List[int]) -> bool:
     # using ranks mapped into that group's local rank space.
     mooncake_ep.recover_ranks(world_backend, global_ranks)
 
-    # All groups (WORLD + sub-groups) have max_world_size — no extend needed.
-    # Brief pause for joiners to enter join_group on sub-groups after
-    # their WORLD join_group returned.
-    time.sleep(2)
-
+    # All groups have max_world_size — no extend_group_size_to needed.
+    # Per Mooncake team: joiner MUST be in join_group on a sub-group
+    # before recover_ranks is called on it.  Poll get_peer_state per
+    # sub-group (same two-phase protocol as WORLD).
     for group in _iter_live_parallel_groups():
         group_local_ranks = _map_global_to_group_local_ranks(group.ranks, global_ranks)
         if not group_local_ranks:
             continue
 
         device_backend = _get_process_group_backend(group.device_group, "cuda")
+        _wait_for_peer_state(mooncake_ep, device_backend, group_local_ranks)
         mooncake_ep.recover_ranks(device_backend, group_local_ranks)
 
         cpu_backend = _get_process_group_backend(group.cpu_group, "cpu")
+        _wait_for_peer_state(mooncake_ep, cpu_backend, group_local_ranks)
         mooncake_ep.recover_ranks(cpu_backend, group_local_ranks)
         _maybe_create_message_queue(group)
 
