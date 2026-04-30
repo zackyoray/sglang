@@ -325,10 +325,35 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
             hidden_states.shape[0] * ep_size * topk_ids.shape[1]
             + self.num_experts
         ) // self.num_experts
+
+        if not hasattr(self, "_dispatch_logged"):
+            logger.info(
+                "[SHAPES] dispatch_a INPUT: hidden_states=%s topk_ids=%s "
+                "topk_weights=%s ep_size=%d expected_m=%d "
+                "num_experts=%d num_local_experts=%d "
+                "num_max_dispatch_tokens=%d nixl_num_experts=%d",
+                list(hidden_states.shape), list(topk_ids.shape),
+                list(topk_weights.shape), ep_size, expected_m,
+                self.num_experts, self.num_local_experts,
+                self.num_max_dispatch_tokens_per_rank,
+                NixlEPBuffer._num_local_experts * NixlEPBuffer._ep_size,
+            )
+            self._dispatch_logged = True
+
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,
             topk_ids,
         )
+
+        if hasattr(self, "_dispatch_logged") and not hasattr(self, "_dispatch_out_logged"):
+            hs_shape = list(hidden_states[0].shape) if isinstance(hidden_states, tuple) else list(hidden_states.shape)
+            logger.info(
+                "[SHAPES] dispatch_a OUTPUT: hidden_states=%s masked_m=%s "
+                "expected_m=%d",
+                hs_shape, list(masked_m.shape), expected_m,
+            )
+            self._dispatch_out_logged = True
+
         return (
             hidden_states,
             topk_ids,
@@ -359,6 +384,18 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
             hidden_states, hidden_states_scale = hidden_states
         else:
             hidden_states_scale = None
+
+        if not hasattr(self, "_dispatchb_logged"):
+            logger.info(
+                "[SHAPES] dispatch_b TO_GEMM: hidden_states=%s "
+                "hidden_states_scale=%s topk_ids=%s topk_weights=%s "
+                "masked_m=%s expected_m=%d",
+                list(hidden_states.shape),
+                list(hidden_states_scale.shape) if hidden_states_scale is not None else None,
+                list(topk_ids.shape), list(topk_weights.shape),
+                list(masked_m.shape), expected_m,
+            )
+            self._dispatchb_logged = True
 
         nixl_output = NixlEPDispatchOutput(
             hidden_states,
@@ -427,6 +464,15 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
+        if not hasattr(self, "_combine_logged"):
+            logger.info(
+                "[SHAPES] combine_a INPUT: hidden_states=%s topk_ids=%s "
+                "topk_weights=%s",
+                list(hidden_states.shape), list(topk_ids.shape),
+                list(topk_weights.shape),
+            )
+            self._combine_logged = True
+
         hidden_states, event, hook = self._combine_core(
             hidden_states,
             topk_ids,
