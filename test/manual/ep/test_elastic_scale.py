@@ -295,6 +295,8 @@ def _scale_up_common_args(
         "--mem-fraction-static",
         "0.5",
         "--disable-cuda-graph",
+        "--chunked-prefill-size",
+        "1024",
         "--nnodes",
         str(nnodes),
         "--node-rank",
