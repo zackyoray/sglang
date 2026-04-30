@@ -68,27 +68,41 @@ class NixlEPBuffer:
         nixl_num_experts = num_local_experts * ep_size is passed to dispatch,
         so NIXL routes: rank = physical_id // num_local_experts.
 
-        Global expert i is owned by rank (i % ep_size) and is the
-        (i // ep_size)-th expert on that rank:
-          physical_id = owner_rank * num_local_experts + local_index
+        When num_local_experts * ep_size == num_experts (no elastic expansion),
+        the mapping is identity and we skip remapping entirely to avoid
+        disrupting the existing expert assignment (trivial/contiguous).
 
-        Pre-scale (ep_size=4):  physical range [0..95],  nixl_num_experts=96
-        Post-scale (ep_size=8): physical range [0..179], nixl_num_experts=192
+        When they differ (elastic: e.g. 24*4=96 model but 24*8=192 dispatch),
+        the mapping assigns global expert i to:
+          physical_id = (i % ep_size) * num_local_experts + (i // ep_size)
         """
         num_local = cls._num_local_experts
+        nixl_total = num_local * ep_size
+        cls._ep_size = ep_size
+
+        if nixl_total == num_experts:
+            # No remapping needed — identity. NIXL routing with num_experts
+            # naturally gives num_local_experts per rank.
+            cls._global_to_physical = None
+            cls._physical_to_global = None
+            logger.info(
+                "[Elastic EP][nixl] routing tables: identity (num_experts=%d "
+                "ep_size=%d num_local=%d nixl_num_experts=%d)",
+                num_experts, ep_size, num_local, nixl_total,
+            )
+            return
+
         device = "cuda"
         g = torch.arange(num_experts, dtype=torch.long, device=device)
         owner = g % ep_size
         local_idx = g // ep_size
         physical = owner * num_local + local_idx
 
-        nixl_total = num_local * ep_size
         cls._global_to_physical = physical
         cls._physical_to_global = torch.zeros(
             nixl_total, dtype=torch.long, device=device
         )
         cls._physical_to_global[physical] = g
-        cls._ep_size = ep_size
         logger.info(
             "[Elastic EP][nixl] built routing tables: num_experts=%d ep_size=%d "
             "num_local=%d nixl_num_experts=%d "
