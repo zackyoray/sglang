@@ -388,10 +388,22 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
                 NixlEPBuffer._scale_to,
             )
             self._last_logged_cep = _cep
-        # nixl_num_experts = num_local_experts * ep_size so NIXL routes
-        # num_local_experts per rank. With nixl_max_ranks=32 in buffer config,
-        # this doesn't overflow internal buffers.
         nixl_num_experts = NixlEPBuffer._num_local_experts * NixlEPBuffer._ep_size
+        if hidden_states.shape[0] > self.num_max_dispatch_tokens_per_rank:
+            logger.error(
+                "[Elastic EP][nixl] BATCH TOO LARGE: x.size(0)=%d > "
+                "num_max_dispatch_tokens_per_rank=%d, nixl_num_experts=%d, "
+                "ep_size=%d, group_size=%d, topk_idx.shape=%s, "
+                "topk_idx.min=%d, topk_idx.max=%d",
+                hidden_states.shape[0],
+                self.num_max_dispatch_tokens_per_rank,
+                nixl_num_experts,
+                NixlEPBuffer._ep_size,
+                buffer.group_size,
+                list(topk_idx.shape),
+                topk_idx[topk_idx >= 0].min().item() if (topk_idx >= 0).any() else -1,
+                topk_idx.max().item(),
+            )
         packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
             buffer.dispatch(
                 hidden_states,
