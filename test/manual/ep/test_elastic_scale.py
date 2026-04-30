@@ -197,6 +197,8 @@ COLD_START_8RANK_ARGS = [
     "8",
     "--mem-fraction-static",
     "0.5",
+    "--chunked-prefill-size",
+    "1024",
 ]
 
 
