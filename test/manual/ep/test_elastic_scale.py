@@ -518,9 +518,22 @@ class _ElasticScaleUpEndToEndBase(CustomTestCase):
         # Step 5: post-scale inference works.
         self._generate_ok("post-scale (8 ranks)")
 
-        # Step 6: accuracy check — deferred until EPLB rebalance completes
-        # (requires ~1000 forward passes for the normal EPLB cycle to fire).
-        # TODO: add a long-running accuracy test that waits for rebalance.
+        # Step 6: accuracy check — verify no silent corruption post-scale.
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=50,
+            num_threads=32,
+        )
+        metrics = run_eval(args)
+        print(f"[TEST] Post-scale GSM8K accuracy: {metrics['score']:.2%}")
+        self.assertGreater(
+            metrics["score"], 0.50,
+            f"Post-scale GSM8K accuracy too low: {metrics['score']:.2%}"
+        )
 
 
 @unittest.skipUnless(

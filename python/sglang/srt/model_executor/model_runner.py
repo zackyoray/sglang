@@ -504,6 +504,55 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     invoked_in_ep_join_path=True
                 )
             )
+
+            # Expand EPLB metadata to the full EP size (same logic as primary).
+            # The joiner received the primary's OLD map (96 slots). Extend it
+            # with trivial slots for all new ranks (including self).
+            metadata = get_global_expert_location_metadata()
+            if metadata is not None and self.server_args.max_ep_size:
+                old_num_physical = metadata.num_physical_experts
+                effective_ep = self.server_args.max_ep_size
+                num_local = old_num_physical // (
+                    old_num_physical // metadata.num_logical_experts
+                    if metadata.num_logical_experts > 0
+                    else 1
+                )
+                # num_local = num_local_experts (24 for our case)
+                num_local = old_num_physical // (
+                    self.server_args.ep_size
+                    if self.server_args.ep_size > 0
+                    else 1
+                )
+                new_num_physical = num_local * effective_ep
+                added = new_num_physical - old_num_physical
+                if added > 0:
+                    self.server_args.ep_num_redundant_experts += added
+                    self.server_args.ep_size = effective_ep
+
+                    old_p2l = metadata.physical_to_logical_map
+                    num_layers = old_p2l.shape[0]
+                    num_logical = metadata.num_logical_experts
+                    trivial_new = (
+                        torch.arange(0, added, device=old_p2l.device)
+                        .unsqueeze(0)
+                        .expand(num_layers, -1)
+                        % num_logical
+                    )
+                    expanded_p2l = torch.cat([old_p2l, trivial_new], dim=1)
+
+                    new_metadata = ExpertLocationMetadata.init_by_mapping(
+                        self.server_args,
+                        self.model_config,
+                        physical_to_logical_map=expanded_p2l,
+                        moe_ep_rank=self.tp_rank,
+                    )
+                    set_global_expert_location_metadata(new_metadata)
+                    logger.info(
+                        "[Elastic EP][JOINER] expanded expert pool: "
+                        "num_physical %d→%d, ep_size=%d",
+                        old_num_physical, new_num_physical, effective_ep,
+                    )
+
             if self.server_args.ep_join_mode == "recover":
                 # Recovery: the original world is healthy. Mark all peers
                 # active so cuda graphs and routing immediately resume the
@@ -1609,29 +1658,48 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if ElasticEPStateManager._on_scale is not None:
                 ElasticEPStateManager._on_scale(from_ep_size, effective_size)
 
-            # Expand EPLB to the new EP size so tokens route to all ranks.
-            # Grow num_physical_experts from num_local*old_ep to num_local*new_ep
-            # by increasing ep_num_redundant_experts. The actual rebalance is
-            # deferred to the normal EPLB cycle (every N iterations) because
-            # the joiner may still be initializing its NIXL buffer and can't
-            # participate in collectives/P2P yet.
+            # Expand EPLB metadata locally (no collectives, no P2P).
+            # New ranks loaded the same weights as the primary (trivial
+            # assignment from checkpoint), so their physical_to_logical_map
+            # is the trivial pattern. We concatenate the primary's current
+            # (possibly rebalanced) map with trivial slots for the joiners.
             metadata = get_global_expert_location_metadata()
-            old_num_physical = metadata.num_physical_experts if metadata else 0
-            num_local = old_num_physical // from_ep_size
-            new_num_physical = num_local * effective_size
-            added_redundant = new_num_physical - old_num_physical
-            if added_redundant > 0:
-                self.server_args.ep_num_redundant_experts += added_redundant
-                self.server_args.ep_size = effective_size
-                logger.info(
-                    "[Elastic EP][EPLB] expanding expert pool: "
-                    "num_physical %d→%d, ep_size %d→%d, "
-                    "ep_num_redundant_experts=%d. "
-                    "Rebalance deferred to normal EPLB cycle.",
-                    old_num_physical, new_num_physical,
-                    from_ep_size, effective_size,
-                    self.server_args.ep_num_redundant_experts,
-                )
+            if metadata is not None:
+                old_num_physical = metadata.num_physical_experts
+                num_local = old_num_physical // from_ep_size
+                new_num_physical = num_local * effective_size
+                added_redundant = new_num_physical - old_num_physical
+                if added_redundant > 0:
+                    self.server_args.ep_num_redundant_experts += added_redundant
+                    self.server_args.ep_size = effective_size
+
+                    old_p2l = metadata.physical_to_logical_map
+                    num_layers = old_p2l.shape[0]
+                    num_logical = metadata.num_logical_experts
+                    trivial_new = (
+                        torch.arange(0, added_redundant, device=old_p2l.device)
+                        .unsqueeze(0)
+                        .expand(num_layers, -1)
+                        % num_logical
+                    )
+                    expanded_p2l = torch.cat([old_p2l, trivial_new], dim=1)
+
+                    new_metadata = ExpertLocationMetadata.init_by_mapping(
+                        self.server_args,
+                        self.model_config,
+                        physical_to_logical_map=expanded_p2l,
+                        moe_ep_rank=self.tp_rank,
+                    )
+                    set_global_expert_location_metadata(new_metadata)
+
+                    logger.info(
+                        "[Elastic EP][EPLB] expanded expert pool locally: "
+                        "num_physical %d→%d, ep_size %d→%d, "
+                        "ep_num_redundant_experts=%d",
+                        old_num_physical, new_num_physical,
+                        from_ep_size, effective_size,
+                        self.server_args.ep_num_redundant_experts,
+                    )
 
             ElasticEPStateManager.instance().snapshot_active_to_last()
             ElasticEPStateManager.instance().sync_active_to_cpu()
