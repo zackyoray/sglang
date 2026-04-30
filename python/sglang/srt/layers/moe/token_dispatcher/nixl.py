@@ -134,6 +134,11 @@ class NixlEPBuffer:
         from sglang.srt.server_args import get_global_server_args
 
         max_ep_size = get_global_server_args().max_ep_size or world_size
+        # Use a large num_ranks for buffer allocation (like vLLM's
+        # VLLM_NIXL_EP_MAX_NUM_RANKS=32). This ensures NIXL internal
+        # buffer math works even when nixl_num_experts grows post-scale
+        # (e.g. 192 with 32 ranks = 6 per slot, vs 192 with 8 = 24).
+        nixl_max_ranks = max(max_ep_size, 32)
 
         num_rdma_bytes = 0
         if deepep_mode.enable_normal():
@@ -141,11 +146,11 @@ class NixlEPBuffer:
         if deepep_mode.enable_low_latency():
             assert num_max_dispatch_tokens_per_rank != -1
             assert num_experts != -1 and num_experts % group.size() == 0
-            max_num_global_experts = max_ep_size * num_local_experts
+            max_num_global_experts = nixl_max_ranks * num_local_experts
             num_rdma_bytes = Buffer.get_rdma_size_hint(
                 num_max_dispatch_tokens_per_rank,
                 hidden_size,
-                max_ep_size,
+                nixl_max_ranks,
                 max_num_global_experts,
             )
 
@@ -170,7 +175,7 @@ class NixlEPBuffer:
         )
 
         cls._buffer.update_memory_buffers(
-            num_ranks=max_ep_size,
+            num_ranks=nixl_max_ranks,
             num_experts_per_rank=cls._num_local_experts,
             num_rdma_bytes=num_rdma_bytes,
         )
@@ -385,7 +390,8 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
             )
             self._last_logged_cep = _cep
         # nixl_num_experts = num_local_experts * ep_size so NIXL routes
-        # num_local_experts per rank: pre-scale 24*4=96, post-scale 24*8=192.
+        # num_local_experts per rank. With nixl_max_ranks=32 in buffer config,
+        # this doesn't overflow internal buffers.
         nixl_num_experts = NixlEPBuffer._num_local_experts * NixlEPBuffer._ep_size
         packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
             buffer.dispatch(
