@@ -249,18 +249,17 @@ class _NixlEPDispatcherImplBase:
         self.active_ranks = (
             elastic_state.active_ranks if elastic_state is not None else None
         )
-        # NIXL's query_mask_buffer requires the mask tensor numel to equal
-        # the buffer's max_num_ranks (which we pre-allocate to max_ep_size).
-        # So the mask AND active_ranks must be sized to max_ep_size. NIXL
-        # populates only the live-world slots; the rest get a sentinel
-        # (not 0), so we track the live portion separately to preserve the
-        # "reserved slots stay at 0" invariant required by is_scaling().
+        # NIXL's query_mask_buffer requires mask_status.numel() == max_num_ranks
+        # from update_memory_buffers (nixl_max_ranks=32), NOT max_ep_size (8).
+        # Size the mask buffer to nixl_max_ranks; only the live-world slots
+        # are copied back to active_ranks.
         self._active_world_size = dist.get_world_size(group)
-        # Joiner with --ep-join-rank-offset N writes its dispatcher mask into
-        # active_ranks[N : N + world_size] rather than [:world_size].
         self._active_rank_offset = ElasticEPStateManager.get_ep_join_rank_offset()
+        from sglang.srt.server_args import get_global_server_args
+        _max_ep = get_global_server_args().max_ep_size or self._active_world_size
+        _nixl_max_ranks = max(_max_ep, 32)
         self._mask_buffer = (
-            torch.zeros_like(self.active_ranks)
+            torch.zeros(_nixl_max_ranks, dtype=torch.int32, device="cuda")
             if self.active_ranks is not None
             else None
         )
