@@ -51,85 +51,26 @@ class NixlEPBuffer:
     # (same timing as RFC — not bumped from HTTP scale alone).
     _scale_to: Optional[int] = None
 
-    # Expert ID remapping tables (following vLLM's approach).
-    # NIXL routes: rank = physical_id // (nixl_num_experts // num_connected_ranks).
-    # We pass nixl_num_experts = num_local_experts * ep_size to dispatch so each
-    # rank gets exactly num_local_experts slots. The remapping packs global router
-    # IDs [0..num_model_experts-1] into contiguous per-rank blocks of num_local_experts.
-    _global_to_physical: Optional[torch.Tensor] = None
-    _physical_to_global: Optional[torch.Tensor] = None
+    # ep_size for nixl_num_experts computation. Updated on scale.
+    # nixl_num_experts = num_local_experts * _ep_size ensures each rank gets
+    # exactly num_local_experts slots in the NIXL dispatch output.
+    # No ID remapping needed: SGLang uses contiguous expert assignment
+    # (experts 0-23 on rank 0, 24-47 on rank 1, etc.) and the router's
+    # topk_ids naturally fall into the correct rank blocks.
     _ep_size: Optional[int] = None
-
-    @classmethod
-    def _build_routing_tables(cls, num_experts: int, ep_size: int) -> None:
-        """Build global↔physical expert ID mapping for NIXL dispatch.
-
-        Each rank owns a contiguous block of num_local_experts physical IDs.
-        nixl_num_experts = num_local_experts * ep_size is passed to dispatch,
-        so NIXL routes: rank = physical_id // num_local_experts.
-
-        When num_local_experts * ep_size == num_experts (no elastic expansion),
-        the mapping is identity and we skip remapping entirely to avoid
-        disrupting the existing expert assignment (trivial/contiguous).
-
-        When they differ (elastic: e.g. 24*4=96 model but 24*8=192 dispatch),
-        the mapping assigns global expert i to:
-          physical_id = (i % ep_size) * num_local_experts + (i // ep_size)
-        """
-        num_local = cls._num_local_experts
-        nixl_total = num_local * ep_size
-        cls._ep_size = ep_size
-
-        if nixl_total == num_experts:
-            # No remapping needed — identity. NIXL routing with num_experts
-            # naturally gives num_local_experts per rank.
-            cls._global_to_physical = None
-            cls._physical_to_global = None
-            logger.info(
-                "[Elastic EP][nixl] routing tables: identity (num_experts=%d "
-                "ep_size=%d num_local=%d nixl_num_experts=%d)",
-                num_experts, ep_size, num_local, nixl_total,
-            )
-            return
-
-        device = "cuda"
-        g = torch.arange(num_experts, dtype=torch.long, device=device)
-        owner = g % ep_size
-        local_idx = g // ep_size
-        physical = owner * num_local + local_idx
-
-        cls._global_to_physical = physical
-        cls._physical_to_global = torch.zeros(
-            nixl_total, dtype=torch.long, device=device
-        )
-        cls._physical_to_global[physical] = g
-        logger.info(
-            "[Elastic EP][nixl] built routing tables: num_experts=%d ep_size=%d "
-            "num_local=%d nixl_num_experts=%d "
-            "(sample: global[0,1,2,3]→physical%s)",
-            num_experts, ep_size, num_local, nixl_total,
-            physical[:4].tolist(),
-        )
-
-    @classmethod
-    def map_global_to_physical(cls, topk_ids: torch.Tensor) -> torch.Tensor:
-        if cls._global_to_physical is None:
-            return topk_ids
-        mask = topk_ids >= 0
-        result = torch.where(mask, cls._global_to_physical[topk_ids.clamp(min=0)], topk_ids)
-        return result
 
     @classmethod
     def on_scale(cls, from_ep_size: int, to_ep_size: int) -> None:
         """Called from ElasticEPStateManager._on_scale_nixl after activate_ranks."""
         cls._scale_to = to_ep_size
-        if cls._num_experts is not None:
-            cls._build_routing_tables(cls._num_experts, to_ep_size)
+        cls._ep_size = to_ep_size
         logger.info(
-            "[Elastic EP][nixl] on_scale(%s -> %s) _scale_to=%s",
+            "[Elastic EP][nixl] on_scale(%s -> %s) _scale_to=%s "
+            "nixl_num_experts=%s",
             from_ep_size,
             to_ep_size,
             to_ep_size,
+            cls._num_local_experts * to_ep_size if cls._num_local_experts else None,
         )
 
     @classmethod
@@ -253,7 +194,7 @@ class NixlEPBuffer:
         cls._connected_ep_size = scale_to
         cls._scale_to = scale_to
 
-        cls._build_routing_tables(num_experts, scale_to)
+        cls._ep_size = scale_to
 
         return cls._buffer
 
@@ -380,10 +321,9 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
             hidden_states.shape[0] * ep_size * topk_ids.shape[1]
             + self.num_experts
         ) // self.num_experts
-        dispatch_topk_ids = NixlEPBuffer.map_global_to_physical(topk_ids)
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,
-            dispatch_topk_ids,
+            topk_ids,
         )
         return (
             hidden_states,
@@ -470,10 +410,9 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
-        combine_topk_ids = NixlEPBuffer.map_global_to_physical(topk_ids)
         hidden_states, event, hook = self._combine_core(
             hidden_states,
-            combine_topk_ids,
+            topk_ids,
             topk_weights,
         )
         return hidden_states, event, hook
