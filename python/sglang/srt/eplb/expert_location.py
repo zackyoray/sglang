@@ -312,9 +312,10 @@ def get_global_expert_location_metadata():
     return _global_expert_location_metadata
 
 
-def set_global_expert_location_metadata(value):
+def set_global_expert_location_metadata(value, allow_overwrite=False):
     global _global_expert_location_metadata
-    assert _global_expert_location_metadata is None
+    if not allow_overwrite:
+        assert _global_expert_location_metadata is None
     _global_expert_location_metadata = value
 
 

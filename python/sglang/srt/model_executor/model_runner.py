@@ -546,7 +546,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         physical_to_logical_map=expanded_p2l,
                         moe_ep_rank=self.tp_rank,
                     )
-                    set_global_expert_location_metadata(new_metadata)
+                    set_global_expert_location_metadata(new_metadata, allow_overwrite=True)
                     logger.info(
                         "[Elastic EP][JOINER] expanded expert pool: "
                         "num_physical %d→%d, ep_size=%d",
@@ -1690,7 +1690,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         physical_to_logical_map=expanded_p2l,
                         moe_ep_rank=self.tp_rank,
                     )
-                    set_global_expert_location_metadata(new_metadata)
+                    set_global_expert_location_metadata(new_metadata, allow_overwrite=True)
 
                     logger.info(
                         "[Elastic EP][EPLB] expanded expert pool locally: "
