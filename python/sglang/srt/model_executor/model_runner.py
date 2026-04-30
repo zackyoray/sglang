@@ -1609,6 +1609,36 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if ElasticEPStateManager._on_scale is not None:
                 ElasticEPStateManager._on_scale(from_ep_size, effective_size)
 
+            # Expand EPLB to the new EP size so tokens route to all ranks.
+            # Grow num_physical_experts from num_local*old_ep to num_local*new_ep
+            # by increasing ep_num_redundant_experts. Then trigger rebalance.
+            metadata = get_global_expert_location_metadata()
+            old_num_physical = metadata.num_physical_experts if metadata else 0
+            num_local = old_num_physical // from_ep_size
+            new_num_physical = num_local * effective_size
+            added_redundant = new_num_physical - old_num_physical
+            if added_redundant > 0:
+                self.server_args.ep_num_redundant_experts += added_redundant
+                self.server_args.ep_size = effective_size
+                logger.info(
+                    "[Elastic EP][EPLB] expanding expert pool: "
+                    "num_physical %d→%d, ep_size %d→%d, "
+                    "ep_num_redundant_experts=%d",
+                    old_num_physical, new_num_physical,
+                    from_ep_size, effective_size,
+                    self.server_args.ep_num_redundant_experts,
+                )
+                if self.eplb_manager is not None:
+                    gen = self.eplb_manager.rebalance()
+                    while True:
+                        try:
+                            next(gen)
+                        except StopIteration:
+                            break
+                    logger.info(
+                        "[Elastic EP][EPLB] rebalance complete post-scale"
+                    )
+
             ElasticEPStateManager.instance().snapshot_active_to_last()
             ElasticEPStateManager.instance().sync_active_to_cpu()
 
