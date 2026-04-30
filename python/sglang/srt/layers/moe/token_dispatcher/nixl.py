@@ -337,8 +337,8 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
                 ep_size, self.num_experts, self.num_local_experts,
                 NixlEPBuffer._num_local_experts * _ep,
                 self.num_max_dispatch_tokens_per_rank,
-                topk_ids[topk_ids >= 0].min().item() if (topk_ids >= 0).any() else -1,
-                topk_ids.max().item(),
+                topk_ids[topk_ids >= 0].min().item() if topk_ids.numel() > 0 and (topk_ids >= 0).any() else -1,
+                topk_ids.max().item() if topk_ids.numel() > 0 else -1,
             )
 
         hidden_states, masked_m, event, hook = self._dispatch_core(
@@ -428,7 +428,7 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
                 NixlEPBuffer._ep_size,
                 buffer.group_size,
                 list(topk_idx.shape),
-                topk_idx[topk_idx >= 0].min().item() if (topk_idx >= 0).any() else -1,
+                topk_idx[topk_idx >= 0].min().item() if topk_idx.numel() > 0 and (topk_idx >= 0).any() else -1,
                 topk_idx.max().item(),
             )
         packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
