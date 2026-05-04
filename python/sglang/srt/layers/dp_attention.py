@@ -55,14 +55,22 @@ _ELASTIC_JOINER_SKIP_ALL_GATHER: bool = False
 
 
 def enable_joiner_all_gather():
-    """Clear the joiner skip flag — called when the joiner is adopted by
-    the primary's controller and starts receiving batches in lockstep."""
-    global _ELASTIC_JOINER_SKIP_ALL_GATHER
+    """Re-enable joiner dp_attention after adoption by the primary.
+
+    Called when the joiner has joined the Mooncake WORLD group and is ready
+    to participate in the unified 8-rank forward pass. Flips both the skip
+    flag and the dp_attention master flag back on — they were both set False
+    at init by ``initialize_dp_attention`` on joiner processes so warmup /
+    forward_idle could run as a plain local forward without dp_gather.
+    """
+    global _ELASTIC_JOINER_SKIP_ALL_GATHER, _ENABLE_DP_ATTENTION_FLAG
     import logging
     logging.getLogger(__name__).info(
-        "[Elastic EP] Joiner all_gather enabled (adopted by primary controller)"
+        "[Elastic EP] Joiner all_gather + dp_attention re-enabled "
+        "(adopted by primary controller)"
     )
     _ELASTIC_JOINER_SKIP_ALL_GATHER = False
+    _ENABLE_DP_ATTENTION_FLAG = True
 
 
 def update_dp_attention_post_scale(new_dp_size: int, new_dp_rank: int):
@@ -349,6 +357,14 @@ def initialize_dp_attention(
             global _ELASTIC_JOINER_SKIP_ALL_GATHER
             if server_args.ep_join_mode in ("scale", "recover"):
                 _ELASTIC_JOINER_SKIP_ALL_GATHER = True
+                # Joiner's warmup / forward_idle must not exercise the
+                # dp_attention machinery: its globals (_DpGatheredBufferWrapper
+                # class vars, dp_padding_mode, …) are populated by
+                # prepare_mlp_sync_batch, which the joiner skips until it is
+                # adopted by the primary's DataParallelController. Keep
+                # dp_attention fully disabled on the joiner until
+                # enable_joiner_all_gather() flips it back on at adoption.
+                _ENABLE_DP_ATTENTION_FLAG = False
         if moe_dense_tp_size is None:
             _LOCAL_ATTN_DP_SIZE = _ATTN_DP_SIZE
         else:

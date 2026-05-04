@@ -553,8 +553,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         old_num_physical, new_num_physical, effective_ep,
                     )
 
-            # Switch dp_attention allreduce to Mooncake PG WORLD group.
-            from sglang.srt.layers.dp_attention import update_dp_attention_post_scale
+            # Re-enable dp_attention on this joiner (was disabled at init to
+            # keep forward_idle local during warmup), then switch dp_attention
+            # allreduce to the Mooncake PG WORLD group.
+            from sglang.srt.layers.dp_attention import (
+                enable_joiner_all_gather,
+                update_dp_attention_post_scale,
+            )
+            enable_joiner_all_gather()
             update_dp_attention_post_scale(
                 new_dp_size=self.server_args.max_ep_size,
                 new_dp_rank=self.tp_rank + self.server_args.ep_join_rank_offset,
