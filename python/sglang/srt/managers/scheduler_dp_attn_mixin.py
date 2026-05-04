@@ -72,10 +72,22 @@ class MLPSyncBatchInfo:
 
     def all_gather(self, device, group: torch.distributed.ProcessGroup):
         local_info_tensor = self._get_local_tensor(device=device)
-        global_info_tensor = torch.empty(
-            (self.dp_size, self.tp_size * self.cp_size, 6),
-            dtype=torch.int64,
-            device=device,
+        fallback_tensor = self._get_fallback_tensor(device=device)
+        # Prefill the gather buffer with the fallback pattern (IDLE forward_mode,
+        # zero tokens, etc.) BEFORE the all_gather. Rationale: when the WORLD
+        # group is Mooncake PG with `max_world_size` pre-provisioning, its
+        # all_gather may not write every slot (see MOONCAKE_MAX_WORLD_SIZE_
+        # INTEGRATION.md: "Works for allreduce, BROKEN for allgather/reduce
+        # _scatter"). Using `torch.empty` left those slots as uninitialized
+        # memory (often 0), which later crashed compute_output() with
+        # `ValueError: 0 is not a valid ForwardMode` because 0 is not in the
+        # ForwardMode enum. Prefilling with IDLE.value means any un-written
+        # slot is correctly interpreted as an idle rank and is filtered out
+        # by the idle/prebuilt exclusion in _compute_global_forward_mode().
+        global_info_tensor = (
+            fallback_tensor
+            .expand(self.dp_size, self.tp_size * self.cp_size, 6)
+            .contiguous()
         )
 
         torch.distributed.all_gather_into_tensor(
@@ -83,7 +95,9 @@ class MLPSyncBatchInfo:
             local_info_tensor,
             group=group,
         )
-        # Set fallback values for inactive ranks
+        # Set fallback values for inactive ranks (based on TP group's
+        # active_ranks view — when the gather ran over WORLD, the prefill
+        # above already covers missing slots).
         tp_info = global_info_tensor.view(self.dp_size * self.tp_size * self.cp_size, 6)
         num_ranks_in_tp_info = tp_info.shape[0]
         if device == "cpu":
@@ -95,7 +109,7 @@ class MLPSyncBatchInfo:
                 num_ranks_in_tp_info, dtype=tp_active_ranks.dtype,
                 device=tp_active_ranks.device,
             )
-        tp_info[tp_active_ranks[:num_ranks_in_tp_info] == 0] = self._get_fallback_tensor(device=device)
+        tp_info[tp_active_ranks[:num_ranks_in_tp_info] == 0] = fallback_tensor
 
         tp0_info = global_info_tensor[:, 0, :]
         self.tp0_info = tp0_info
