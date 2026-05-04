@@ -1725,7 +1725,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if self.tp_rank == 0:
                 try:
                     import zmq as _zmq
-                    from sglang.srt.managers.io_struct import ElasticScaleWorkerPorts
+                    from sglang.srt.managers.io_struct import ElasticScaleWorkerPortsReq
                     from sglang.srt.server_args import DP_ATTENTION_HANDSHAKE_PORT_DELTA
                     from sglang.srt.utils.network import NetworkAddress
 
@@ -1746,7 +1746,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         "[Elastic EP] Got joiner worker ports: %s",
                         joiner_worker_ports,
                     )
-                    self._pending_elastic_scale_msg = ElasticScaleWorkerPorts(
+                    self._pending_elastic_scale_msg = ElasticScaleWorkerPortsReq(
                         new_worker_ports=joiner_worker_ports
                     )
                 except Exception as e:

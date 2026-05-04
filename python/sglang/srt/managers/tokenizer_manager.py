@@ -50,7 +50,7 @@ from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
-    ElasticScaleWorkerPorts,
+    ElasticScaleWorkerPortsReq,
     BatchEmbeddingOutput,
     BatchStrOutput,
     BatchTokenIDOutput,
@@ -508,7 +508,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 # For handling case when scheduler skips detokenizer and forwards back to the tokenizer manager, we ignore it.
                 (HealthCheckOutput, lambda x: None),
                 (ActiveRanksOutput, self.update_active_ranks),
-                (ElasticScaleWorkerPorts, self.forward_elastic_scale_ports),
+                (ElasticScaleWorkerPortsReq, self.forward_elastic_scale_ports),
             ]
         )
         self.init_communicators(self.server_args)
@@ -2363,7 +2363,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
     def update_active_ranks(self, ranks: ActiveRanksOutput):
         self.send_to_scheduler.send_pyobj(ranks)
 
-    def forward_elastic_scale_ports(self, msg: ElasticScaleWorkerPorts):
+    def forward_elastic_scale_ports(self, msg: ElasticScaleWorkerPortsReq):
         self.send_to_scheduler.send_pyobj(msg)
 
     async def scale_elastic_ep(

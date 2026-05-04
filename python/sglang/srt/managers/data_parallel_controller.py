@@ -33,7 +33,7 @@ from sglang.srt.managers.io_struct import (
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
     BlockReqInput,
-    ElasticScaleWorkerPorts,
+    ElasticScaleWorkerPortsReq,
     ProfileReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -256,7 +256,7 @@ class DataParallelController:
                 (ProfileReq, self.send_to_all_workers),
                 (WatchLoadUpdateReq, self.handle_load_update_req),
                 (ActiveRanksOutput, self.update_active_ranks),
-                (ElasticScaleWorkerPorts, lambda msg: self.add_elastic_workers(msg.new_worker_ports)),
+                (ElasticScaleWorkerPortsReq, lambda msg: self.add_elastic_workers(msg.new_worker_ports)),
             ]
         )
         self._request_dispatcher.add_fallback_fn(self.send_control_message)

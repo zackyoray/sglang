@@ -1609,7 +1609,7 @@ class ActiveRanksOutput(BaseReq):
 
 
 @dataclass
-class ElasticScaleWorkerPorts(BaseReq):
+class ElasticScaleWorkerPortsReq(BaseReq):
     """Sent to DataParallelController to add joiner scheduler workers."""
     new_worker_ports: List[int]
 
