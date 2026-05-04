@@ -517,7 +517,7 @@ def _dp_gather_via_all_reduce(
         )
 
     # Input IDs are in int 32. We should use inplace_all_reduce for local case because of custom all reduce.
-    if _USE_WORLD_GROUP_FOR_DP_GATHER:
+    if _USE_WORLD_GROUP_FOR_DP_GATHER and not _ELASTIC_JOINER_SKIP_ALL_GATHER:
         from sglang.srt.distributed.parallel_state import get_world_group
         world_group = get_world_group()
         global_tokens[:] = world_group.all_reduce(global_tokens)
@@ -541,7 +541,7 @@ def _dp_gather_via_all_gather(
     forward_batch: ForwardBatch,
     is_partial: bool,
 ):
-    if _USE_WORLD_GROUP_FOR_DP_GATHER:
+    if _USE_WORLD_GROUP_FOR_DP_GATHER and not _ELASTIC_JOINER_SKIP_ALL_GATHER:
         from sglang.srt.distributed.parallel_state import get_world_group
         gather_group = get_world_group()
     else:

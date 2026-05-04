@@ -168,12 +168,6 @@ def prepare_mlp_sync_batch_raw(
         )
 
     skip_all_gather = envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
-    # Elastic EP joiners skip the all_gather during their own init phase
-    # because the primary's ranks aren't in the same call → deadlock.
-    # Cleared when the joiner transitions to the primary's controller.
-    from sglang.srt.layers.dp_attention import _ELASTIC_JOINER_SKIP_ALL_GATHER
-    if not skip_all_gather and _ELASTIC_JOINER_SKIP_ALL_GATHER:
-        skip_all_gather = True
     can_cuda_graph = (
         local_batch is None
         or local_batch.forward_mode.is_decode_or_idle()
@@ -186,9 +180,13 @@ def prepare_mlp_sync_batch_raw(
 
     tbo_preparer = TboDPAttentionPreparer()
     # After elastic scale, use the Mooncake PG WORLD group for all_gather
-    # so all 8 ranks participate (not just the original 4 in the TP group).
-    from sglang.srt.layers.dp_attention import _USE_WORLD_GROUP_FOR_DP_GATHER
-    if _USE_WORLD_GROUP_FOR_DP_GATHER:
+    # so all 8 ranks participate. BUT: joiner during init uses LOCAL TP group
+    # (can't join the 8-rank all_gather until adopted by primary's controller).
+    from sglang.srt.layers.dp_attention import (
+        _USE_WORLD_GROUP_FOR_DP_GATHER,
+        _ELASTIC_JOINER_SKIP_ALL_GATHER,
+    )
+    if _USE_WORLD_GROUP_FOR_DP_GATHER and not _ELASTIC_JOINER_SKIP_ALL_GATHER:
         from sglang.srt.distributed.parallel_state import get_world_group
         world = get_world_group()
         group = world.device_group
