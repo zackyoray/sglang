@@ -74,6 +74,48 @@ class NixlEPBuffer:
         )
 
     @classmethod
+    def _sync_connect_ranks(cls, ranks: list, *, tag: str) -> None:
+        """Run buffer.connect_ranks(ranks) in lockstep across all active EP ranks.
+
+        NIXL's connect_ranks is a two-sided TCPStore handshake: each side
+        writes its own metadata, reads the peers', and registers RDMA
+        memory descriptors. For that exchange to populate peer info
+        correctly on both sides, BOTH sides must be inside connect_ranks
+        at overlapping times. Without an explicit sync, primary hits
+        update_connections on its first post-scale dispatch while the
+        joiner is still in DeepGEMM warmup / kernel JIT — the two calls
+        can be 20+ seconds apart, and the "successful" return on each
+        side leaves late-added peer info in an inconsistent state,
+        producing silent dispatch-receive timeouts (`masked_m_sum=0`).
+
+        We wrap the call with a barrier on the Mooncake WORLD group,
+        which honors `active_ranks` — pre-scale it spans only the
+        primary's active ranks (cheap no-op), post-scale it spans all
+        primary+joiner ranks (which is exactly the sync we need).
+
+        The post-call barrier guards the reverse failure: a rank that
+        returns from its local handshake and jumps into dispatch while
+        a peer is still inside connect_ranks would try to RDMA against
+        an un-finalized peer memory descriptor.
+        """
+        from sglang.srt.distributed.parallel_state import get_world_group
+
+        world_group = get_world_group().device_group
+        logger.info(
+            "[Elastic EP][nixl] sync-connect (%s) pre-barrier WORLD", tag,
+        )
+        torch.distributed.barrier(group=world_group)
+        cls._buffer.connect_ranks(ranks)
+        logger.info(
+            "[Elastic EP][nixl] sync-connect (%s) connect_ranks(%s) done; "
+            "post-barrier WORLD (buffer.group_size=%s)",
+            tag,
+            ranks,
+            cls._buffer.group_size,
+        )
+        torch.distributed.barrier(group=world_group)
+
+    @classmethod
     def _update_connections(cls, scale_to: int) -> None:
         """connect_ranks(range(_connected_ep_size, scale_to)); caller ensures scale_to > _connected_ep_size."""
         new_ranks = list(range(cls._connected_ep_size, scale_to))
@@ -83,12 +125,8 @@ class NixlEPBuffer:
             new_ranks,
             scale_to,
         )
-        cls._buffer.connect_ranks(new_ranks)
+        cls._sync_connect_ranks(new_ranks, tag="update")
         cls._connected_ep_size = scale_to
-        logger.info(
-            "[Elastic EP][nixl] after connect_ranks: buffer.group_size=%s",
-            cls._buffer.group_size,
-        )
 
     @classmethod
     def get_nixl_buffer(
@@ -195,7 +233,7 @@ class NixlEPBuffer:
             offset,
             max_ep_size,
         )
-        cls._buffer.connect_ranks(live_ranks)
+        cls._sync_connect_ranks(live_ranks, tag="initial")
         cls._connected_ep_size = scale_to
         cls._scale_to = scale_to
 
