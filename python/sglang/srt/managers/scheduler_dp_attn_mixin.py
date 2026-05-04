@@ -83,14 +83,19 @@ class MLPSyncBatchInfo:
             local_info_tensor,
             group=group,
         )
+        # Set fallback values for inactive ranks
+        tp_info = global_info_tensor.view(self.dp_size * self.tp_size * self.cp_size, 6)
+        num_ranks_in_tp_info = tp_info.shape[0]
         if device == "cpu":
             tp_active_ranks = get_tp_group().active_ranks_cpu
         else:
             tp_active_ranks = get_tp_group().active_ranks
-
-        # Set fallback values for inactive ranks
-        tp_info = global_info_tensor.view(self.dp_size * self.tp_size * self.cp_size, 6)
-        tp_info[tp_active_ranks == 0] = self._get_fallback_tensor(device=device)
+        if tp_active_ranks.shape[0] < num_ranks_in_tp_info:
+            tp_active_ranks = torch.ones(
+                num_ranks_in_tp_info, dtype=tp_active_ranks.dtype,
+                device=tp_active_ranks.device,
+            )
+        tp_info[tp_active_ranks[:num_ranks_in_tp_info] == 0] = self._get_fallback_tensor(device=device)
 
         tp0_info = global_info_tensor[:, 0, :]
         self.tp0_info = tp0_info
@@ -174,7 +179,15 @@ def prepare_mlp_sync_batch_raw(
         local_batch.is_extend_in_batch = is_extend_in_batch
 
     tbo_preparer = TboDPAttentionPreparer()
-    if len(offload_tags) == 0 and (
+    # After elastic scale, use the Mooncake PG WORLD group for all_gather
+    # so all 8 ranks participate (not just the original 4 in the TP group).
+    from sglang.srt.layers.dp_attention import _USE_WORLD_GROUP_FOR_DP_GATHER
+    if _USE_WORLD_GROUP_FOR_DP_GATHER:
+        from sglang.srt.distributed.parallel_state import get_world_group
+        world = get_world_group()
+        group = world.device_group
+        device = world.device
+    elif len(offload_tags) == 0 and (
         disable_overlap_schedule
         or envs.SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH.get()
     ):
