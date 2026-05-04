@@ -134,11 +134,11 @@ class DpPaddingMode(IntEnum):
 
 class _DpGatheredBufferWrapper:
 
-    _hidden_size: int = 1
-    _dtype: torch.dtype = torch.float16
-    _device: torch.device = torch.device("cpu")
-    _global_dp_buffer_len: int = 0
-    _local_dp_buffer_len: int = 0
+    _hidden_size: int
+    _dtype: torch.dtype
+    _device: torch.device
+    _global_dp_buffer_len: int
+    _local_dp_buffer_len: int
     _dp_max_padding: bool = False
     _global_num_tokens: Optional[List[int]] = None
     _is_extend_in_batch: bool = False
@@ -164,10 +164,9 @@ class _DpGatheredBufferWrapper:
 
     @classmethod
     def get_global_dp_buffer(cls) -> torch.Tensor:
-        buf_len = cls._global_dp_buffer_len if cls._global_dp_buffer_len > 0 else 1
         with use_symmetric_memory(get_tp_group(), disabled=not cls._dp_max_padding):
             buffer = torch.empty(
-                (buf_len, cls._hidden_size),
+                (cls._global_dp_buffer_len, cls._hidden_size),
                 dtype=cls._dtype,
                 device=cls._device,
             )
@@ -175,10 +174,9 @@ class _DpGatheredBufferWrapper:
 
     @classmethod
     def get_local_dp_buffer(cls) -> torch.Tensor:
-        buf_len = cls._local_dp_buffer_len if cls._local_dp_buffer_len > 0 else 1
         with use_symmetric_memory(get_tp_group(), disabled=not cls._dp_max_padding):
             buffer = torch.empty(
-                (buf_len, cls._hidden_size),
+                (cls._local_dp_buffer_len, cls._hidden_size),
                 dtype=cls._dtype,
                 device=cls._device,
             )
