@@ -523,9 +523,6 @@ class _ElasticScaleUpEndToEndBase(CustomTestCase):
         self._generate_ok("post-scale (8 ranks)")
 
         # Step 6: accuracy check on primary post-scale.
-        # Joiner GSM8K disabled — requires unified DP group (milestone 13).
-        # Sending to joiner port causes NIXL timeouts because primary ranks
-        # aren't in dispatch when joiner tries to send tokens to them.
         args = SimpleNamespace(
             base_url=self.base_url,
             model=self.model,
