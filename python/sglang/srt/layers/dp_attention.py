@@ -48,6 +48,22 @@ _ENABLE_DP_ATTENTION_FLAG: bool = False
 # original ranks). Set by update_dp_attention_post_scale().
 _USE_WORLD_GROUP_FOR_DP_GATHER: bool = False
 
+# Elastic EP joiners skip the all_gather during their own init phase
+# because the primary's ranks aren't in the same call → deadlock.
+# Set True at joiner init, cleared when adopted by primary's controller.
+_ELASTIC_JOINER_SKIP_ALL_GATHER: bool = False
+
+
+def enable_joiner_all_gather():
+    """Clear the joiner skip flag — called when the joiner is adopted by
+    the primary's controller and starts receiving batches in lockstep."""
+    global _ELASTIC_JOINER_SKIP_ALL_GATHER
+    import logging
+    logging.getLogger(__name__).info(
+        "[Elastic EP] Joiner all_gather enabled (adopted by primary controller)"
+    )
+    _ELASTIC_JOINER_SKIP_ALL_GATHER = False
+
 
 def update_dp_attention_post_scale(new_dp_size: int, new_dp_rank: int):
     """Update dp_attention globals after elastic scale-up.
@@ -325,11 +341,13 @@ def initialize_dp_attention(
         global _USE_WORLD_GROUP_FOR_DP_GATHER
         if server_args.elastic_ep_backend is not None and server_args.max_ep_size:
             _USE_WORLD_GROUP_FOR_DP_GATHER = True
-            # Keep _ATTN_DP_SIZE as dp_size (not max_ep_size) to avoid
-            # inflating buffer sizes. The Mooncake WORLD group handles
-            # elastic membership; buffer sizing stays based on active ranks.
             offset = getattr(server_args, "ep_join_rank_offset", 0) or 0
             _ATTN_DP_RANK = tp_rank + offset
+
+            # Joiner skips all_gather during own init (before primary adopts it)
+            global _ELASTIC_JOINER_SKIP_ALL_GATHER
+            if server_args.ep_join_mode in ("scale", "recover"):
+                _ELASTIC_JOINER_SKIP_ALL_GATHER = True
         if moe_dense_tp_size is None:
             _LOCAL_ATTN_DP_SIZE = _ATTN_DP_SIZE
         else:

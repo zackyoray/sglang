@@ -199,6 +199,7 @@ COLD_START_8RANK_ARGS = [
     "0.5",
     "--chunked-prefill-size",
     "1024",
+    "--disable-cuda-graph",
 ]
 
 

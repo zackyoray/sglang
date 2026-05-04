@@ -168,6 +168,12 @@ def prepare_mlp_sync_batch_raw(
         )
 
     skip_all_gather = envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
+    # Elastic EP joiners skip the all_gather during their own init phase
+    # because the primary's ranks aren't in the same call → deadlock.
+    # Cleared when the joiner transitions to the primary's controller.
+    from sglang.srt.layers.dp_attention import _ELASTIC_JOINER_SKIP_ALL_GATHER
+    if not skip_all_gather and _ELASTIC_JOINER_SKIP_ALL_GATHER:
+        skip_all_gather = True
     can_cuda_graph = (
         local_batch is None
         or local_batch.forward_mode.is_decode_or_idle()
