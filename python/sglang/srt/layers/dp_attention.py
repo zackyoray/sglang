@@ -317,6 +317,17 @@ def initialize_dp_attention(
 
     if enable_dp_attention:
         _ATTN_DP_SIZE = dp_size
+
+        # When elastic EP is configured, use Mooncake PG WORLD group for
+        # dp_gather from startup. The WORLD group has max_world_size capacity
+        # and handles partial participation (only active ranks contribute).
+        # This avoids needing to switch groups post-scale.
+        global _USE_WORLD_GROUP_FOR_DP_GATHER
+        if server_args.elastic_ep_backend is not None and server_args.max_ep_size:
+            _USE_WORLD_GROUP_FOR_DP_GATHER = True
+            _ATTN_DP_SIZE = server_args.max_ep_size
+            offset = getattr(server_args, "ep_join_rank_offset", 0) or 0
+            _ATTN_DP_RANK = tp_rank + offset
         if moe_dense_tp_size is None:
             _LOCAL_ATTN_DP_SIZE = _ATTN_DP_SIZE
         else:
