@@ -342,11 +342,12 @@ def initialize_dp_attention(
         # This avoids needing to switch groups post-scale.
         global _USE_WORLD_GROUP_FOR_DP_GATHER
         if server_args.elastic_ep_backend is not None and server_args.max_ep_size:
-            _USE_WORLD_GROUP_FOR_DP_GATHER = True
             offset = getattr(server_args, "ep_join_rank_offset", 0) or 0
             _ATTN_DP_RANK = tp_rank + offset
 
-            # Joiner skips all_gather during own init (before primary adopts it)
+            # Primary: don't switch to WORLD group at init. Switch after scale
+            # via update_dp_attention_post_scale(). Joiner: also don't switch
+            # at init — use local TP group. Switch when adopted by primary.
             global _ELASTIC_JOINER_SKIP_ALL_GATHER
             if server_args.ep_join_mode in ("scale", "recover"):
                 _ELASTIC_JOINER_SKIP_ALL_GATHER = True
