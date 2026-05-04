@@ -33,6 +33,7 @@ from sglang.srt.managers.io_struct import (
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
     BlockReqInput,
+    ElasticScaleWorkerPorts,
     ProfileReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -202,6 +203,33 @@ class DataParallelController:
     def update_active_ranks(self, ranks: ActiveRanksOutput):
         self.status = ranks.status
 
+    def add_elastic_workers(self, new_worker_ports: List[int]):
+        """Add joiner scheduler workers after elastic scale-up.
+
+        Creates new ZMQ PUSH sockets to the joiner's scheduler endpoints
+        and extends the workers/status lists. Called when the primary
+        detects new ranks have joined via Mooncake PG.
+        """
+        bind_host = "127.0.0.1"
+        if self.server_args.dist_init_addr:
+            bind_host = NetworkAddress.parse(self.server_args.dist_init_addr).host
+
+        for port in new_worker_ports:
+            endpoint = NetworkAddress(bind_host, port).to_tcp()
+            sock = get_zmq_socket(self.context, zmq.PUSH, endpoint, True)
+            self.workers.append(sock)
+            self.status.append(True)
+            logger.info(
+                "[Elastic EP] Added worker dp_rank=%d at %s",
+                len(self.workers) - 1, endpoint,
+            )
+
+        self.dp_budget = DPBudget(len(self.workers))
+        logger.info(
+            "[Elastic EP] DataParallelController grown to %d workers",
+            len(self.workers),
+        )
+
     def dispatching_with_trace(self, req: Req):
         req.time_stats = DPControllerReqTimeStats.new_from_obj(req.time_stats)
 
@@ -228,6 +256,7 @@ class DataParallelController:
                 (ProfileReq, self.send_to_all_workers),
                 (WatchLoadUpdateReq, self.handle_load_update_req),
                 (ActiveRanksOutput, self.update_active_ranks),
+                (ElasticScaleWorkerPorts, lambda msg: self.add_elastic_workers(msg.new_worker_ports)),
             ]
         )
         self._request_dispatcher.add_fallback_fn(self.send_control_message)

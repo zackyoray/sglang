@@ -2907,6 +2907,12 @@ class Scheduler(
                 ActiveRanksOutput(status=dp_active_ranks.tolist())
             )
 
+        # Forward pending elastic scale message to DataParallelController
+        pending = getattr(self.model_worker._model_runner, "_pending_elastic_scale_msg", None)
+        if pending is not None:
+            self.send_to_tokenizer.send_output(pending)
+            self.model_worker._model_runner._pending_elastic_scale_msg = None
+
         return ret
 
     def launch_batch_sample_if_needed(

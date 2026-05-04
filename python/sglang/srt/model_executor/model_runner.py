@@ -1718,6 +1718,42 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             self.server_args.dp_size = effective_size
 
+            # Tell the DataParallelController to add joiner's scheduler
+            # workers. Only rank 0 does this (it's the controller leader).
+            # Fetch joiner's worker ports via the handshake endpoint.
+            # Store the message for the scheduler to send via send_to_tokenizer.
+            if self.tp_rank == 0:
+                try:
+                    import zmq as _zmq
+                    from sglang.srt.managers.io_struct import ElasticScaleWorkerPorts
+                    from sglang.srt.server_args import DP_ATTENTION_HANDSHAKE_PORT_DELTA
+                    from sglang.srt.utils.network import NetworkAddress
+
+                    joiner_port = self.server_args.port + 1
+                    joiner_handshake = NetworkAddress(
+                        "127.0.0.1",
+                        joiner_port + DP_ATTENTION_HANDSHAKE_PORT_DELTA,
+                    ).to_tcp()
+                    ctx = _zmq.Context()
+                    req = ctx.socket(_zmq.REQ)
+                    req.setsockopt(_zmq.RCVTIMEO, 10000)
+                    req.connect(joiner_handshake)
+                    req.send(b"0")
+                    joiner_worker_ports = req.recv_pyobj()
+                    req.close()
+                    ctx.term()
+                    logger.info(
+                        "[Elastic EP] Got joiner worker ports: %s",
+                        joiner_worker_ports,
+                    )
+                    self._pending_elastic_scale_msg = ElasticScaleWorkerPorts(
+                        new_worker_ports=joiner_worker_ports
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[Elastic EP] Failed to get joiner worker ports: %s", e,
+                    )
+
             ElasticEPStateManager.instance().snapshot_active_to_last()
             ElasticEPStateManager.instance().sync_active_to_cpu()
 
