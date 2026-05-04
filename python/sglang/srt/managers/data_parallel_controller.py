@@ -201,7 +201,19 @@ class DataParallelController:
         self.dp_budget.update_budget(obj)
 
     def update_active_ranks(self, ranks: ActiveRanksOutput):
-        self.status = ranks.status
+        # `ranks.status` is sourced from the primary's NCCL TP group view
+        # (see scheduler.py: dp_active_ranks from tp_group.active_ranks).
+        # That TP group stays at the original dp_size (4) forever — post-
+        # elastic-scale we deliberately do NOT grow the NCCL group; the new
+        # ranks are tracked by `add_elastic_workers` appending to
+        # self.workers / self.status. So never SHRINK self.status below the
+        # number of registered workers: clip or pad so len matches.
+        n = len(self.workers)
+        incoming = list(ranks.status)
+        if len(incoming) >= n:
+            self.status = incoming[:n]
+        else:
+            self.status = incoming + [True] * (n - len(incoming))
 
     def add_elastic_workers(self, new_worker_ports: List[int]):
         """Add joiner scheduler workers after elastic scale-up.
