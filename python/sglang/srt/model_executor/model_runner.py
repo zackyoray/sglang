@@ -553,6 +553,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         old_num_physical, new_num_physical, effective_ep,
                     )
 
+            # Switch dp_attention allreduce to Mooncake PG WORLD group.
+            from sglang.srt.layers.dp_attention import update_dp_attention_post_scale
+            update_dp_attention_post_scale(
+                new_dp_size=self.server_args.max_ep_size,
+                new_dp_rank=self.tp_rank + self.server_args.ep_join_rank_offset,
+            )
+            self.server_args.dp_size = self.server_args.max_ep_size
+
             if self.server_args.ep_join_mode == "recover":
                 # Recovery: the original world is healthy. Mark all peers
                 # active so cuda graphs and routing immediately resume the
@@ -1700,6 +1708,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         from_ep_size, effective_size,
                         self.server_args.ep_num_redundant_experts,
                     )
+
+            # Switch dp_attention allreduce to Mooncake PG WORLD group
+            # so all ranks (old + new) participate in unified dp_gather.
+            from sglang.srt.layers.dp_attention import update_dp_attention_post_scale
+            update_dp_attention_post_scale(
+                new_dp_size=effective_size,
+                new_dp_rank=self.tp_rank,
+            )
+            self.server_args.dp_size = effective_size
 
             ElasticEPStateManager.instance().snapshot_active_to_last()
             ElasticEPStateManager.instance().sync_active_to_cpu()

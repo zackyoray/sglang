@@ -43,6 +43,30 @@ _LOCAL_ATTN_DP_SIZE: Optional[int] = None
 _LOCAL_ATTN_DP_RANK: Optional[int] = None
 _ENABLE_DP_ATTENTION_FLAG: bool = False
 
+# After elastic scale, dp_gather allreduce uses the Mooncake PG WORLD group
+# (which has all ranks) instead of the NCCL TP group (which has only the
+# original ranks). Set by update_dp_attention_post_scale().
+_USE_WORLD_GROUP_FOR_DP_GATHER: bool = False
+
+
+def update_dp_attention_post_scale(new_dp_size: int, new_dp_rank: int):
+    """Update dp_attention globals after elastic scale-up.
+
+    Switches dp_gather allreduce from NCCL TP group to Mooncake PG WORLD
+    group so all ranks (old + new) participate in the unified forward pass.
+    """
+    global _ATTN_DP_SIZE, _ATTN_DP_RANK, _USE_WORLD_GROUP_FOR_DP_GATHER
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.info(
+        "[Elastic EP] update_dp_attention_post_scale: dp_size %s→%s, "
+        "dp_rank=%s, switching to WORLD group for dp_gather",
+        _ATTN_DP_SIZE, new_dp_size, new_dp_rank,
+    )
+    _ATTN_DP_SIZE = new_dp_size
+    _ATTN_DP_RANK = new_dp_rank
+    _USE_WORLD_GROUP_FOR_DP_GATHER = True
+
 _is_hip = is_hip()
 _USE_ROCM700A_WA = _is_hip and get_bool_env_var("SGLANG_USE_ROCM700A")
 
@@ -462,17 +486,22 @@ def _dp_gather_via_all_reduce(
         )
 
     # Input IDs are in int 32. We should use inplace_all_reduce for local case because of custom all reduce.
-    NUM_GPUS_PER_NODE = 8
-    if (
-        not local_tokens.dtype.is_floating_point
-        and get_tensor_model_parallel_world_size() <= NUM_GPUS_PER_NODE
-    ):
-        from sglang.srt.distributed.parallel_state import inplace_all_reduce
-
-        inplace_all_reduce(global_tokens, group_name=get_tp_group().unique_name)
-
+    if _USE_WORLD_GROUP_FOR_DP_GATHER:
+        from sglang.srt.distributed.parallel_state import get_world_group
+        world_group = get_world_group()
+        global_tokens[:] = world_group.all_reduce(global_tokens)
     else:
-        global_tokens[:] = tensor_model_parallel_all_reduce(global_tokens)
+        NUM_GPUS_PER_NODE = 8
+        if (
+            not local_tokens.dtype.is_floating_point
+            and get_tensor_model_parallel_world_size() <= NUM_GPUS_PER_NODE
+        ):
+            from sglang.srt.distributed.parallel_state import inplace_all_reduce
+
+            inplace_all_reduce(global_tokens, group_name=get_tp_group().unique_name)
+
+        else:
+            global_tokens[:] = tensor_model_parallel_all_reduce(global_tokens)
 
 
 def _dp_gather_via_all_gather(
@@ -481,8 +510,14 @@ def _dp_gather_via_all_gather(
     forward_batch: ForwardBatch,
     is_partial: bool,
 ):
+    if _USE_WORLD_GROUP_FOR_DP_GATHER:
+        from sglang.srt.distributed.parallel_state import get_world_group
+        gather_group = get_world_group()
+    else:
+        gather_group = get_tp_group()
+
     if get_attention_tp_size() == 1:
-        get_tp_group().all_gather_into_tensor(global_tokens, local_tokens)
+        gather_group.all_gather_into_tensor(global_tokens, local_tokens)
         return
 
     if not is_partial:
@@ -492,7 +527,7 @@ def _dp_gather_via_all_gather(
         get_attention_tp_rank()
     ]
     get_attention_tp_group().reduce_scatter_tensor(scattered_local_tokens, local_tokens)
-    get_tp_group().all_gather_into_tensor(global_tokens, scattered_local_tokens)
+    gather_group.all_gather_into_tensor(global_tokens, scattered_local_tokens)
 
 
 def _dp_gather(
