@@ -325,7 +325,9 @@ def initialize_dp_attention(
         global _USE_WORLD_GROUP_FOR_DP_GATHER
         if server_args.elastic_ep_backend is not None and server_args.max_ep_size:
             _USE_WORLD_GROUP_FOR_DP_GATHER = True
-            _ATTN_DP_SIZE = server_args.max_ep_size
+            # Keep _ATTN_DP_SIZE as dp_size (not max_ep_size) to avoid
+            # inflating buffer sizes. The Mooncake WORLD group handles
+            # elastic membership; buffer sizing stays based on active ranks.
             offset = getattr(server_args, "ep_join_rank_offset", 0) or 0
             _ATTN_DP_RANK = tp_rank + offset
         if moe_dense_tp_size is None:
