@@ -540,17 +540,29 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     )
                     expanded_p2l = torch.cat([old_p2l, trivial_new], dim=1)
 
+                    # Use the GLOBAL EP rank here: on the joiner process,
+                    # `self.tp_rank` is the local tp_rank (0..3) but the
+                    # joiner's slot in the expanded 8-rank EP topology is
+                    # `local + ep_join_rank_offset` (4..7). Passing the local
+                    # value makes _compute_logical_to_all_physical_map's
+                    # _find_nearest_expert prune every logical expert's
+                    # candidate list to a primary-side slot (0..95), so
+                    # nothing ever routes to joiner slots 96..191 —
+                    # `masked_m_sum=0` on every rank post-scale.
+                    offset = (self.server_args.ep_join_rank_offset or 0)
+                    global_ep_rank = self.tp_rank + offset
                     new_metadata = ExpertLocationMetadata.init_by_mapping(
                         self.server_args,
                         self.model_config,
                         physical_to_logical_map=expanded_p2l,
-                        moe_ep_rank=self.tp_rank,
+                        moe_ep_rank=global_ep_rank,
                     )
                     set_global_expert_location_metadata(new_metadata, allow_overwrite=True)
                     logger.info(
                         "[Elastic EP][JOINER] expanded expert pool: "
-                        "num_physical %d→%d, ep_size=%d",
+                        "num_physical %d→%d, ep_size=%d, moe_ep_rank=%d",
                         old_num_physical, new_num_physical, effective_ep,
+                        global_ep_rank,
                     )
 
             # Re-enable dp_attention on this joiner (was disabled at init to
@@ -1698,21 +1710,27 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     )
                     expanded_p2l = torch.cat([old_p2l, trivial_new], dim=1)
 
+                    # Keep the same formula on primary for consistency with
+                    # the joiner path. `ep_join_rank_offset` is 0 on primary,
+                    # so this is a no-op there.
+                    offset = (self.server_args.ep_join_rank_offset or 0)
+                    global_ep_rank = self.tp_rank + offset
                     new_metadata = ExpertLocationMetadata.init_by_mapping(
                         self.server_args,
                         self.model_config,
                         physical_to_logical_map=expanded_p2l,
-                        moe_ep_rank=self.tp_rank,
+                        moe_ep_rank=global_ep_rank,
                     )
                     set_global_expert_location_metadata(new_metadata, allow_overwrite=True)
 
                     logger.info(
                         "[Elastic EP][EPLB] expanded expert pool locally: "
                         "num_physical %d→%d, ep_size %d→%d, "
-                        "ep_num_redundant_experts=%d",
+                        "ep_num_redundant_experts=%d, moe_ep_rank=%d",
                         old_num_physical, new_num_physical,
                         from_ep_size, effective_size,
                         self.server_args.ep_num_redundant_experts,
+                        global_ep_rank,
                     )
 
             # Switch dp_attention allreduce to Mooncake PG WORLD group
