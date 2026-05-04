@@ -216,7 +216,7 @@ class DataParallelController:
 
         for port in new_worker_ports:
             endpoint = NetworkAddress(bind_host, port).to_tcp()
-            sock = get_zmq_socket(self.context, zmq.PUSH, endpoint, True)
+            sock = get_zmq_socket(self.context, zmq.PUSH, endpoint, False)
             self.workers.append(sock)
             self.status.append(True)
             logger.info(
