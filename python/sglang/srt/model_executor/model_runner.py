@@ -564,6 +564,31 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         old_num_physical, new_num_physical, effective_ep,
                         global_ep_rank,
                     )
+                    # DEBUG — fingerprint the post-expansion mapping. p2l.sum
+                    # should match the primary's view (rank-independent global
+                    # state). rtr is rank-dependent: it shows where THIS rank
+                    # routes each logical expert. Compare between joiner and
+                    # primary logs to detect drift.
+                    try:
+                        _p2l = new_metadata.physical_to_logical_map
+                        _rtr = new_metadata.logical_to_rank_dispatch_physical_map
+                        logger.info(
+                            "[Elastic EP][JOINER][mapping] "
+                            "p2l.shape=%s p2l.sum=%d "
+                            "p2l[0,0:8]=%s p2l[0,-8:]=%s "
+                            "rtr.shape=%s rtr[0,0:8]=%s rtr[0,-8:]=%s "
+                            "global_ep_rank=%d",
+                            list(_p2l.shape), int(_p2l.sum().item()),
+                            _p2l[0, :8].tolist(), _p2l[0, -8:].tolist(),
+                            list(_rtr.shape) if _rtr is not None else None,
+                            _rtr[0, :8].tolist() if _rtr is not None else None,
+                            _rtr[0, -8:].tolist() if _rtr is not None else None,
+                            global_ep_rank,
+                        )
+                    except Exception as _e:
+                        logger.warning(
+                            "[Elastic EP][JOINER][mapping] dump failed: %s", _e,
+                        )
 
             # Re-enable dp_attention on this joiner (was disabled at init to
             # keep forward_idle local during warmup), then switch dp_attention
@@ -1732,6 +1757,32 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         self.server_args.ep_num_redundant_experts,
                         global_ep_rank,
                     )
+                    # DEBUG — fingerprint the post-scale mapping on each
+                    # primary rank. p2l.sum is a rank-independent global hash:
+                    # all 8 ranks (primary + joiner) should log the same value
+                    # for the same (layers, num_physical) shape. rtr rows are
+                    # rank-dependent by design. If p2l.sum differs between
+                    # primary and joiner, the expansions diverged.
+                    try:
+                        _p2l = new_metadata.physical_to_logical_map
+                        _rtr = new_metadata.logical_to_rank_dispatch_physical_map
+                        logger.info(
+                            "[Elastic EP][EPLB][mapping] "
+                            "p2l.shape=%s p2l.sum=%d "
+                            "p2l[0,0:8]=%s p2l[0,-8:]=%s "
+                            "rtr.shape=%s rtr[0,0:8]=%s rtr[0,-8:]=%s "
+                            "global_ep_rank=%d",
+                            list(_p2l.shape), int(_p2l.sum().item()),
+                            _p2l[0, :8].tolist(), _p2l[0, -8:].tolist(),
+                            list(_rtr.shape) if _rtr is not None else None,
+                            _rtr[0, :8].tolist() if _rtr is not None else None,
+                            _rtr[0, -8:].tolist() if _rtr is not None else None,
+                            global_ep_rank,
+                        )
+                    except Exception as _e:
+                        logger.warning(
+                            "[Elastic EP][EPLB][mapping] dump failed: %s", _e,
+                        )
 
             # Switch dp_attention allreduce to Mooncake PG WORLD group
             # so all ranks (old + new) participate in unified dp_gather.
