@@ -402,6 +402,30 @@ class _NixlEPDispatcherImplBase:
             if self.active_ranks is not None
             else None
         )
+        # Optional: skip NIXL mask query + active_ranks mutation in the
+        # combine path. This disables the fault-tolerance signal (NIXL's
+        # `query_mask_buffer` returns "this rank looks faulted" 0/1
+        # values that we propagate into `active_ranks`). The downstream
+        # consumer is the scheduler's "EPLB due to rank faults" trigger
+        # at `model_runner.py:3354` — it fires whenever
+        # `is_active_equal_last()` becomes False, which a single mask
+        # flip in the combine path causes immediately. That trigger then
+        # calls `eplb_manager.rebalance()` (collective dump_record + P2P)
+        # in the middle of the next forward pass, racing with our
+        # late-add NIXL dispatch — which is the dominant cause of the
+        # post-scale 380+ NIXL-EP timeouts.
+        #
+        # Use SGLANG_NIXL_SKIP_FAULT_MASK=1 to disable the mask read
+        # for elastic-EP scale-up correctness testing. Cost: no fault
+        # tolerance (any rank death is now silent).
+        import os as _os
+        self._skip_fault_mask = (
+            _os.environ.get("SGLANG_NIXL_SKIP_FAULT_MASK", "0") == "1"
+        )
+        # Track previous mask snapshot so we only log mask transitions
+        # (flips), not the every-combine state. This avoids spam.
+        self._prev_mask_snapshot: Optional[List[int]] = None
+        self._mask_log_count = 0
 
         self.handle = None
         self.quant_config = None
@@ -748,8 +772,37 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
             async_finish=not self.return_recv_hook,
             return_recv_hook=self.return_recv_hook,
         )
-        if self._mask_buffer is not None:
+        if self._mask_buffer is not None and not self._skip_fault_mask:
             buffer.query_mask_buffer(self._mask_buffer)
+
+            # Probe: log mask transitions (only when the mask actually
+            # flips), not every combine. Logs the rank that just got
+            # newly marked faulted/recovered, plus the dispatch counter
+            # within this dispatcher instance. Capped at 50 lines per
+            # dispatcher to avoid spam if NIXL is constantly toggling.
+            try:
+                cur = self._mask_buffer.cpu().tolist()
+                if self._prev_mask_snapshot is not None and self._mask_log_count < 50:
+                    flips = [
+                        (r, self._prev_mask_snapshot[r], cur[r])
+                        for r in range(min(len(cur), len(self._prev_mask_snapshot)))
+                        if cur[r] != self._prev_mask_snapshot[r]
+                    ]
+                    if flips:
+                        logger.warning(
+                            "[Elastic EP][nixl][mask-flip] dispatcher_id=%d "
+                            "ep_size=%s flips=%s prev=%s cur=%s",
+                            id(self) % 100000,
+                            NixlEPBuffer._ep_size,
+                            flips, self._prev_mask_snapshot, cur,
+                        )
+                        self._mask_log_count += 1
+                self._prev_mask_snapshot = cur
+            except Exception as _e:
+                logger.warning(
+                    "[Elastic EP][nixl][mask-flip] probe failed: %s", _e,
+                )
+
             # Only update the live-world slots from NIXL's mask. NIXL fills
             # reserved slots (max_ep_size > world_size) with a sentinel that
             # would corrupt is_scaling() / EPLB if we wrote it through.
