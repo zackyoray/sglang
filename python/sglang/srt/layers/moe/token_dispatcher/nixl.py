@@ -309,10 +309,40 @@ class NixlEPBuffer:
             f"num_experts_per_rank={cls._num_local_experts}) "
         )
 
-        cls._buffer = Buffer(
+        # Match NIXL test (`tests/elastic/elastic.py`) Buffer kwargs.
+        # NIXL's reference test (which we verified works in this exact
+        # container with our exact dispatch params) passes
+        # `explicitly_destroy=True` and an explicit `timeout_ms`. We had
+        # been using bare-defaults (`explicitly_destroy=False`,
+        # `low_latency_mode=True`, `timeout_ms=30000`). Default behavior
+        # for `explicitly_destroy=False` is destructor-based cleanup at
+        # GC time — the wrapper's docstring warns this can hang Python's
+        # exception path and may leave NIXL agent state in a half-torn
+        # configuration during long-lived primary processes. Matching
+        # the reference test exactly eliminates this as a variable for
+        # the post-scale "primary->joiner silently fails" symptom.
+        #
+        # Behind env var SGLANG_NIXL_EXPLICIT_DESTROY=1 (default 0) so
+        # we can A/B isolate whether this is the cause without touching
+        # other call paths.
+        import os as _os
+        _explicit_destroy = (
+            _os.environ.get("SGLANG_NIXL_EXPLICIT_DESTROY", "0") == "1"
+        )
+        _buffer_kwargs = dict(
             rank=global_rank,
             tcp_store_group=tcp_store,
         )
+        if _explicit_destroy:
+            _buffer_kwargs["explicitly_destroy"] = True
+            _buffer_kwargs["timeout_ms"] = 30_000
+        logger.info(
+            "[Elastic EP][nixl] Buffer kwargs: %s (env "
+            "SGLANG_NIXL_EXPLICIT_DESTROY=%s)",
+            sorted(_buffer_kwargs.keys()),
+            _os.environ.get("SGLANG_NIXL_EXPLICIT_DESTROY", "0"),
+        )
+        cls._buffer = Buffer(**_buffer_kwargs)
 
         cls._buffer.update_memory_buffers(
             num_ranks=nixl_max_ranks,
