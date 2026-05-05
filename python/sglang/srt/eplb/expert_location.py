@@ -538,7 +538,20 @@ def _find_nearest_expert(
     if len(same_gpu_physical_expert_ids) > 0:
         return same_gpu_physical_expert_ids[0]
 
-    # 3. Otherwise, prefer same-node experts
+    # 3. Otherwise, prefer same-node experts — but only if the same-node
+    #    filter is a STRICT SUBSET of the candidate set. In single-node
+    #    configurations (`nnodes=1`) every candidate is by definition
+    #    "same node", so the filter is a no-op; returning the first
+    #    candidate then deterministically biases all traffic to the
+    #    lowest-numbered physical slot, which lives on rank 0. Returning
+    #    -1 here defers to `compute_logical_to_rank_dispatch_physical_map`
+    #    `_fair_choices` fallback (lines ~481-486), which round-robin
+    #    distributes the choice across the full candidate set per rank.
+    #
+    #    Multi-node behavior is unchanged: when the filter genuinely
+    #    narrows the candidate list (e.g. some candidates on this node,
+    #    some on another), we still pick the first same-node candidate
+    #    to keep the dispatch local.
     node_rank = moe_ep_rank // num_gpus_per_node
     same_node_physical_expert_ids = [
         physical_expert_id
@@ -548,7 +561,7 @@ def _find_nearest_expert(
         )
         == node_rank
     ]
-    if len(same_node_physical_expert_ids) > 0:
+    if 0 < len(same_node_physical_expert_ids) < len(candidate_physical_expert_ids):
         return same_node_physical_expert_ids[0]
 
     # 4. At last, leave it as -1 to indicate not found.
