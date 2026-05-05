@@ -1689,15 +1689,34 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.eplb_manager.reset_generator()
                 ElasticEPStateManager.instance().reset()
             else:
-                # Scale-up: mark joined ranks as active.
+                # Scale-up: mark joined ranks as active and apply the same
+                # post-join hygiene the recovery branch does (snapshot
+                # last_active_ranks, reset the EPLB scheduling generator).
+                # Without these two steps:
+                #   - `is_active_equal_last()` returns False indefinitely
+                #     after scale (last is stale at the pre-scale snapshot
+                #     `[1,1,1,1,0,0,0,0]`), which keeps EPLB-driven code
+                #     paths thinking there's a phantom rank fault and may
+                #     trigger spurious rebalance attempts.
+                #   - the EPLB generator carries pre-scale iteration
+                #     state across the topology change, so the next
+                #     periodic `update_expert_location` is computed
+                #     against now-stale `old_expert_location_metadata`
+                #     (the [layers, 96] view) — the same root cause as
+                #     PR #15771 documented for the recovery path.
                 inst = ElasticEPStateManager.instance()
                 for r in ranks_to_join:
                     inst.active_ranks[r] = 1
+                inst.snapshot_active_to_last()
                 inst.sync_active_to_cpu()
+                if self.eplb_manager is not None:
+                    self.eplb_manager.reset_generator()
                 logger.info(
                     "[Elastic EP][PRIMARY] after scale-up: active_ranks=%s "
-                    "is_scaling=%s effective_ep_size=%d",
+                    "last_active_ranks=%s is_scaling=%s effective_ep_size=%d "
+                    "eplb_generator=reset",
                     inst.active_ranks.tolist(),
+                    inst.last_active_ranks.tolist(),
                     ElasticEPStateManager.is_scaling(),
                     ElasticEPStateManager.get_effective_ep_size(),
                 )
