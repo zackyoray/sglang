@@ -536,6 +536,41 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
     ):
         hook() if self.return_recv_hook else event.current_stream_wait()
 
+        # POST-WAIT masked_m probe (replaces the racy dispatch_a OUTPUT log).
+        # `masked_m` is filled atomically by the NIXL recv kernel; reading
+        # it before `event.current_stream_wait()` (or `hook()`) returns
+        # stale zero data. By logging here -- after the wait -- we get the
+        # ground-truth per-local-expert receive count. masked_m_sum=0 here
+        # is REAL; non-zero means the dispatch delivered tokens.
+        #
+        # Logged for the first 5 dispatches per `_ep` change, every rank.
+        # Use the BUFFER-level `_ep_size` so the gate fires both pre- and
+        # post-scale.
+        _ep = NixlEPBuffer._ep_size
+        if getattr(self, "_postwait_diag_ep", None) != _ep:
+            self._postwait_diag_ep = _ep
+            self._postwait_diag_count = 0
+        if getattr(self, "_postwait_diag_count", 0) < 5 and _ep:
+            try:
+                m_list = masked_m.cpu().tolist()
+                m_sum = int(sum(m_list))
+                m_max = int(max(m_list)) if m_list else 0
+                non_zero = sum(1 for v in m_list if v > 0)
+                logger.info(
+                    "[Elastic EP][nixl][post-wait] dispatch #%d ep=%s "
+                    "masked_m_sum=%d masked_m_max_per_expert=%d "
+                    "num_local_experts_with_traffic=%d/%d "
+                    "expected_m=%d masked_m_per_expert=%s",
+                    self._postwait_diag_count, _ep,
+                    m_sum, m_max, non_zero, len(m_list),
+                    expected_m, m_list,
+                )
+            except Exception as _e:
+                logger.warning(
+                    "[Elastic EP][nixl][post-wait] probe failed: %s", _e,
+                )
+            self._postwait_diag_count += 1
+
         get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency(
             masked_m
         )
