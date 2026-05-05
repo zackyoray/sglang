@@ -171,6 +171,31 @@ class NixlEPBuffer:
         _no_barrier = (
             _os.environ.get("SGLANG_NIXL_NO_BARRIER", "0") == "1"
         )
+        # NIXL has its own GPU-side barrier (`Buffer.barrier()`) implemented
+        # in `nixl_ep_ll.cu` (LL-native; not the HT `intranode::barrier`).
+        # NIXL's reference elastic test (`tests/elastic/elastic.py`) calls
+        # `buffer.barrier()` between phases — including right after a
+        # connect_ranks expands the active set — to synchronize per-rank
+        # GPU-side dispatch state (sync_count_ptr / sync_buffer_ptr /
+        # buffer_idx parity) across all live peers.
+        #
+        # We never called it. The Mooncake WORLD `torch.distributed.barrier`
+        # only syncs *host-side* (it's a CPU collective on the Mooncake PG)
+        # and does not touch any of NIXL's per-rank GPU coordination
+        # buffers. After scale, primary's recv kernel may still be in a
+        # state from a pre-scale dispatch (different `buffer_idx` parity,
+        # stale `sync_count` for the new peers) when the joiner's first
+        # send arrives — the joiner's RDMA write goes to a slot the
+        # primary's recv kernel isn't currently polling, so the primary
+        # silently misses it and the joiner sees nothing in return ->
+        # 384 dispatch-receive timeouts on primary, mask flips on joiner.
+        #
+        # Toggle via SGLANG_NIXL_CALL_BARRIER=1 to add the NIXL barrier
+        # immediately after the post-WORLD-barrier in _sync_connect_ranks.
+        # Default off (=0) to preserve the prior behavior for A/B testing.
+        _call_nixl_barrier = (
+            _os.environ.get("SGLANG_NIXL_CALL_BARRIER", "0") == "1"
+        )
 
         world_group = get_world_group().device_group
         logger.info(
@@ -223,6 +248,25 @@ class NixlEPBuffer:
 
         if not _no_barrier:
             torch.distributed.barrier(group=world_group)
+
+        if _call_nixl_barrier:
+            try:
+                nb_t0 = time.perf_counter()
+                cls._buffer.barrier()
+                # `barrier()` enqueues a kernel on the current CUDA stream;
+                # synchronize so we know it actually completed (and any
+                # mask-flip-on-timeout is observed) before we return.
+                torch.cuda.synchronize()
+                nb_dt_ms = (time.perf_counter() - nb_t0) * 1000.0
+                logger.info(
+                    "[Elastic EP][nixl] sync-connect (%s) NIXL Buffer.barrier() "
+                    "done in %.1f ms (env SGLANG_NIXL_CALL_BARRIER=1)",
+                    tag, nb_dt_ms,
+                )
+            except Exception as _e:
+                logger.warning(
+                    "[Elastic EP][nixl] NIXL Buffer.barrier() raised: %s", _e,
+                )
 
     @classmethod
     def _update_connections(cls, scale_to: int) -> None:
