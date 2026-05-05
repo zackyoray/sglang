@@ -236,15 +236,38 @@ def prepare_mlp_sync_batch_raw(
         world = get_world_group()
         group = world.device_group
         device = world.device
+        _branch = "WORLD"
     elif len(offload_tags) == 0 and (
         disable_overlap_schedule
         or envs.SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH.get()
     ):
         group = tp_group.device_group
         device = tp_group.device
+        _branch = "TP-device"
     else:
         group = tp_group.cpu_group
         device = "cpu"
+        _branch = "TP-cpu"
+
+    # Branch diagnostic: pair with [mlp-sync][probe] to see WHY primary
+    # is selecting the wrong group post-scale (the probe confirms its
+    # group is 4-rank but doesn't tell us which branch was taken nor
+    # what _USE_WORLD_GROUP_FOR_DP_GATHER actually evaluated to).
+    import os as _os_branch
+    if _os_branch.environ.get("SGLANG_DEBUG_MLP_SYNC", "0") == "1":
+        import logging as _logging_branch
+        _logging_branch.getLogger(__name__).info(
+            "[mlp-sync][branch] picked=%s _USE_WORLD_GROUP=%s "
+            "_ELASTIC_JOINER_SKIP=%s dp_size=%d tp_size=%d cp_size=%d "
+            "group_size=%d disable_overlap=%s offload_tags=%s",
+            _branch,
+            _USE_WORLD_GROUP_FOR_DP_GATHER,
+            _ELASTIC_JOINER_SKIP_ALL_GATHER,
+            dp_size, attn_tp_size, attn_cp_size,
+            torch.distributed.get_world_size(group),
+            disable_overlap_schedule,
+            sorted(offload_tags) if offload_tags else [],
+        )
 
     local_can_run_tbo, local_forward_mode = tbo_preparer.prepare_all_gather(local_batch)
 
