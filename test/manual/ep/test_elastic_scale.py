@@ -63,45 +63,7 @@ os.environ.setdefault("SGLANG_NIXL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK", "1024")
 
 ib_devices = get_rdma_devices_args()
 
-
-def _maybe_disable_eplb(args: list) -> list:
-    """Optionally drop ``--enable-eplb`` (and its ``--ep-num-redundant-experts``
-    value) from the server args when ``SGLANG_ELASTIC_DEBUG_DISABLE_EPLB=1``.
-
-    Toggle this to A/B test whether EPLB-related state corruption is
-    implicated in post-scale dispatch failures. See
-    `DEBUG_CONTEXT.md` § "Session 13 notes" for context. EPLB-related
-    side effects we want to rule out:
-
-    - The expert-distribution recorder accumulates per-expert traffic
-      stats (`on_deepep_dispatch_low_latency`) every dispatch. Post-scale
-      we expand `physical_to_logical_map` from `[layers, 96]` to
-      `[layers, 192]` -- the recorder's internal counters may not
-      survive the shape change without subtle corruption (band-aid in
-      `7328fcec1` truncates rather than properly extending).
-    - `EPLBManager` periodic rebalance can fire `update_expert_location`
-      which uses both old + new metadata; SGLang PR #15771 documented
-      that recovered ranks have stale `old_expert_location_metadata`
-      causing asymmetric P2P. The same may apply to scale-up since we
-      don't reset the EPLB generator on the scale-up branch.
-    """
-    if os.environ.get("SGLANG_ELASTIC_DEBUG_DISABLE_EPLB") != "1":
-        return list(args)
-    out = []
-    skip_value = False
-    for a in args:
-        if skip_value:
-            skip_value = False
-            continue
-        if a == "--enable-eplb":
-            continue
-        if a == "--ep-num-redundant-experts":
-            skip_value = True  # also drop the value that follows
-            continue
-        out.append(a)
-    return out
-
-SERVER_ARGS = _maybe_disable_eplb([
+SERVER_ARGS = [
     "--trust-remote-code",
     "--moe-a2a-backend",
     "nixl",
@@ -123,7 +85,7 @@ SERVER_ARGS = _maybe_disable_eplb([
     "8",
     "--mem-fraction-static",
     "0.5",
-])
+]
 
 
 class TestElasticScaleServerLaunch(CustomTestCase):
@@ -213,7 +175,7 @@ def _count_visible_gpus() -> int:
 # confirms the crash is in the Mooncake PG extend-then-join path, not in
 # our infrastructure.
 
-COLD_START_8RANK_ARGS = _maybe_disable_eplb([
+COLD_START_8RANK_ARGS = [
     "--trust-remote-code",
     "--moe-a2a-backend",
     "nixl",
@@ -238,7 +200,7 @@ COLD_START_8RANK_ARGS = _maybe_disable_eplb([
     "--chunked-prefill-size",
     "1024",
     "--disable-cuda-graph",
-])
+]
 
 
 @unittest.skipUnless(
@@ -311,7 +273,7 @@ def _scale_up_common_args(
     dist_init_addr. Joiner shape (nnodes=2 vs nnodes=1) is chosen by the
     concrete TestElasticScaleUpEndToEnd* subclass.
     """
-    return _maybe_disable_eplb([
+    return [
         "--trust-remote-code",
         "--moe-a2a-backend",
         "nixl",
@@ -342,7 +304,7 @@ def _scale_up_common_args(
         str(node_rank),
         "--dist-init-addr",
         dist_init_addr,
-    ])
+    ]
 
 
 class _ElasticScaleUpEndToEndBase(CustomTestCase):
