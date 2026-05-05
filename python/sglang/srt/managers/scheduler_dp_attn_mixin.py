@@ -95,6 +95,37 @@ class MLPSyncBatchInfo:
             local_info_tensor,
             group=group,
         )
+
+        # Probe to verify whether the underlying allgather actually wrote
+        # every peer's slot post-scale (the third revision of the elastic-
+        # EP timeout investigation: with Mooncake PR #1968 commit 3c068028d
+        # in pg_2_9_1.so, the allgather should be functional for all-active
+        # max_world_size=actual_size; this probe gives ground truth).
+        # Format per slot (6 ints):
+        #   [num_tokens, num_tokens_for_logprob, can_cuda_graph,
+        #    is_extend_in_batch, local_can_run_tbo, local_forward_mode]
+        # IDLE.value=4. So a slot of [0,0,1,0,1,4] is the prefill-fallback
+        # (un-written by the collective) — if a rank that we KNOW had
+        # tokens shows that, the allgather skipped its slot.
+        # Toggle SGLANG_DEBUG_MLP_SYNC=1.
+        import os as _os
+        if _os.environ.get("SGLANG_DEBUG_MLP_SYNC", "0") == "1":
+            import logging as _logging
+            try:
+                _local_cpu = local_info_tensor.detach().cpu().tolist()
+                _gflat = global_info_tensor.detach().cpu().view(-1, 6).tolist()
+                _my_rank = torch.distributed.get_rank(group)
+                _ws = torch.distributed.get_world_size(group)
+                _logging.getLogger(__name__).info(
+                    "[mlp-sync][probe] rank=%d world_size=%d dp_size=%d "
+                    "local=%s global_per_slot=%s",
+                    _my_rank, _ws, self.dp_size, _local_cpu, _gflat,
+                )
+            except Exception as _e:
+                _logging.getLogger(__name__).warning(
+                    "[mlp-sync][probe] failed: %s", _e,
+                )
+
         # Set fallback values for inactive ranks (based on TP group's
         # active_ranks view — when the gather ran over WORLD, the prefill
         # above already covers missing slots).
