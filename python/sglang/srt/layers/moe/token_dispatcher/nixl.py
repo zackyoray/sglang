@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from enum import Enum, auto
 from typing import List, Optional
 
@@ -74,6 +75,57 @@ class NixlEPBuffer:
         )
 
     @classmethod
+    def _peek_tcp_store_keys(
+        cls, ranks: List[int], *, tag: str, phase: str
+    ) -> None:
+        """Non-blocking peek of NIXL_EP/{rank} keys in the global TCPStore.
+
+        Idea 2 from session-9 follow-up: confirm whether the metadata each
+        peer is supposed to write to TCPStore as part of its connect_ranks
+        is actually present at the moment we're about to read it.
+
+        - phase="pre" (just before our connect_ranks call): the peer keys
+          for `ranks` should be present (or about to appear). MISSING here
+          means the peer hasn't entered its connect_ranks yet (barrier
+          ordering bug) or already finished + deleted them (ditto).
+        - phase="post" (just after our connect_ranks): all peer keys for
+          `ranks` should now be GONE (each peer deletes its key in the
+          finally of _fetch_remote_metadata_from_tcp_store), and our own
+          NIXL_EP/{self.rank} key should also be GONE. If anything is
+          still present, the handshake didn't run cleanly on some side.
+        """
+        try:
+            store = cls._buffer.tcp_store_group
+        except Exception as _e:
+            logger.warning(
+                "[Elastic EP][nixl][peek] %s/%s: buffer has no tcp_store_group: %s",
+                tag, phase, _e,
+            )
+            return
+        if store is None:
+            logger.warning(
+                "[Elastic EP][nixl][peek] %s/%s: tcp_store_group is None", tag, phase,
+            )
+            return
+        # Include own key in post-phase to verify our finally-delete ran.
+        keys = [f"NIXL_EP/{r}" for r in ranks if r != cls._buffer.rank]
+        if phase == "post":
+            keys.append(f"NIXL_EP/{cls._buffer.rank}")
+        if not keys:
+            return
+        present = []
+        for k in keys:
+            try:
+                exists = bool(store.check([k]))
+            except Exception as _e:
+                exists = f"err({_e})"
+            present.append((k, exists))
+        logger.info(
+            "[Elastic EP][nixl][peek] %s/%s tcpstore keys: %s",
+            tag, phase, present,
+        )
+
+    @classmethod
     def _sync_connect_ranks(cls, ranks: list, *, tag: str) -> None:
         """Run buffer.connect_ranks(ranks) in lockstep across all active EP ranks.
 
@@ -105,14 +157,46 @@ class NixlEPBuffer:
             "[Elastic EP][nixl] sync-connect (%s) pre-barrier WORLD", tag,
         )
         torch.distributed.barrier(group=world_group)
+
+        # Idea 5 (vLLM parity, defensive): re-bind the TCPStore reference
+        # before each connect_ranks. In SGLang the global store doesn't
+        # change across scale events so this is a no-op; in vLLM the
+        # All2AllManager is recreated per scale event and the new
+        # tcp_store_group must be re-attached. Matching the call here
+        # eliminates one variable in cross-implementation comparison.
+        try:
+            current_store = get_global_tcp_store()
+            if current_store is not None:
+                cls._buffer.set_tcp_store_group(current_store)
+        except Exception as _e:
+            logger.warning(
+                "[Elastic EP][nixl] set_tcp_store_group(global) failed: %s", _e,
+            )
+
+        # Idea 2: peek before the handshake. Expect peer keys to be
+        # present (or about to appear within ms after the entry barrier).
+        cls._peek_tcp_store_keys(ranks, tag=tag, phase="pre")
+
+        connect_t0 = time.perf_counter()
         cls._buffer.connect_ranks(ranks)
+        connect_dt_ms = (time.perf_counter() - connect_t0) * 1000.0
+
         logger.info(
-            "[Elastic EP][nixl] sync-connect (%s) connect_ranks(%s) done; "
-            "post-barrier WORLD (buffer.group_size=%s)",
+            "[Elastic EP][nixl] sync-connect (%s) connect_ranks(%s) done in "
+            "%.1f ms; post-barrier WORLD (buffer.group_size=%s, "
+            "buffer.num_ranks=%s)",
             tag,
             ranks,
+            connect_dt_ms,
             cls._buffer.group_size,
+            getattr(cls._buffer, "num_ranks", "N/A"),
         )
+
+        # Idea 2 (post-phase): peer keys should now be GONE, and so
+        # should our own. Anything still present indicates a handshake
+        # path that returned without running its finally-delete.
+        cls._peek_tcp_store_keys(ranks, tag=tag, phase="post")
+
         torch.distributed.barrier(group=world_group)
 
     @classmethod
@@ -378,6 +462,42 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
                 topk_ids[topk_ids >= 0].min().item() if topk_ids.numel() > 0 and (topk_ids >= 0).any() else -1,
                 topk_ids.max().item() if topk_ids.numel() > 0 else -1,
             )
+
+        # Idea 1: per-target-rank token histogram for the first few
+        # dispatches after each ep_size change. This is what tells us
+        # whether the primary actually addresses joiner ranks 4..7
+        # post-scale. If primary's histogram is `[a,b,c,d,0,0,0,0]`
+        # post-scale, NIXL is innocent — the bug is in the per-rank
+        # `logical_to_rank_dispatch_physical_map`, not the late-add
+        # NIXL handshake. Logged on EVERY rank so we get a symmetric
+        # picture for each scale event.
+        if getattr(self, "_traffic_diag_ep", None) != _ep:
+            self._traffic_diag_ep = _ep
+            self._traffic_diag_count = 0
+        if (
+            getattr(self, "_traffic_diag_count", 0) < 5
+            and NixlEPBuffer._num_local_experts
+            and _ep
+        ):
+            nle = NixlEPBuffer._num_local_experts
+            valid_mask = topk_ids >= 0
+            if valid_mask.any():
+                target_ranks = topk_ids[valid_mask] // nle
+                clamped = target_ranks.clamp(min=0, max=_ep - 1).to(torch.int64)
+                hist = torch.bincount(clamped, minlength=_ep).cpu().tolist()
+                oob = int((target_ranks >= _ep).sum().item())
+                t_min = int(target_ranks.min().item())
+                t_max = int(target_ranks.max().item())
+            else:
+                hist, oob, t_min, t_max = [], 0, -1, -1
+            logger.info(
+                "[Elastic EP][nixl][traffic] dispatch #%d ep=%s "
+                "tokens_per_target_rank=%s (target_min=%d target_max=%d "
+                "oob_count=%d num_local_experts=%d num_tokens=%d)",
+                self._traffic_diag_count, _ep, hist, t_min, t_max, oob, nle,
+                int(hidden_states.shape[0]) if hidden_states.dim() > 0 else 0,
+            )
+            self._traffic_diag_count += 1
 
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,
