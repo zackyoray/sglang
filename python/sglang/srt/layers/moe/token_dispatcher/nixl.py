@@ -152,11 +152,35 @@ class NixlEPBuffer:
         """
         from sglang.srt.distributed.parallel_state import get_world_group
 
+        # Optional bypass of the Mooncake WORLD barriers around
+        # connect_ranks. NIXL's reference test (`tests/elastic/elastic.py`)
+        # has NO such barriers and works cleanly. We added them because
+        # without an explicit sync, primary↔joiner enter `connect_ranks`
+        # ~22 s apart on our setup (joiner spawns then loads model
+        # weights for many seconds before reaching its first dispatch),
+        # and TCPStore peer-key races can occur (peer writes key, runs
+        # connect, deletes key — all before the other side sees it).
+        #
+        # The barriers fix that race but introduce another variable
+        # (Mooncake collective sync interleaved with NIXL's TCPStore
+        # handshake). Toggle via SGLANG_NIXL_NO_BARRIER=1 to test
+        # whether the barriers themselves are causing the post-scale
+        # primary→joiner delivery failure. Default off (=0) keeps the
+        # current barrier behavior.
+        import os as _os
+        _no_barrier = (
+            _os.environ.get("SGLANG_NIXL_NO_BARRIER", "0") == "1"
+        )
+
         world_group = get_world_group().device_group
         logger.info(
-            "[Elastic EP][nixl] sync-connect (%s) pre-barrier WORLD", tag,
+            "[Elastic EP][nixl] sync-connect (%s) pre-barrier WORLD "
+            "(env SGLANG_NIXL_NO_BARRIER=%s)",
+            tag,
+            _os.environ.get("SGLANG_NIXL_NO_BARRIER", "0"),
         )
-        torch.distributed.barrier(group=world_group)
+        if not _no_barrier:
+            torch.distributed.barrier(group=world_group)
 
         # Idea 5 (vLLM parity, defensive): re-bind the TCPStore reference
         # before each connect_ranks. In SGLang the global store doesn't
@@ -197,7 +221,8 @@ class NixlEPBuffer:
         # path that returned without running its finally-delete.
         cls._peek_tcp_store_keys(ranks, tag=tag, phase="post")
 
-        torch.distributed.barrier(group=world_group)
+        if not _no_barrier:
+            torch.distributed.barrier(group=world_group)
 
     @classmethod
     def _update_connections(cls, scale_to: int) -> None:
