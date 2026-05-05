@@ -256,11 +256,29 @@ class NixlEPBuffer:
         from sglang.srt.server_args import get_global_server_args
 
         max_ep_size = get_global_server_args().max_ep_size or world_size
-        # Use a large num_ranks for buffer allocation (like vLLM's
-        # VLLM_NIXL_EP_MAX_NUM_RANKS=32). This ensures NIXL internal
-        # buffer math works even when nixl_num_experts grows post-scale
-        # (e.g. 192 with 32 ranks = 6 per slot, vs 192 with 8 = 24).
-        nixl_max_ranks = max(max_ep_size, 32)
+        # Size the buffer for the actual scale-up frontier — NOT inflated to
+        # 32 like the older code did.
+        #
+        # Background: the previous version used `max(max_ep_size, 32)` to
+        # match vLLM's `VLLM_NIXL_EP_MAX_NUM_RANKS=32` constant. That was
+        # only necessary against a buggy NIXL where `dispatch()`/`combine()`
+        # sized the EPLayout from the runtime `(num_ranks, num_experts)`
+        # args, so a larger buffer slot count was a workaround for the
+        # signaling-region overlap. Since NIXL `8e32438` (PR #1451), the
+        # EPLayout is sized from the buffer's `(max_num_ranks,
+        # max_experts_per_rank)` registered at `update_memory_buffers` —
+        # so over-sizing now reserves a 32×N rdma_buffer with placeholder
+        # `nixl_null_agent` slots for ranks 8..31, which the LL recv
+        # kernel still strides over. Empirically that produces the
+        # 384-timeout (every primary↔joiner pair) symptom we chased for
+        # several sessions.
+        #
+        # NIXL's own `tests/elastic/elastic.py` reference test passes
+        # cleanly when `max_num_ranks` matches the actual scale-up target
+        # (`plan.get_max_rank() + 1`), with the same `(num_experts_per_rank
+        # =24, hidden=2560, num_topk=6)` config as us. So match that
+        # convention.
+        nixl_max_ranks = max_ep_size
 
         num_rdma_bytes = 0
         if deepep_mode.enable_normal():
@@ -371,17 +389,16 @@ class _NixlEPDispatcherImplBase:
         self.active_ranks = (
             elastic_state.active_ranks if elastic_state is not None else None
         )
-        # NIXL's query_mask_buffer requires mask_status.numel() == max_num_ranks
-        # from update_memory_buffers (nixl_max_ranks=32), NOT max_ep_size (8).
-        # Size the mask buffer to nixl_max_ranks; only the live-world slots
-        # are copied back to active_ranks.
+        # NIXL's query_mask_buffer requires
+        # `mask_status.numel() == max_num_ranks` registered via
+        # update_memory_buffers — which we now set equal to `max_ep_size`
+        # (no 32-cap, see get_nixl_buffer for rationale).
         self._active_world_size = dist.get_world_size(group)
         self._active_rank_offset = ElasticEPStateManager.get_ep_join_rank_offset()
         from sglang.srt.server_args import get_global_server_args
         _max_ep = get_global_server_args().max_ep_size or self._active_world_size
-        _nixl_max_ranks = max(_max_ep, 32)
         self._mask_buffer = (
-            torch.zeros(_nixl_max_ranks, dtype=torch.int32, device="cuda")
+            torch.zeros(_max_ep, dtype=torch.int32, device="cuda")
             if self.active_ranks is not None
             else None
         )
