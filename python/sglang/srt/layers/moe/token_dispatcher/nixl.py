@@ -803,6 +803,52 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
             return_recv_hook=self.return_recv_hook,
         )
         if self._mask_buffer is not None and not self._skip_fault_mask:
+            # KNOWN-ARCH-ISSUE: this fault-mask flow is not globally
+            # consistent across primary + joiner processes.
+            #
+            # Per-process state. `ElasticEPStateManager.instance().active_ranks`
+            # is a per-process tensor, NOT all_reduced. Each process only
+            # writes the slice it locally owns
+            # (`[off : off + n]`, see below). Primary owns `[0:4]`, joiner
+            # owns `[4:8]`. The SAME LOGICAL TENSOR has different values
+            # in each process. Specifically:
+            #
+            #   primary's active_ranks  = [P0, P1, P2, P3, 1, 1, 1, 1]
+            #   joiner's  active_ranks  = [1,  1,  1,  1,  J0, J1, J2, J3]
+            #
+            # NIXL's `query_mask_buffer` returns a kernel-side view of
+            # which src_ranks the local recv kernel marked faulted (1)
+            # vs alive (0). Below we DROP the foreign slice
+            # (`_mask_buffer[0:off]` and `_mask_buffer[off+n:]`) when
+            # writing back, on the rationale that "primary doesn't have
+            # authority over joiner's slots" and vice versa.
+            #
+            # CONSEQUENCE OF DROPPING THE FOREIGN SLICE: when joiner's
+            # NIXL kernel marks primary as faulted (which is what the
+            # `[mask-flip] cur=[1,1,1,1,0,0,0,0]` log line on the joiner
+            # side means), that "primary is faulted" signal never reaches
+            # the primary process. Primary's local `active_ranks` keeps
+            # showing primary slots as alive (because each process
+            # initialized them to 1 at scale time and only updates its
+            # own slice). This is fine for scale-up correctness in
+            # principle (no real fault occurred) but it means the
+            # fault-tolerance path is one-sided in scale-up mode.
+            #
+            # The "globally sync'd" view that DOES exist is at the
+            # Mooncake/NCCL PG level: `self.tp_group.active_ranks`
+            # (read by `scheduler.py:2902` and forwarded via
+            # `ActiveRanksOutput` to the DataParallelController).
+            # That tensor IS maintained collectively by the PG backend.
+            # It is a DIFFERENT tensor from the
+            # `ElasticEPStateManager.instance().active_ranks` one we
+            # update here. Mixing the two is the source of confusion.
+            #
+            # TODO(elastic-EP): unify the two `active_ranks` tensors so
+            # that NIXL's per-rank fault info propagates globally (e.g.
+            # an all_reduce(MIN) on the kernel-mask-derived view, or
+            # routing all fault detection through the Mooncake PG).
+            # Until then, the kernel-mask probe and the global view will
+            # disagree under partial-network failures.
             buffer.query_mask_buffer(self._mask_buffer)
 
             # Probe: log mask transitions (only when the mask actually
