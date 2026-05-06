@@ -549,11 +549,14 @@ class _ElasticScaleUpEndToEndBase(CustomTestCase):
         is safe (no crash, just returns False).
         """
         # Step 1: sanity-check that the 4-rank primary serves traffic.
+        print("[TEST][step 1] pre-scale /generate sanity start", flush=True)
         self._generate_ok("pre-scale (4 ranks)")
+        print("[TEST][step 1] pre-scale /generate sanity done", flush=True)
 
         # Step 2: trigger the scale FIRST.  extend_group_size_to(8) on
         # the primary grows the PG so new slots exist.  get_peer_state
         # on empty slots returns False (Mooncake PR #1968).
+        print("[TEST][step 2] POST /scale_elastic_ep start", flush=True)
         resp = self._post(
             "/scale_elastic_ep", json={"new_ep_size": TOTAL_EP_SIZE}
         )
@@ -565,24 +568,46 @@ class _ElasticScaleUpEndToEndBase(CustomTestCase):
         body = resp.json()
         self.assertEqual(body["old_ep_size"], TP_PER_GROUP)
         self.assertEqual(body["new_ep_size"], TOTAL_EP_SIZE)
+        print(
+            f"[TEST][step 2] POST /scale_elastic_ep done body={body}",
+            flush=True,
+        )
 
         # Step 3: launch the joining group.  It will init_process_group
         # (extension mode), load model, skip CUDA graphs, then call
         # join_group() which blocks until recover_ranks().
+        print("[TEST][step 3] launch joining group start", flush=True)
         self._launch_joining_group()
+        print("[TEST][step 3] launch joining group done", flush=True)
 
         # Step 4: wait for the join to complete.  The primary's poll
         # loop (maybe_join_ep_ranks) runs at the end of every forward
         # pass, so we must keep sending requests to drive forward
         # passes -- without traffic the poll never fires.
+        print("[TEST][step 4] wait for scaling complete start", flush=True)
         deadline = time.time() + 300
+        poll_count = 0
         while time.time() < deadline:
+            poll_count += 1
             resp = self._post("/is_scaling_elastic_ep")
+            print(
+                f"[TEST][step 4] poll {poll_count} "
+                f"status={resp.status_code} body={resp.text[:200]}",
+                flush=True,
+            )
             if resp.ok and not resp.json().get("is_scaling_elastic_ep", True):
-                print("[TEST] Scaling complete!")
+                print(
+                    f"[TEST][step 4] scaling complete after {poll_count} polls",
+                    flush=True,
+                )
+                print("[TEST] Scaling complete!", flush=True)
                 break
             # Drive a forward pass so the poll loop runs on all ranks.
             try:
+                print(
+                    f"[TEST][step 4] poll {poll_count} drive /generate start",
+                    flush=True,
+                )
                 self._post(
                     "/generate",
                     json={
@@ -590,19 +615,32 @@ class _ElasticScaleUpEndToEndBase(CustomTestCase):
                         "sampling_params": {"max_new_tokens": 1, "temperature": 0.0},
                     },
                 )
-            except Exception:
-                pass
+                print(
+                    f"[TEST][step 4] poll {poll_count} drive /generate done",
+                    flush=True,
+                )
+            except Exception as exc:
+                print(
+                    f"[TEST][step 4] poll {poll_count} drive /generate "
+                    f"raised {type(exc).__name__}: {exc}",
+                    flush=True,
+                )
             time.sleep(2)
         else:
             self.fail("Timed out waiting for scaling to complete (300s)")
 
         # Step 5: post-scale inference works.
+        print("[TEST][step 5] post-scale /generate sanity start", flush=True)
         self._generate_ok("post-scale (8 ranks)")
+        print("[TEST][step 5] post-scale /generate sanity done", flush=True)
 
         # Optional client-side diagnostic before entering the GSM8K harness.
+        print("[TEST][step 5.5] optional completion probe start", flush=True)
         self._debug_completion_probe()
+        print("[TEST][step 5.5] optional completion probe done", flush=True)
 
         # Step 6: accuracy check on primary post-scale.
+        print("[TEST][step 6] post-scale GSM8K run_eval start", flush=True)
         args = SimpleNamespace(
             base_url=self.base_url,
             model=self.model,
@@ -613,6 +651,7 @@ class _ElasticScaleUpEndToEndBase(CustomTestCase):
             num_threads=32,
         )
         metrics = run_eval(args)
+        print("[TEST][step 6] post-scale GSM8K run_eval done", flush=True)
         print(f"[TEST] Post-scale GSM8K accuracy: {metrics['score']:.2%}")
         self.assertGreater(
             metrics["score"], 0.50,
