@@ -434,12 +434,27 @@ class _ElasticScaleUpEndToEndBase(CustomTestCase):
         return requests.post(f"{self.base_url}{path}", timeout=60, **kwargs)
 
     def _generate_ok(self, msg_suffix: str) -> None:
-        resp = self._post(
-            "/generate",
-            json={
-                "text": "Hello",
-                "sampling_params": {"max_new_tokens": 4, "temperature": 0.0},
-            },
+        print(f"[TEST] /generate {msg_suffix} start", flush=True)
+        t0 = time.perf_counter()
+        try:
+            resp = self._post(
+                "/generate",
+                json={
+                    "text": "Hello",
+                    "sampling_params": {"max_new_tokens": 4, "temperature": 0.0},
+                },
+            )
+        except Exception as exc:
+            print(
+                f"[TEST] /generate {msg_suffix} raised after "
+                f"{time.perf_counter() - t0:.2f}s: {type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            raise
+        print(
+            f"[TEST] /generate {msg_suffix} done status={resp.status_code} "
+            f"latency={time.perf_counter() - t0:.2f}s body={resp.text[:200]}",
+            flush=True,
         )
         self.assertEqual(
             resp.status_code,
