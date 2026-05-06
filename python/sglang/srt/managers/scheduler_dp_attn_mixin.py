@@ -70,7 +70,12 @@ class MLPSyncBatchInfo:
             dtype=dtype,
         )
 
-    def all_gather(self, device, group: torch.distributed.ProcessGroup):
+    def all_gather(
+        self,
+        device,
+        group: torch.distributed.ProcessGroup,
+        use_all_reduce: bool = False,
+    ):
         local_info_tensor = self._get_local_tensor(device=device)
         fallback_tensor = self._get_fallback_tensor(device=device)
         # Prefill the gather buffer with the fallback pattern (IDLE forward_mode,
@@ -90,11 +95,35 @@ class MLPSyncBatchInfo:
             .contiguous()
         )
 
-        torch.distributed.all_gather_into_tensor(
-            global_info_tensor.flatten(),
-            local_info_tensor,
-            group=group,
-        )
+        if use_all_reduce:
+            # Mooncake WORLD with max_world_size can report group.size()==4 on
+            # primary even after active_ranks grows to 8, while joiners report
+            # group.size()==8. all_gather_into_tensor sizes its output from
+            # get_world_size(group), so primary and joiner don't actually
+            # participate in the same 8-slot exchange. Mooncake allreduce is
+            # the supported max_world_size collective, so encode each rank's
+            # local 6-int record into its global-rank slot and sum the tensor.
+            global_info_tensor.zero_()
+            flat_info = global_info_tensor.view(-1, 6)
+            rank = torch.distributed.get_rank(group)
+            if 0 <= rank < flat_info.shape[0]:
+                flat_info[rank] = local_info_tensor
+            torch.distributed.all_reduce(
+                global_info_tensor,
+                op=torch.distributed.ReduceOp.SUM,
+                group=group,
+            )
+            # Any slot with no participant contribution remains all-zero; turn
+            # it back into the existing IDLE fallback so downstream ForwardMode
+            # parsing never sees enum value 0.
+            missing = flat_info.abs().sum(dim=1) == 0
+            flat_info[missing] = fallback_tensor
+        else:
+            torch.distributed.all_gather_into_tensor(
+                global_info_tensor.flatten(),
+                local_info_tensor,
+                group=group,
+            )
 
         # Probe to verify whether the underlying allgather actually wrote
         # every peer's slot post-scale (the third revision of the elastic-
@@ -259,12 +288,13 @@ def prepare_mlp_sync_batch_raw(
         _logging_branch.getLogger(__name__).info(
             "[mlp-sync][branch] picked=%s _USE_WORLD_GROUP=%s "
             "_ELASTIC_JOINER_SKIP=%s dp_size=%d tp_size=%d cp_size=%d "
-            "group_size=%d disable_overlap=%s offload_tags=%s",
+            "group_size=%d use_all_reduce=%s disable_overlap=%s offload_tags=%s",
             _branch,
             _USE_WORLD_GROUP_FOR_DP_GATHER,
             _ELASTIC_JOINER_SKIP_ALL_GATHER,
             dp_size, attn_tp_size, attn_cp_size,
             torch.distributed.get_world_size(group),
+            _branch == "WORLD",
             disable_overlap_schedule,
             sorted(offload_tags) if offload_tags else [],
         )
@@ -284,7 +314,11 @@ def prepare_mlp_sync_batch_raw(
     )
 
     if not skip_all_gather:
-        mlp_sync_info.all_gather(device=device, group=group)
+        mlp_sync_info.all_gather(
+            device=device,
+            group=group,
+            use_all_reduce=_branch == "WORLD",
+        )
 
         mlp_sync_info.tbo_split_seq_index, mlp_sync_info.global_forward_mode = (
             tbo_preparer.compute_output(
