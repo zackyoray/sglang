@@ -1451,6 +1451,9 @@ class Scheduler(
         self.result_queue: Deque[
             Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
         ] = deque()
+        phase_heartbeat = os.environ.get("SGLANG_ELASTIC_PHASE_HEARTBEAT", "0") == "1"
+        phase_heartbeat_iter = 0
+        phase_heartbeat_last = 0.0
 
         def pop_and_process():
             # Process the results of the last batch
@@ -1458,16 +1461,50 @@ class Scheduler(
             self.process_batch_result(tmp_batch, tmp_result)
 
         while True:
+            phase_heartbeat_iter += 1
             # Receive requests
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
+                if phase_heartbeat and time.monotonic() - phase_heartbeat_last >= 1.0:
+                    phase_heartbeat_last = time.monotonic()
+                    logger.info(
+                        "[sched-loop][heartbeat] iter=%d loop=overlap "
+                        "stage=paused recv_reqs=%d engine_paused=True",
+                        phase_heartbeat_iter,
+                        len(recv_reqs),
+                    )
                 continue
 
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
+            if phase_heartbeat and time.monotonic() - phase_heartbeat_last >= 1.0:
+                phase_heartbeat_last = time.monotonic()
+                running_bs = -1
+                try:
+                    running_batch = getattr(self, "running_batch", None)
+                    if running_batch is None or running_batch.is_empty():
+                        running_bs = 0
+                    else:
+                        running_bs = running_batch.batch_size()
+                except Exception:
+                    pass
+                logger.info(
+                    "[sched-loop][heartbeat] iter=%d loop=overlap "
+                    "stage=after-get-batch recv_reqs=%d has_batch=%s "
+                    "running_bs=%d result_queue=%d disable_overlap=%s "
+                    "engine_paused=%s require_mlp_sync=%s",
+                    phase_heartbeat_iter,
+                    len(recv_reqs),
+                    batch is not None,
+                    running_bs,
+                    len(self.result_queue),
+                    disable_overlap_for_batch,
+                    self._engine_paused,
+                    getattr(self, "require_mlp_sync", None),
+                )
 
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
