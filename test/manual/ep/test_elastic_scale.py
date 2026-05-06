@@ -43,6 +43,7 @@ import os
 import subprocess
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from types import SimpleNamespace
 
 import requests
@@ -446,6 +447,66 @@ class _ElasticScaleUpEndToEndBase(CustomTestCase):
             f"/generate {msg_suffix} failed: {resp.text}",
         )
 
+    def _debug_completion_probe(self) -> None:
+        """Issue a small explicit /v1/completions batch before GSM8K.
+
+        This is a client-side diagnostic for the current post-scale stall:
+        if these requests all start and finish, the SGLang server path is
+        responsive and any later stall is likely inside the GSM8K eval harness.
+        If this hangs, the server-side logs around the same request ids tell us
+        which scheduler/NIXL phase stopped.
+        """
+        if os.environ.get("SGLANG_ELASTIC_DEBUG_COMPLETION_PROBE", "0") != "1":
+            return
+
+        num_requests = int(os.environ.get("SGLANG_ELASTIC_DEBUG_COMPLETION_REQUESTS", "8"))
+        max_workers = int(os.environ.get("SGLANG_ELASTIC_DEBUG_COMPLETION_THREADS", "4"))
+        url = f"{self.base_url}/v1/completions"
+        print(
+            f"[TEST][completion-probe] start url={url} "
+            f"num_requests={num_requests} max_workers={max_workers}",
+            flush=True,
+        )
+
+        def _one(i: int):
+            prompt = (
+                f"Question: What is {i} + {i}?\n"
+                "Answer:"
+            )
+            payload = {
+                "model": self.model,
+                "prompt": prompt,
+                "max_tokens": 32,
+                "temperature": 0.0,
+            }
+            t0 = time.perf_counter()
+            print(f"[TEST][completion-probe] request {i} start", flush=True)
+            resp = requests.post(url, json=payload, timeout=120)
+            dt = time.perf_counter() - t0
+            text = resp.text[:160].replace("\n", "\\n")
+            print(
+                f"[TEST][completion-probe] request {i} done "
+                f"status={resp.status_code} latency={dt:.2f}s body={text}",
+                flush=True,
+            )
+            resp.raise_for_status()
+            return i, dt
+
+        t0 = time.perf_counter()
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = [pool.submit(_one, i) for i in range(num_requests)]
+            for fut in as_completed(futures, timeout=300):
+                i, dt = fut.result()
+                print(
+                    f"[TEST][completion-probe] request {i} observed_done "
+                    f"latency={dt:.2f}s",
+                    flush=True,
+                )
+        print(
+            f"[TEST][completion-probe] all_done total_latency={time.perf_counter() - t0:.2f}s",
+            flush=True,
+        )
+
     def test_scale_up_on_demand(self):
         """The real scale use case: serve on N ranks, then attach N more.
 
@@ -522,6 +583,9 @@ class _ElasticScaleUpEndToEndBase(CustomTestCase):
 
         # Step 5: post-scale inference works.
         self._generate_ok("post-scale (8 ranks)")
+
+        # Optional client-side diagnostic before entering the GSM8K harness.
+        self._debug_completion_probe()
 
         # Step 6: accuracy check on primary post-scale.
         args = SimpleNamespace(
