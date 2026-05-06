@@ -521,6 +521,10 @@ class _NixlEPDispatcherImplBase:
         self._skip_fault_mask = (
             _os.environ.get("SGLANG_NIXL_SKIP_FAULT_MASK", "0") == "1"
         )
+        self._phase_heartbeat = (
+            _os.environ.get("SGLANG_NIXL_PHASE_HEARTBEAT", "0") == "1"
+        )
+        self._phase_seq = 0
         # Track previous mask snapshot so we only log mask transitions
         # (flips), not the every-combine state. This avoids spam.
         self._prev_mask_snapshot: Optional[List[int]] = None
@@ -562,6 +566,36 @@ class _NixlEPDispatcherImplBase:
     def _get_buffer(self):
         raise NotImplementedError
 
+    def _log_phase(self, phase: str, **kwargs) -> None:
+        """Low-volume-ish phase trace for elastic EP hang debugging.
+
+        This deliberately logs every phase boundary when enabled. It is only
+        meant for diagnostic runs and lets us identify the last phase every
+        rank reached (dispatch, combine core, combine wait, etc.).
+        """
+        if not self._phase_heartbeat:
+            return
+        self._phase_seq += 1
+        try:
+            rank = dist.get_rank()
+        except Exception:
+            rank = -1
+        try:
+            group_rank = dist.get_rank(self.group)
+        except Exception:
+            group_rank = -1
+        detail = " ".join(f"{k}={v}" for k, v in kwargs.items())
+        logger.info(
+            "[Elastic EP][nixl][phase] seq=%d phase=%s rank=%s group_rank=%s "
+            "ep=%s %s",
+            self._phase_seq,
+            phase,
+            rank,
+            group_rank,
+            NixlEPBuffer._ep_size,
+            detail,
+        )
+
 
 class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
     def __init__(self, return_recv_hook: bool, **kwargs):
@@ -579,6 +613,10 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
     ):
+        self._log_phase(
+            "dispatch_a.enter",
+            hidden_shape=list(hidden_states.shape),
+        )
         buffer = self._get_buffer()
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
         topk_ids = topk_ids.to(torch.int64)
@@ -643,6 +681,14 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
             hidden_states,
             topk_ids,
         )
+        try:
+            self._log_phase(
+                "dispatch_a.exit",
+                masked_m_sum=int(masked_m.sum().item()),
+                masked_m_shape=list(masked_m.shape),
+            )
+        except Exception:
+            self._log_phase("dispatch_a.exit")
 
         if getattr(self, "_shapes_logged_ep", None) != _ep:
             hs_shape = list(hidden_states[0].shape) if isinstance(hidden_states, tuple) else list(hidden_states.shape)
@@ -674,7 +720,15 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
         event,
         hook,
     ):
+        self._log_phase("dispatch_b.enter")
         hook() if self.return_recv_hook else event.current_stream_wait()
+        try:
+            self._log_phase(
+                "dispatch_b.exit",
+                masked_m_sum=int(masked_m.sum().item()),
+            )
+        except Exception:
+            self._log_phase("dispatch_b.exit")
 
         # POST-WAIT masked_m probe (replaces the racy dispatch_a OUTPUT log).
         # `masked_m` is filled atomically by the NIXL recv kernel; reading
@@ -844,15 +898,33 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
+        self._log_phase(
+            "combine_a.enter",
+            hidden_shape=list(hidden_states.shape),
+            topk_shape=list(topk_ids.shape),
+        )
         hidden_states, event, hook = self._combine_core(
             hidden_states,
             topk_ids,
             topk_weights,
         )
+        out_shape = (
+            list(hidden_states[0].shape)
+            if isinstance(hidden_states, tuple)
+            else list(hidden_states.shape)
+        )
+        self._log_phase("combine_a.exit", output_shape=out_shape)
         return hidden_states, event, hook
 
     def combine_b(self, hidden_states, event, hook):
+        self._log_phase("combine_b.enter")
         hook() if self.return_recv_hook else event.current_stream_wait()
+        out_shape = (
+            list(hidden_states[0].shape)
+            if isinstance(hidden_states, tuple)
+            else list(hidden_states.shape)
+        )
+        self._log_phase("combine_b.exit", output_shape=out_shape)
         return hidden_states
 
     def _combine_core(
@@ -863,6 +935,11 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
     ):
         buffer = self._get_buffer()
 
+        self._log_phase(
+            "combine_core.enter",
+            hidden_shape=list(hidden_states.shape),
+            topk_shape=list(topk_ids.shape),
+        )
         combined_hidden_states, event, hook = buffer.combine(
             x=hidden_states,
             topk_idx=topk_ids,
@@ -871,6 +948,12 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
             async_finish=not self.return_recv_hook,
             return_recv_hook=self.return_recv_hook,
         )
+        out_shape = (
+            list(combined_hidden_states[0].shape)
+            if isinstance(combined_hidden_states, tuple)
+            else list(combined_hidden_states.shape)
+        )
+        self._log_phase("combine_core.after_buffer", output_shape=out_shape)
         if self._mask_buffer is not None and not self._skip_fault_mask:
             # KNOWN-ARCH-ISSUE: this fault-mask flow is not globally
             # consistent across primary + joiner processes.
@@ -927,6 +1010,11 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
             # dispatcher to avoid spam if NIXL is constantly toggling.
             try:
                 cur = self._mask_buffer.cpu().tolist()
+                self._log_phase(
+                    "combine_core.mask",
+                    mask_sum=int(sum(cur)),
+                    mask=cur[: max(NixlEPBuffer._ep_size or 0, 8)],
+                )
                 if self._prev_mask_snapshot is not None and self._mask_log_count < 50:
                     flips = [
                         (r, self._prev_mask_snapshot[r], cur[r])
