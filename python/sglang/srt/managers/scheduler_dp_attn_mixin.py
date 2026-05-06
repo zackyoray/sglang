@@ -108,11 +108,40 @@ class MLPSyncBatchInfo:
             rank = torch.distributed.get_rank(group)
             if 0 <= rank < flat_info.shape[0]:
                 flat_info[rank] = local_info_tensor
+
+            # Low-volume hang diagnostic: log enter/exit only when this rank
+            # actually has tokens (skip the idle-rank flood). Pair the two
+            # lines: if [enter] fires but [exit] never does on any rank, the
+            # WORLD all_reduce is the stuck collective. Toggle via
+            # SGLANG_DEBUG_MLP_SYNC_HEARTBEAT=1.
+            import os as _os_hb
+            _heartbeat = (
+                _os_hb.environ.get("SGLANG_DEBUG_MLP_SYNC_HEARTBEAT", "0") == "1"
+                and self.num_tokens > 0
+            )
+            if _heartbeat:
+                import logging as _logging_hb
+                _logging_hb.getLogger(__name__).info(
+                    "[mlp-sync][heartbeat] enter rank=%d dp_size=%d "
+                    "num_tokens=%d local_forward_mode=%d group_size=%d",
+                    rank, self.dp_size, self.num_tokens,
+                    self.local_forward_mode,
+                    torch.distributed.get_world_size(group),
+                )
             torch.distributed.all_reduce(
                 global_info_tensor,
                 op=torch.distributed.ReduceOp.SUM,
                 group=group,
             )
+            if _heartbeat:
+                _global_num_tokens_view = (
+                    global_info_tensor.detach().cpu().view(-1, 6)[:, 0].tolist()
+                )
+                _logging_hb.getLogger(__name__).info(
+                    "[mlp-sync][heartbeat] exit  rank=%d dp_size=%d "
+                    "global_num_tokens=%s",
+                    rank, self.dp_size, _global_num_tokens_view,
+                )
             # Any slot with no participant contribution remains all-zero; turn
             # it back into the existing IDLE fallback so downstream ForwardMode
             # parsing never sees enum value 0.
