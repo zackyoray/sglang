@@ -109,24 +109,36 @@ class MLPSyncBatchInfo:
             if 0 <= rank < flat_info.shape[0]:
                 flat_info[rank] = local_info_tensor
 
-            # Low-volume hang diagnostic: log enter/exit only when this rank
-            # actually has tokens (skip the idle-rank flood). Pair the two
-            # lines: if [enter] fires but [exit] never does on any rank, the
-            # WORLD all_reduce is the stuck collective. Toggle via
+            # Low-volume hang diagnostic. Always log non-idle ranks, and log
+            # idle ranks at most once/sec so we can prove whether joiners
+            # participate as idle batches without flooding the logs. Pair the
+            # two lines: if [enter] fires but [exit] never does on any rank,
+            # the WORLD all_reduce is the stuck collective. Toggle via
             # SGLANG_DEBUG_MLP_SYNC_HEARTBEAT=1.
             import os as _os_hb
-            _heartbeat = (
+            import time as _time_hb
+            _heartbeat_enabled = (
                 _os_hb.environ.get("SGLANG_DEBUG_MLP_SYNC_HEARTBEAT", "0") == "1"
-                and self.num_tokens > 0
             )
+            _heartbeat = False
+            if _heartbeat_enabled:
+                if self.num_tokens > 0:
+                    _heartbeat = True
+                else:
+                    _now_hb = _time_hb.monotonic()
+                    _last_hb = getattr(MLPSyncBatchInfo, "_last_idle_hb_ts", 0.0)
+                    if _now_hb - _last_hb >= 1.0:
+                        MLPSyncBatchInfo._last_idle_hb_ts = _now_hb
+                        _heartbeat = True
             if _heartbeat:
                 import logging as _logging_hb
                 _logging_hb.getLogger(__name__).info(
                     "[mlp-sync][heartbeat] enter rank=%d dp_size=%d "
-                    "num_tokens=%d local_forward_mode=%d group_size=%d",
+                    "num_tokens=%d local_forward_mode=%d group_size=%d idle=%s",
                     rank, self.dp_size, self.num_tokens,
                     self.local_forward_mode,
                     torch.distributed.get_world_size(group),
+                    self.num_tokens == 0,
                 )
             torch.distributed.all_reduce(
                 global_info_tensor,
