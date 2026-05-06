@@ -263,7 +263,11 @@ def prepare_mlp_sync_batch_raw(
     if _USE_WORLD_GROUP_FOR_DP_GATHER and not _ELASTIC_JOINER_SKIP_ALL_GATHER:
         from sglang.srt.distributed.parallel_state import get_world_group
         world = get_world_group()
-        group = world.device_group
+        # Use the DEFAULT Mooncake WORLD process group, not SGLang's
+        # GroupCoordinator-created `world.device_group`. The latter is a
+        # `new_group(ranks=[0..3])` created on primary at startup and never
+        # grows; the default process group is the one recover_ranks() updates.
+        group = torch.distributed.group.WORLD
         device = world.device
         _branch = "WORLD"
     elif len(offload_tags) == 0 and (

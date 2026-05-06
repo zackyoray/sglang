@@ -535,9 +535,17 @@ def _dp_gather_via_all_reduce(
 
     # Input IDs are in int 32. We should use inplace_all_reduce for local case because of custom all reduce.
     if _USE_WORLD_GROUP_FOR_DP_GATHER and not _ELASTIC_JOINER_SKIP_ALL_GATHER:
-        from sglang.srt.distributed.parallel_state import get_world_group
-        world_group = get_world_group()
-        global_tokens[:] = world_group.all_reduce(global_tokens)
+        # Use the default Mooncake WORLD process group here. The SGLang
+        # GroupCoordinator `get_world_group().device_group` is a new_group
+        # created at startup over the primary's initial ranks [0..3], so it
+        # keeps reporting size 4 after elastic recovery. The default WORLD PG
+        # is the one recover_ranks() updates and is the only group that can
+        # span primary + joiner after scale.
+        torch.distributed.all_reduce(
+            global_tokens,
+            op=torch.distributed.ReduceOp.SUM,
+            group=torch.distributed.group.WORLD,
+        )
     else:
         NUM_GPUS_PER_NODE = 8
         if (
