@@ -638,6 +638,13 @@ class _ElasticScaleUpEndToEndBase(CustomTestCase):
         print("[TEST][step 5.5] optional completion probe start", flush=True)
         self._debug_completion_probe()
         print("[TEST][step 5.5] optional completion probe done", flush=True)
+        if os.environ.get("SGLANG_ELASTIC_STOP_AFTER_COMPLETION_PROBE", "0") == "1":
+            print(
+                "[TEST][step 5.5] stop-after-completion-probe requested; "
+                "marking post-scale single-completion milestone complete",
+                flush=True,
+            )
+            return
 
         # Step 6: accuracy check on primary post-scale.
         print("[TEST][step 6] post-scale GSM8K run_eval start", flush=True)
