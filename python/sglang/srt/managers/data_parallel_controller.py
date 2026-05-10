@@ -16,6 +16,7 @@
 import faulthandler
 import logging
 import multiprocessing as mp
+import os
 import signal
 import threading
 import time
@@ -245,9 +246,24 @@ class DataParallelController:
     def dispatching_with_trace(self, req: Req):
         req.time_stats = DPControllerReqTimeStats.new_from_obj(req.time_stats)
 
+        if os.environ.get("SGLANG_ELASTIC_FRONTEND_TRACE", "0") == "1":
+            logger.info(
+                "[Elastic EP][frontend] dp-controller.dispatch.enter "
+                "rid=%s req_type=%s workers=%d status=%s rr=%d",
+                getattr(req, "rid", None),
+                type(req).__name__,
+                len(self.workers),
+                self.status,
+                self.round_robin_counter,
+            )
         req.time_stats.set_dp_dispatch_time()
         self.dispatching(req)
         req.time_stats.set_dp_dispatch_finish_time()
+        if os.environ.get("SGLANG_ELASTIC_FRONTEND_TRACE", "0") == "1":
+            logger.info(
+                "[Elastic EP][frontend] dp-controller.dispatch.exit rid=%s",
+                getattr(req, "rid", None),
+            )
 
     def dispatch_batch_generate(self, batch_req: BatchTokenizedGenerateReqInput):
         for req in batch_req:
@@ -602,7 +618,17 @@ class DataParallelController:
 
     def maybe_external_dp_rank_routing(self, req: Req):
         if req.routed_dp_rank is not None:
-            logger.debug(f"Direct routing to DP rank {req.routed_dp_rank}")
+            if os.environ.get("SGLANG_ELASTIC_FRONTEND_TRACE", "0") == "1":
+                logger.info(
+                    "[Elastic EP][frontend] dp-controller.dispatch.direct "
+                    "rid=%s target=%s workers=%d status=%s",
+                    getattr(req, "rid", None),
+                    req.routed_dp_rank,
+                    len(self.workers),
+                    self.status,
+                )
+            else:
+                logger.debug(f"Direct routing to DP rank {req.routed_dp_rank}")
             self.workers[req.routed_dp_rank].send_pyobj(req)
             return True
         return False
@@ -613,8 +639,19 @@ class DataParallelController:
 
         while True:
             if self.status[self.round_robin_counter]:
-                logger.debug(f"Choose worker {self.round_robin_counter}")
-                self.workers[self.round_robin_counter].send_pyobj(req)
+                target = self.round_robin_counter
+                if os.environ.get("SGLANG_ELASTIC_FRONTEND_TRACE", "0") == "1":
+                    logger.info(
+                        "[Elastic EP][frontend] dp-controller.dispatch.rr "
+                        "rid=%s target=%d workers=%d status=%s",
+                        getattr(req, "rid", None),
+                        target,
+                        len(self.workers),
+                        self.status,
+                    )
+                else:
+                    logger.debug(f"Choose worker {target}")
+                self.workers[target].send_pyobj(req)
                 self.round_robin_counter = (self.round_robin_counter + 1) % len(
                     self.workers
                 )
@@ -664,6 +701,13 @@ class DataParallelController:
                     recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
                 except zmq.ZMQError:
                     break
+                if os.environ.get("SGLANG_ELASTIC_FRONTEND_TRACE", "0") == "1":
+                    logger.info(
+                        "[Elastic EP][frontend] dp-controller.recv "
+                        "obj_type=%s rid=%s",
+                        type(recv_req).__name__,
+                        getattr(recv_req, "rid", None),
+                    )
                 self._request_dispatcher(recv_req)
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import uuid
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
@@ -77,6 +78,15 @@ class OpenAIServingBase(ABC):
         If you want to override this method, you should be careful to record the validation time.
         """
         received_time = monotonic_time()
+        frontend_trace = os.environ.get("SGLANG_ELASTIC_FRONTEND_TRACE", "0") == "1"
+        if frontend_trace:
+            logger.info(
+                "[Elastic EP][frontend] openai.handle.enter handler=%s "
+                "request_type=%s stream=%s",
+                self.__class__.__name__,
+                type(request).__name__,
+                getattr(request, "stream", None),
+            )
 
         try:
             # Validate request
@@ -93,6 +103,14 @@ class OpenAIServingBase(ABC):
             adapted_request, processed_request = self._convert_to_internal_request(
                 request, raw_request
             )
+            if frontend_trace:
+                logger.info(
+                    "[Elastic EP][frontend] openai.handle.converted handler=%s "
+                    "rid=%s adapted_type=%s",
+                    self.__class__.__name__,
+                    getattr(adapted_request, "rid", None),
+                    type(adapted_request).__name__,
+                )
 
             if isinstance(adapted_request, (GenerateReqInput, EmbeddingReqInput)):
                 # Only set timing fields if adapted_request supports them
@@ -100,10 +118,21 @@ class OpenAIServingBase(ABC):
 
             # Note(Xinyuan): raw_request below is only used for detecting the connection of the client
             if hasattr(request, "stream") and request.stream:
+                if frontend_trace:
+                    logger.info(
+                        "[Elastic EP][frontend] openai.handle.streaming rid=%s",
+                        getattr(adapted_request, "rid", None),
+                    )
                 return await self._handle_streaming_request(
                     adapted_request, processed_request, raw_request
                 )
             else:
+                if frontend_trace:
+                    logger.info(
+                        "[Elastic EP][frontend] openai.handle.non_streaming.begin "
+                        "rid=%s",
+                        getattr(adapted_request, "rid", None),
+                    )
                 return await self._handle_non_streaming_request(
                     adapted_request, processed_request, raw_request
                 )

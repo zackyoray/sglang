@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
@@ -425,6 +426,13 @@ class OpenAIServingCompletion(OpenAIServingBase):
         raw_request: Request,
     ) -> Union[CompletionResponse, ErrorResponse, ORJSONResponse]:
         """Handle non-streaming completion request"""
+        frontend_trace = os.environ.get("SGLANG_ELASTIC_FRONTEND_TRACE", "0") == "1"
+        if frontend_trace:
+            logger.info(
+                "[Elastic EP][frontend] completions.non_streaming.generate.begin "
+                "rid=%s",
+                getattr(adapted_request, "rid", None),
+            )
         try:
             generator = self.tokenizer_manager.generate_request(
                 adapted_request, raw_request
@@ -441,6 +449,13 @@ class OpenAIServingCompletion(OpenAIServingBase):
             ret,
             int(time.time()),
         )
+        if frontend_trace:
+            logger.info(
+                "[Elastic EP][frontend] completions.non_streaming.generate.done "
+                "rid=%s ret_items=%d",
+                getattr(adapted_request, "rid", None),
+                len(ret),
+            )
 
         return response
 

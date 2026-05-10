@@ -521,11 +521,28 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
     ):
+        frontend_trace = os.environ.get("SGLANG_ELASTIC_FRONTEND_TRACE", "0") == "1"
+        if frontend_trace:
+            logger.info(
+                "[Elastic EP][frontend] tokenizer.generate.enter "
+                "obj_type=%s rid=%s is_single=%s",
+                type(obj).__name__,
+                getattr(obj, "rid", None),
+                getattr(obj, "is_single", None),
+            )
         self.auto_create_handle_loop()
 
         # Normalize the request
         obj.normalize_batch_and_arguments()
         self._set_default_priority(obj)
+        if frontend_trace:
+            logger.info(
+                "[Elastic EP][frontend] tokenizer.generate.normalized "
+                "rid=%s is_single=%s stream=%s",
+                getattr(obj, "rid", None),
+                getattr(obj, "is_single", None),
+                getattr(obj, "stream", None),
+            )
 
         if isinstance(obj, GenerateReqInput) and obj.routed_dp_rank is not None:
             dp_size = self.server_args.dp_size
@@ -556,8 +573,28 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
             # Tokenize the request and send it to the scheduler
             if obj.is_single:
                 tokenized_obj = await self._tokenize_one_request(obj)
+                if frontend_trace:
+                    logger.info(
+                        "[Elastic EP][frontend] tokenizer.generate.tokenized "
+                        "rid=%s input_len=%s",
+                        getattr(tokenized_obj, "rid", None),
+                        len(getattr(tokenized_obj, "input_ids", []) or []),
+                    )
                 self._send_one_request(tokenized_obj)
+                if frontend_trace:
+                    logger.info(
+                        "[Elastic EP][frontend] tokenizer.generate.wait_response "
+                        "rid=%s",
+                        getattr(obj, "rid", None),
+                    )
                 async for response in self._wait_one_response(obj, request):
+                    if frontend_trace:
+                        logger.info(
+                            "[Elastic EP][frontend] tokenizer.generate.response "
+                            "rid=%s keys=%s",
+                            getattr(obj, "rid", None),
+                            list(response.keys()) if isinstance(response, dict) else type(response).__name__,
+                        )
                     yield response
             else:
                 async for response in self._handle_batch_request(obj, request):
@@ -1160,7 +1197,19 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
     ):
         tokenized_obj.time_stats.set_api_server_dispatch_time()
         tokenized_obj = wrap_shm_features(tokenized_obj)
+        if os.environ.get("SGLANG_ELASTIC_FRONTEND_TRACE", "0") == "1":
+            logger.info(
+                "[Elastic EP][frontend] tokenizer.send_one.before "
+                "rid=%s obj_type=%s",
+                getattr(tokenized_obj, "rid", None),
+                type(tokenized_obj).__name__,
+            )
         self.send_to_scheduler.send_pyobj(tokenized_obj)
+        if os.environ.get("SGLANG_ELASTIC_FRONTEND_TRACE", "0") == "1":
+            logger.info(
+                "[Elastic EP][frontend] tokenizer.send_one.after rid=%s",
+                getattr(tokenized_obj, "rid", None),
+            )
         tokenized_obj.time_stats.set_api_server_dispatch_finish_time()
 
     def _send_batch_request(
