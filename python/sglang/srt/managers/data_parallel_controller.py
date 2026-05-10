@@ -585,6 +585,27 @@ class DataParallelController:
                     rank_port_args = PortArgs.init_new(
                         server_args, dp_rank, worker_ports
                     )
+                    if server_args.ep_join_mode in ("scale", "recover"):
+                        # After adoption, the primary tokenizer owns the HTTP
+                        # request state. Joiner schedulers still receive
+                        # requests through their adopted worker endpoints, but
+                        # their outputs must go back through the primary
+                        # detokenizer/tokenizer path.
+                        primary_addr = NetworkAddress.parse(server_args.dist_init_addr)
+                        primary_port_base = primary_addr.port + 1
+                        rank_port_args.tokenizer_ipc_name = NetworkAddress(
+                            primary_addr.host, primary_port_base
+                        ).to_tcp()
+                        rank_port_args.detokenizer_ipc_name = NetworkAddress(
+                            primary_addr.host, primary_port_base + 1
+                        ).to_tcp()
+                        logger.info(
+                            "[Elastic EP] Joiner DP%d outputs routed to primary "
+                            "tokenizer=%s detokenizer=%s",
+                            dp_rank,
+                            rank_port_args.tokenizer_ipc_name,
+                            rank_port_args.detokenizer_ipc_name,
+                        )
                     # Data parallelism reuses the tensor parallelism group,
                     # so all dp ranks should use the same nccl port.
                     rank_port_args.nccl_port = port_args.nccl_port
