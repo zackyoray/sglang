@@ -648,20 +648,32 @@ class _ElasticScaleUpEndToEndBase(CustomTestCase):
 
         # Step 6: accuracy check on primary post-scale.
         print("[TEST][step 6] post-scale GSM8K run_eval start", flush=True)
+        gsm8k_num_examples = int(os.environ.get("SGLANG_ELASTIC_GSM8K_EXAMPLES", "50"))
+        gsm8k_num_threads = int(os.environ.get("SGLANG_ELASTIC_GSM8K_THREADS", "32"))
+        gsm8k_max_tokens = int(os.environ.get("SGLANG_ELASTIC_GSM8K_MAX_TOKENS", "512"))
+        gsm8k_min_score = float(os.environ.get("SGLANG_ELASTIC_GSM8K_MIN_SCORE", "0.50"))
+        print(
+            "[TEST][step 6] GSM8K config "
+            f"num_examples={gsm8k_num_examples} "
+            f"num_threads={gsm8k_num_threads} "
+            f"max_tokens={gsm8k_max_tokens} "
+            f"min_score={gsm8k_min_score:.2f}",
+            flush=True,
+        )
         args = SimpleNamespace(
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
             api="completion",
-            max_tokens=512,
-            num_examples=50,
-            num_threads=32,
+            max_tokens=gsm8k_max_tokens,
+            num_examples=gsm8k_num_examples,
+            num_threads=gsm8k_num_threads,
         )
         metrics = run_eval(args)
         print("[TEST][step 6] post-scale GSM8K run_eval done", flush=True)
         print(f"[TEST] Post-scale GSM8K accuracy: {metrics['score']:.2%}")
         self.assertGreater(
-            metrics["score"], 0.50,
+            metrics["score"], gsm8k_min_score,
             f"Post-scale GSM8K accuracy too low: {metrics['score']:.2%}"
         )
 
