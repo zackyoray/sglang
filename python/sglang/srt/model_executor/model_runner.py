@@ -603,6 +603,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 new_dp_rank=self.tp_rank + self.server_args.ep_join_rank_offset,
             )
             self.server_args.dp_size = self.server_args.max_ep_size
+            if (
+                self.eplb_manager is not None
+                and self.server_args.ep_join_mode == "scale"
+            ):
+                self.eplb_manager.disable_rebalance(
+                    "elastic scale-up post-scale EPLB rebalance is not implemented yet"
+                )
 
             if self.server_args.ep_join_mode == "recover":
                 # Recovery: the original world is healthy. Mark all peers
@@ -1802,6 +1809,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         logger.warning(
                             "[Elastic EP][EPLB][mapping] dump failed: %s", _e,
                         )
+
+            if self.eplb_manager is not None:
+                self.eplb_manager.disable_rebalance(
+                    "elastic scale-up post-scale EPLB rebalance is not implemented yet"
+                )
 
             # Switch dp_attention allreduce to Mooncake PG WORLD group
             # so all ranks (old + new) participate in unified dp_gather.
