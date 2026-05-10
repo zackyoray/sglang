@@ -59,7 +59,6 @@ from sglang.srt.utils.common import (
 from sglang.srt.utils.network import (
     NetworkAddress,
     bind_port,
-    get_free_port,
     get_zmq_socket,
     get_zmq_socket_on_host,
 )
@@ -445,9 +444,37 @@ class DataParallelController:
                 continue
             logger.debug(f"Received handshake from node {client_rank}")
 
+            self._release_elastic_worker_sockets_for_primary()
+
             # Send worker ports to client
             rep_socket.send_pyobj(worker_ports)
             logger.debug(f"Sent worker ports to node {client_rank}")
+
+    def _release_elastic_worker_sockets_for_primary(self):
+        """Let the primary controller take ownership of joiner worker endpoints."""
+        if self.server_args.ep_join_mode not in ("scale", "recover"):
+            return
+        if getattr(self, "_elastic_worker_sockets_released", False):
+            return
+
+        for i, worker in enumerate(self.workers):
+            if worker is None:
+                continue
+            try:
+                worker.close(linger=0)
+                logger.info(
+                    "[Elastic EP] Released joiner local worker socket dp_rank=%d "
+                    "for primary controller binding",
+                    i,
+                )
+            except Exception:
+                logger.exception(
+                    "[Elastic EP] Failed to release joiner worker socket dp_rank=%d",
+                    i,
+                )
+            self.workers[i] = None
+
+        self._elastic_worker_sockets_released = True
 
     def _receive_ports_as_client(self, endpoint: str, node_rank: int) -> List[int]:
         """Receive worker ports from the server node."""
@@ -481,28 +508,14 @@ class DataParallelController:
         else:
             bind_host = NetworkAddress.parse(server_args.dist_init_addr).host
 
-        # Pre-allocate worker ports on node 0 to avoid conflicts.
-        #
-        # Elastic joiners only report ports. Their schedulers connect PULL
-        # sockets to endpoints that the primary controller binds later via
-        # add_elastic_workers(). If the joiner binds local PUSH sockets here,
-        # the primary can only connect a second PUSH socket to a PUSH endpoint,
-        # and the first request routed to a joiner worker blocks in send_pyobj.
+        # Pre-allocate worker ports on node 0 to avoid conflicts. Elastic
+        # joiners still bind local PUSH sockets during startup so their normal
+        # warmup path can dispatch to local schedulers. When the primary later
+        # asks for these ports, the joiner releases them and the primary binds
+        # replacement PUSH sockets in add_elastic_workers().
         worker_ports = []
-        is_elastic_joiner = server_args.ep_join_mode in ("scale", "recover")
         if server_args.node_rank == 0:
             for dp_rank in range(server_args.dp_size):
-                if is_elastic_joiner:
-                    worker_port = get_free_port()
-                    worker_ports.append(worker_port)
-                    logger.info(
-                        "[Elastic EP] Reserved joiner worker dp_rank=%s port=%s "
-                        "for primary controller binding",
-                        dp_rank,
-                        worker_port,
-                    )
-                    continue
-
                 worker_port, worker_socket = get_zmq_socket_on_host(
                     self.context, zmq.PUSH, host=bind_host
                 )
