@@ -2020,8 +2020,18 @@ def _wait_and_warmup(
     if server_args.checkpoint_engine_wait_weights_before_ready:
         _wait_weights_ready()
 
-    # Send a warmup request
-    if not server_args.skip_server_warmup:
+    # Send a warmup request. Elastic joiners are adopted by the primary
+    # controller and should not send local HTTP warmup traffic after their
+    # scheduler sockets have been handed over for primary-owned routing.
+    skip_elastic_joiner_warmup = server_args.ep_join_mode in ("scale", "recover")
+    if skip_elastic_joiner_warmup:
+        logger.info(
+            "[Elastic EP] Skipping server warmup for elastic joiner "
+            "(ep_join_mode=%s)",
+            server_args.ep_join_mode,
+        )
+
+    if not server_args.skip_server_warmup and not skip_elastic_joiner_warmup:
         if not execute_warmup_func(server_args):
             return
     else:
