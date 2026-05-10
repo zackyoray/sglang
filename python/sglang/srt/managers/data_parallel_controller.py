@@ -59,6 +59,7 @@ from sglang.srt.utils.common import (
 from sglang.srt.utils.network import (
     NetworkAddress,
     bind_port,
+    get_free_port,
     get_zmq_socket,
     get_zmq_socket_on_host,
 )
@@ -229,7 +230,10 @@ class DataParallelController:
 
         for port in new_worker_ports:
             endpoint = NetworkAddress(bind_host, port).to_tcp()
-            sock = get_zmq_socket(self.context, zmq.PUSH, endpoint, False)
+            # Joiner schedulers connect their PULL sockets to this endpoint.
+            # The primary controller must be the PUSH binder, matching the
+            # initial DP-attention worker setup.
+            sock = get_zmq_socket(self.context, zmq.PUSH, endpoint, True)
             self.workers.append(sock)
             self.status.append(True)
             logger.info(
@@ -477,10 +481,28 @@ class DataParallelController:
         else:
             bind_host = NetworkAddress.parse(server_args.dist_init_addr).host
 
-        # Pre-allocate worker ports on node 0 to avoid conflicts
+        # Pre-allocate worker ports on node 0 to avoid conflicts.
+        #
+        # Elastic joiners only report ports. Their schedulers connect PULL
+        # sockets to endpoints that the primary controller binds later via
+        # add_elastic_workers(). If the joiner binds local PUSH sockets here,
+        # the primary can only connect a second PUSH socket to a PUSH endpoint,
+        # and the first request routed to a joiner worker blocks in send_pyobj.
         worker_ports = []
+        is_elastic_joiner = server_args.ep_join_mode in ("scale", "recover")
         if server_args.node_rank == 0:
             for dp_rank in range(server_args.dp_size):
+                if is_elastic_joiner:
+                    worker_port = get_free_port()
+                    worker_ports.append(worker_port)
+                    logger.info(
+                        "[Elastic EP] Reserved joiner worker dp_rank=%s port=%s "
+                        "for primary controller binding",
+                        dp_rank,
+                        worker_port,
+                    )
+                    continue
+
                 worker_port, worker_socket = get_zmq_socket_on_host(
                     self.context, zmq.PUSH, host=bind_host
                 )
