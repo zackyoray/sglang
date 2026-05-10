@@ -278,6 +278,27 @@ class TokenizerCommunicatorMixin:
             if isinstance(value, _Communicator):
                 value.set_fan_out(fan_out)
 
+    def update_control_communicator_fan_out(
+        self: TokenizerManager, worker_count: int
+    ):
+        if (
+            self.server_args.enable_dp_attention
+            and not self.server_args.enable_dp_attention_local_control_broadcast
+        ):
+            control_fan_out = (
+                worker_count + self.server_args.tp_size - 1
+            ) // self.server_args.tp_size
+        else:
+            control_fan_out = worker_count
+
+        self.get_internal_state_communicator.set_fan_out(control_fan_out)
+        logger.info(
+            "[Elastic EP] TokenizerManager control communicator fanout updated "
+            "to %d (workers=%d)",
+            control_fan_out,
+            worker_count,
+        )
+
     def _get_communicator_dispatcher(self: TokenizerManager):
         return TypeBasedDispatcher(
             [

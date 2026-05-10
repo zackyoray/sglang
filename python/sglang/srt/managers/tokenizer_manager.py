@@ -2413,11 +2413,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
         self.send_to_scheduler.send_pyobj(ranks)
 
     def forward_elastic_scale_ports(self, msg: ElasticScaleWorkerPortsReq):
-        self.server_args.dp_size += len(msg.new_worker_ports)
-        self.update_communicator_fan_out(self.server_args.dp_size)
+        worker_count = self.server_args.dp_size + len(msg.new_worker_ports)
+        self.update_control_communicator_fan_out(worker_count)
         logger.info(
-            "[Elastic EP] TokenizerManager communicator fanout updated to %d",
-            self.server_args.dp_size,
+            "[Elastic EP] TokenizerManager observed elastic worker count %d",
+            worker_count,
         )
         self.send_to_scheduler.send_pyobj(msg)
 
