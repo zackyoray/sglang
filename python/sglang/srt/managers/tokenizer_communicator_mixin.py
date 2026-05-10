@@ -159,7 +159,16 @@ class _Communicator(Generic[T]):
         else:
             return await self.watching_call(obj)
 
+    def set_fan_out(self, fan_out: int):
+        self._fan_out = fan_out
+
     def handle_recv(self, recv_obj: T):
+        if self._result_values is None or self._result_event is None:
+            logger.warning(
+                "Dropping stale communicator response without active waiter: %s",
+                type(recv_obj).__name__,
+            )
+            return
         self._result_values.append(recv_obj)
         if len(self._result_values) == self._fan_out:
             self._result_event.set()
@@ -263,6 +272,11 @@ class TokenizerCommunicatorMixin:
         )
 
         self._result_dispatcher += self._get_communicator_dispatcher()
+
+    def update_communicator_fan_out(self: TokenizerManager, fan_out: int):
+        for value in vars(self).values():
+            if isinstance(value, _Communicator):
+                value.set_fan_out(fan_out)
 
     def _get_communicator_dispatcher(self: TokenizerManager):
         return TypeBasedDispatcher(
