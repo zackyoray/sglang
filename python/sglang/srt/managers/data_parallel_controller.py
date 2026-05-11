@@ -203,11 +203,16 @@ class DataParallelController:
 
     def update_active_ranks(self, ranks: ActiveRanksOutput):
         if os.environ.get("SGLANG_ELASTIC_FORCE_ALL_WORKERS_ACTIVE", "0") == "1":
+            old_status = self.status
             self.status = [True] * len(self.workers)
-            logger.info(
-                "[Elastic EP] Forcing all DP workers active for diagnostics: %s",
-                self.status,
-            )
+            if (
+                old_status != self.status
+                or os.environ.get("SGLANG_ELASTIC_WORKER_STATUS_TRACE", "0") == "1"
+            ):
+                logger.info(
+                    "[Elastic EP] Forcing all DP workers active for diagnostics: %s",
+                    self.status,
+                )
             return
 
         # `ranks.status` is sourced from the primary's NCCL TP group view
