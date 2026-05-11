@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import random
 from dataclasses import dataclass
 from pathlib import Path
@@ -453,6 +454,10 @@ def compute_logical_to_rank_dispatch_physical_map(
     num_local_node_physical_experts = num_local_gpu_physical_experts * num_gpus_per_node
     num_layers, num_logical_experts, _ = logical_to_all_physical_map.shape
     dtype = logical_to_all_physical_map.dtype
+    force_joiner_to_primary = (
+        os.environ.get("SGLANG_ELASTIC_JOINER_ROUTE_TO_PRIMARY", "0") == "1"
+    )
+    primary_ep_size = getattr(server_args, "ep_join_rank_offset", 0) or 0
 
     result_list = [
         [[-1] * num_logical_experts for _ in range(num_layers)] for _ in range(ep_size)
@@ -466,13 +471,24 @@ def compute_logical_to_rank_dispatch_physical_map(
 
             remaining_ranks = []
             for moe_ep_rank in range(ep_size):
-                val = _find_nearest_expert(
-                    candidate_physical_expert_ids=candidate_physical_expert_ids,
-                    num_local_gpu_physical_experts=num_local_gpu_physical_experts,
-                    moe_ep_rank=moe_ep_rank,
-                    num_gpus_per_node=num_gpus_per_node,
-                    num_local_node_physical_experts=num_local_node_physical_experts,
-                )
+                if (
+                    force_joiner_to_primary
+                    and primary_ep_size > 0
+                    and moe_ep_rank >= primary_ep_size
+                ):
+                    val = _find_primary_expert(
+                        candidate_physical_expert_ids=candidate_physical_expert_ids,
+                        num_local_gpu_physical_experts=num_local_gpu_physical_experts,
+                        primary_ep_size=primary_ep_size,
+                    )
+                else:
+                    val = _find_nearest_expert(
+                        candidate_physical_expert_ids=candidate_physical_expert_ids,
+                        num_local_gpu_physical_experts=num_local_gpu_physical_experts,
+                        moe_ep_rank=moe_ep_rank,
+                        num_gpus_per_node=num_gpus_per_node,
+                        num_local_node_physical_experts=num_local_node_physical_experts,
+                    )
 
                 result_list[moe_ep_rank][layer_id][logical_expert_id] = val
                 if val == -1:
@@ -501,6 +517,24 @@ def _logical_to_all_physical_raw(
         ].tolist()
         if physical_expert_id != -1
     ]
+
+
+def _find_primary_expert(
+    candidate_physical_expert_ids: List[int],
+    num_local_gpu_physical_experts: int,
+    primary_ep_size: int,
+) -> int:
+    primary_physical_expert_ids = [
+        physical_expert_id
+        for physical_expert_id in candidate_physical_expert_ids
+        if _compute_gpu_id_of_physical_expert(
+            physical_expert_id, num_local_gpu_physical_experts
+        )
+        < primary_ep_size
+    ]
+    if len(primary_physical_expert_ids) > 0:
+        return primary_physical_expert_ids[0]
+    return -1
 
 
 def _compute_gpu_id_of_physical_expert(
