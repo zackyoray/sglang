@@ -355,6 +355,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.attention_chunk_size = model_config.attention_chunk_size
         self.forward_pass_id = 0
         self._elastic_logits_trace_count = 0
+        self._elastic_sample_trace_count = 0
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
         self.enable_hisparse = server_args.enable_hisparse
@@ -3654,6 +3655,110 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             top_margin,
         )
 
+    def _elastic_sample_trace_enabled(self) -> bool:
+        if os.environ.get("SGLANG_ELASTIC_SAMPLE_TRACE", "0") != "1":
+            return False
+
+        if os.environ.get("SGLANG_ELASTIC_SAMPLE_TRACE_POST_SCALE_ONLY", "1") == "1":
+            inst = ElasticEPStateManager.instance()
+            max_ep_size = self.server_args.max_ep_size or 0
+            if inst is None or max_ep_size <= 0 or inst.effective_ep_size < max_ep_size:
+                return False
+
+        if (
+            os.environ.get("SGLANG_ELASTIC_SAMPLE_TRACE_JOINER_ONLY", "0") == "1"
+            and (self.server_args.ep_join_rank_offset or 0) == 0
+        ):
+            return False
+
+        limit = self._elastic_trace_int_env("SGLANG_ELASTIC_SAMPLE_TRACE_LIMIT", 128)
+        return self._elastic_sample_trace_count < limit
+
+    def _log_elastic_sample_trace(
+        self,
+        tag: str,
+        logits_output: LogitsProcessorOutput,
+        forward_batch: ForwardBatch,
+        next_token_ids: torch.Tensor,
+    ) -> None:
+        if not self._elastic_sample_trace_enabled():
+            return
+
+        next_token_logits = logits_output.next_token_logits
+        if next_token_logits is None:
+            return
+
+        top_k_env = max(
+            1, self._elastic_trace_int_env("SGLANG_ELASTIC_SAMPLE_TRACE_TOPK", 16)
+        )
+        row_limit = max(
+            1, self._elastic_trace_int_env("SGLANG_ELASTIC_SAMPLE_TRACE_ROWS", 1)
+        )
+        head_limit = max(
+            1, self._elastic_trace_int_env("SGLANG_ELASTIC_SAMPLE_TRACE_HEAD", 8)
+        )
+
+        with torch.no_grad():
+            values = next_token_logits.detach().float()
+            if values.ndim == 1:
+                rows = values.unsqueeze(0)
+            elif values.ndim >= 2:
+                rows = values.reshape(-1, values.shape[-1])
+            else:
+                rows = values.reshape(1, 1)
+
+            top_ids = []
+            top_values = []
+            sampled_ranks = []
+            sampled_values = []
+            if rows.numel() > 0 and rows.shape[-1] > 0:
+                top_rows = min(row_limit, rows.shape[0])
+                top_k = min(top_k_env, rows.shape[-1])
+                topk_source = torch.where(
+                    torch.isfinite(rows[:top_rows]),
+                    rows[:top_rows],
+                    torch.full_like(rows[:top_rows], float("-inf")),
+                )
+                vals, ids = torch.topk(topk_source, k=top_k, dim=-1)
+                top_ids = ids.cpu().tolist()
+                top_values = vals.cpu().tolist()
+
+                sampled = next_token_ids.detach().flatten()[:top_rows].to(torch.long)
+                for row_idx, token_id in enumerate(sampled):
+                    token_int = int(token_id.item())
+                    row = rows[row_idx]
+                    sampled_values.append(float(row[token_int].item()))
+                    matches = (ids[row_idx] == token_int).nonzero(as_tuple=True)[0]
+                    sampled_ranks.append(
+                        int(matches[0].item()) if matches.numel() > 0 else -1
+                    )
+
+        offset = self.server_args.ep_join_rank_offset or 0
+        global_ep_rank = self.tp_rank + offset
+        self._elastic_sample_trace_count += 1
+        logger.info(
+            "[Elastic EP][sample-trace] tag=%s count=%d local_rank=%d "
+            "global_ep_rank=%d is_joiner=%s forward_mode=%s batch_size=%s "
+            "req_pool_head=%s seq_lens_head=%s positions_head=%s "
+            "sampled_ids=%s sampled_values=%s sampled_topk_ranks=%s "
+            "top_ids=%s top_values=%s",
+            tag,
+            self._elastic_sample_trace_count,
+            self.tp_rank,
+            global_ep_rank,
+            offset > 0,
+            forward_batch.forward_mode,
+            forward_batch.batch_size,
+            self._elastic_trace_tensor_head(forward_batch.req_pool_indices, head_limit),
+            self._elastic_trace_tensor_head(forward_batch.seq_lens, head_limit),
+            self._elastic_trace_tensor_head(forward_batch.positions, head_limit),
+            self._elastic_trace_tensor_head(next_token_ids, head_limit),
+            sampled_values,
+            sampled_ranks,
+            top_ids,
+            top_values,
+        )
+
     def sample(
         self,
         logits_output: LogitsProcessorOutput,
@@ -3690,6 +3795,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 if forward_batch.forward_mode.is_decode()
                 else forward_batch.seq_lens - 1
             ),
+        )
+        self._log_elastic_sample_trace(
+            "post_sample", logits_output, forward_batch, next_token_ids
         )
         self.maybe_update_ngram_token_table(next_token_ids, forward_batch)
         return next_token_ids
