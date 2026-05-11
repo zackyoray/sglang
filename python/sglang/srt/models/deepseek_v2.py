@@ -48,6 +48,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -586,6 +587,15 @@ class DeepseekV2MoE(nn.Module):
     def _elastic_hidden_trace_enabled(self) -> bool:
         if os.environ.get("SGLANG_ELASTIC_HIDDEN_TRACE", "0") != "1":
             return False
+        if os.environ.get("SGLANG_ELASTIC_HIDDEN_TRACE_POST_SCALE_ONLY", "1") == "1":
+            inst = ElasticEPStateManager.instance()
+            max_ep_size = get_global_server_args().max_ep_size or 0
+            if (
+                inst is None
+                or max_ep_size <= 0
+                or inst.effective_ep_size < max_ep_size
+            ):
+                return False
         layers = os.environ.get("SGLANG_ELASTIC_HIDDEN_TRACE_LAYERS", "0")
         if layers.strip() == "*":
             return True
@@ -1127,6 +1137,7 @@ class DeepseekV2MoE(nn.Module):
             return None
 
     def op_gate(self, state):
+        self._log_elastic_hidden_trace("tbo_moe_input", state.hidden_states_mlp_input)
         if is_non_idle_and_non_empty(
             state.forward_batch.forward_mode, state.hidden_states_mlp_input
         ):
@@ -1198,9 +1209,13 @@ class DeepseekV2MoE(nn.Module):
             state.hidden_states_after_combine = self.experts.dispatcher.combine_b(
                 tbo_subbatch_index=state.get("tbo_subbatch_index"),
             )
+            self._log_elastic_hidden_trace(
+                "tbo_after_combine", state.hidden_states_after_combine
+            )
 
     def op_output(self, state):
         final_hidden_states = state.pop("hidden_states_after_combine")
+        self._log_elastic_hidden_trace("tbo_before_output", final_hidden_states)
 
         if get_moe_a2a_backend().is_mori():
             num_tokens = state.pop("num_tokens")
@@ -1220,6 +1235,7 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states *= self.routed_scaling_factor
 
         state.hidden_states_mlp_output = final_hidden_states
+        self._log_elastic_hidden_trace("tbo_moe_output", final_hidden_states)
 
 
 class DeepseekV2AttentionMLA(
