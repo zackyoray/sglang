@@ -293,6 +293,7 @@ class LogitsProcessor(nn.Module):
         self._elastic_tp_gather_branch_markers = 0
         self._elastic_tp_gather_entry_markers = 0
         self._elastic_tp_gather_trace_events = 0
+        self._elastic_content_trace_count = 0
 
     @staticmethod
     def _elastic_trace_int_env(name: str, default: int) -> int:
@@ -599,6 +600,159 @@ class LogitsProcessor(nn.Module):
 
         return True
 
+    def _elastic_content_trace_enabled(self) -> bool:
+        if os.environ.get("SGLANG_ELASTIC_CONTENT_TRACE", "0") != "1":
+            return False
+
+        if os.environ.get("SGLANG_ELASTIC_CONTENT_TRACE_POST_SCALE_ONLY", "1") == "1":
+            inst = ElasticEPStateManager.instance()
+            max_ep_size = get_global_server_args().max_ep_size or 0
+            if inst is None or max_ep_size <= 0 or inst.effective_ep_size < max_ep_size:
+                return False
+
+        if (
+            os.environ.get("SGLANG_ELASTIC_CONTENT_TRACE_JOINER_ONLY", "0") == "1"
+            and (get_global_server_args().ep_join_rank_offset or 0) == 0
+        ):
+            return False
+
+        limit = self._elastic_trace_int_env("SGLANG_ELASTIC_CONTENT_TRACE_LIMIT", 128)
+        return self._elastic_content_trace_count < limit
+
+    def _log_elastic_content_trace(
+        self,
+        tag: str,
+        tensor: Optional[torch.Tensor],
+        logits_metadata: LogitsMetadata,
+        *,
+        token_counts: Optional[List[int]] = None,
+        row_counts: Optional[List[int]] = None,
+        contributed_ranges: Optional[List[Tuple[int, int, int]]] = None,
+        shard_range: Optional[Tuple[int, int]] = None,
+    ) -> None:
+        if not self._elastic_content_trace_enabled():
+            return
+
+        limit = self._elastic_trace_int_env("SGLANG_ELASTIC_CONTENT_TRACE_LIMIT", 128)
+        if self._elastic_content_trace_count >= limit:
+            return
+
+        local_ep_rank, global_ep_rank, offset = self._get_elastic_rank_info()
+        self._elastic_content_trace_count += 1
+
+        if tensor is None:
+            logger.info(
+                "[Elastic EP][content-trace] tag=%s count=%d local_ep_rank=%d "
+                "global_ep_rank=%d is_joiner=%s forward_mode=%s tensor=None "
+                "token_counts=%s row_counts=%s contributed_ranges=%s shard_range=%s",
+                tag,
+                self._elastic_content_trace_count,
+                local_ep_rank,
+                global_ep_rank,
+                offset > 0,
+                logits_metadata.forward_mode,
+                token_counts,
+                row_counts,
+                contributed_ranges,
+                shard_range,
+            )
+            return
+
+        with torch.no_grad():
+            detached = tensor.detach()
+            numel = detached.numel()
+            shape = list(detached.shape)
+            dtype = detached.dtype
+            if numel == 0:
+                logger.info(
+                    "[Elastic EP][content-trace] tag=%s count=%d local_ep_rank=%d "
+                    "global_ep_rank=%d is_joiner=%s forward_mode=%s shape=%s "
+                    "dtype=%s numel=0 token_counts=%s row_counts=%s "
+                    "contributed_ranges=%s shard_range=%s",
+                    tag,
+                    self._elastic_content_trace_count,
+                    local_ep_rank,
+                    global_ep_rank,
+                    offset > 0,
+                    logits_metadata.forward_mode,
+                    shape,
+                    dtype,
+                    token_counts,
+                    row_counts,
+                    contributed_ranges,
+                    shard_range,
+                )
+                return
+
+            values = detached.float()
+            flat = values.flatten()
+            checksum = float(flat[: min(1024, numel)].sum().item())
+            finite = torch.isfinite(values)
+            finite_count = int(finite.sum().item())
+            nan_count = int(torch.isnan(values).sum().item())
+            inf_count = int(torch.isinf(values).sum().item())
+
+            top_ids = []
+            top_values = []
+            top_margin = []
+            top_k = max(1, self._elastic_trace_int_env("SGLANG_ELASTIC_CONTENT_TRACE_TOPK", 16))
+            if values.ndim >= 2 and values.shape[-1] > 0:
+                rows = values.reshape(-1, values.shape[-1])
+                row_limit = min(
+                    rows.shape[0],
+                    max(1, self._elastic_trace_int_env("SGLANG_ELASTIC_CONTENT_TRACE_ROWS", 1)),
+                )
+                k = min(top_k, rows.shape[-1])
+                topk_source = torch.where(
+                    torch.isfinite(rows[:row_limit]),
+                    rows[:row_limit],
+                    torch.full_like(rows[:row_limit], float("-inf")),
+                )
+                vals, ids = torch.topk(topk_source, k=k, dim=-1)
+                top_ids = ids.cpu().tolist()
+                top_values = vals.cpu().tolist()
+                if k >= 2:
+                    top_margin = (vals[:, 0] - vals[:, 1]).cpu().tolist()
+
+            abs_top_indices = []
+            abs_top_values = []
+            abs_k = min(top_k, flat.numel())
+            if abs_k > 0:
+                abs_vals, abs_idx = torch.topk(flat.abs(), k=abs_k)
+                abs_top_indices = abs_idx.cpu().tolist()
+                abs_top_values = abs_vals.cpu().tolist()
+
+        logger.info(
+            "[Elastic EP][content-trace] tag=%s count=%d local_ep_rank=%d "
+            "global_ep_rank=%d is_joiner=%s forward_mode=%s shape=%s dtype=%s "
+            "numel=%d finite=%d nan=%d inf=%d checksum1024=%.6g "
+            "top_ids=%s top_values=%s top_margin=%s abs_top_indices=%s "
+            "abs_top_values=%s token_counts=%s row_counts=%s "
+            "contributed_ranges=%s shard_range=%s",
+            tag,
+            self._elastic_content_trace_count,
+            local_ep_rank,
+            global_ep_rank,
+            offset > 0,
+            logits_metadata.forward_mode,
+            shape,
+            dtype,
+            numel,
+            finite_count,
+            nan_count,
+            inf_count,
+            checksum,
+            top_ids,
+            top_values,
+            top_margin,
+            abs_top_indices,
+            abs_top_values,
+            token_counts,
+            row_counts,
+            contributed_ranges,
+            shard_range,
+        )
+
     @staticmethod
     def _logits_row_counts_from_token_counts(
         logits: torch.Tensor, token_counts: List[int]
@@ -709,10 +863,28 @@ class LogitsProcessor(nn.Module):
                 list(output.shape),
             )
 
+        self._log_elastic_content_trace(
+            "world_logits_gather_input_shard",
+            logits,
+            logits_metadata,
+            token_counts=token_counts,
+            row_counts=counts,
+            contributed_ranges=contributed_ranges,
+            shard_range=(shard_start, shard_end),
+        )
         torch.distributed.all_reduce(
             output,
             op=torch.distributed.ReduceOp.SUM,
             group=torch.distributed.group.WORLD,
+        )
+        self._log_elastic_content_trace(
+            "world_logits_gather_output",
+            output,
+            logits_metadata,
+            token_counts=token_counts,
+            row_counts=counts,
+            contributed_ranges=contributed_ranges,
+            shard_range=(shard_start, shard_end),
         )
         return output
 
@@ -1286,9 +1458,13 @@ class LogitsProcessor(nn.Module):
         self._log_elastic_readout_trace(
             "logits_after_dp_gather_hidden", hidden_states, logits_metadata
         )
+        self._log_elastic_content_trace(
+            "content_after_dp_gather_hidden", hidden_states, logits_metadata
+        )
 
         logits = self._compute_lm_head(hidden_states, lm_head, embedding_bias)
         self._log_elastic_readout_trace("logits_after_lm_head", logits, logits_metadata)
+        self._log_elastic_content_trace("content_after_lm_head", logits, logits_metadata)
 
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
@@ -1350,10 +1526,16 @@ class LogitsProcessor(nn.Module):
         self._log_elastic_readout_trace(
             "logits_after_dp_scatter", logits, logits_metadata
         )
+        self._log_elastic_content_trace(
+            "content_after_dp_scatter", logits, logits_metadata
+        )
 
         logits = self._copy_logits_to_buffer(logits, logits_metadata)
         self._log_elastic_readout_trace(
             "logits_after_buffer_copy", logits, logits_metadata
+        )
+        self._log_elastic_content_trace(
+            "content_after_buffer_copy", logits, logits_metadata
         )
 
         if self.final_logit_softcapping:
