@@ -578,7 +578,7 @@ class LogitsProcessor(nn.Module):
             offset > 0,
             logits_metadata.forward_mode,
             get_attention_tp_rank(),
-            self.attn_tp_size,
+            self._elastic_attn_tp_size(),
             attn_tp_group.rank_in_group,
             attn_tp_group.world_size,
             attn_tp_group.ranks,
