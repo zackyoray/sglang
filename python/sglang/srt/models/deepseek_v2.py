@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import nullcontext
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -41,6 +42,7 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.distributed import (
     divide,
+    get_moe_expert_parallel_rank,
     get_moe_expert_parallel_world_size,
     get_pp_group,
     get_tensor_model_parallel_world_size,
@@ -399,6 +401,7 @@ class DeepseekV2MoE(nn.Module):
         self.layer_id = layer_id
         self.alt_stream = alt_stream
         self.is_nextn = is_nextn
+        self._elastic_hidden_trace_counts = {}
 
         if self.tp_size > config.n_routed_experts:
             raise ValueError(
@@ -579,6 +582,95 @@ class DeepseekV2MoE(nn.Module):
                 name, x, self.experts.num_local_experts
             )
         ]
+
+    def _elastic_hidden_trace_enabled(self) -> bool:
+        if os.environ.get("SGLANG_ELASTIC_HIDDEN_TRACE", "0") != "1":
+            return False
+        layers = os.environ.get("SGLANG_ELASTIC_HIDDEN_TRACE_LAYERS", "0")
+        if layers.strip() == "*":
+            return True
+        try:
+            return self.layer_id in {int(x) for x in layers.split(",") if x.strip()}
+        except ValueError:
+            return self.layer_id == 0
+
+    def _log_elastic_hidden_trace(self, tag: str, tensor: torch.Tensor) -> None:
+        if not self._elastic_hidden_trace_enabled():
+            return
+        limit = int(os.environ.get("SGLANG_ELASTIC_HIDDEN_TRACE_LIMIT", "32"))
+        count = self._elastic_hidden_trace_counts.get(tag, 0)
+        if count >= limit:
+            return
+        self._elastic_hidden_trace_counts[tag] = count + 1
+
+        local_ep_rank = get_moe_expert_parallel_rank()
+        offset = get_global_server_args().ep_join_rank_offset or 0
+        global_ep_rank = local_ep_rank + offset
+
+        if tensor is None:
+            logger.info(
+                "[Elastic EP][hidden-trace] tag=%s layer=%d local_ep_rank=%d "
+                "global_ep_rank=%d tensor=None",
+                tag,
+                self.layer_id,
+                local_ep_rank,
+                global_ep_rank,
+            )
+            return
+
+        with torch.no_grad():
+            detached = tensor.detach()
+            numel = detached.numel()
+            if numel == 0:
+                logger.info(
+                    "[Elastic EP][hidden-trace] tag=%s layer=%d local_ep_rank=%d "
+                    "global_ep_rank=%d shape=%s dtype=%s numel=0",
+                    tag,
+                    self.layer_id,
+                    local_ep_rank,
+                    global_ep_rank,
+                    list(detached.shape),
+                    detached.dtype,
+                )
+                return
+
+            values = detached.float()
+            finite = torch.isfinite(values)
+            finite_count = int(finite.sum().item())
+            nan_count = int(torch.isnan(values).sum().item())
+            inf_count = int(torch.isinf(values).sum().item())
+            if finite_count > 0:
+                finite_values = values[finite]
+                mean = float(finite_values.mean().item())
+                std = float(finite_values.std(unbiased=False).item())
+                min_value = float(finite_values.min().item())
+                max_value = float(finite_values.max().item())
+            else:
+                mean = std = min_value = max_value = float("nan")
+            flat = values.flatten()
+            checksum = float(flat[: min(1024, numel)].sum().item())
+
+        logger.info(
+            "[Elastic EP][hidden-trace] tag=%s layer=%d local_ep_rank=%d "
+            "global_ep_rank=%d shape=%s dtype=%s numel=%d finite=%d "
+            "nan=%d inf=%d mean=%.6g std=%.6g min=%.6g max=%.6g "
+            "checksum1024=%.6g",
+            tag,
+            self.layer_id,
+            local_ep_rank,
+            global_ep_rank,
+            list(detached.shape),
+            detached.dtype,
+            numel,
+            finite_count,
+            nan_count,
+            inf_count,
+            mean,
+            std,
+            min_value,
+            max_value,
+            checksum,
+        )
 
     def forward(
         self,
@@ -801,6 +893,7 @@ class DeepseekV2MoE(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        self._log_elastic_hidden_trace("moe_input", hidden_states)
         shared_output = None
         sbo_enabled_flag = self._fuse_shared_experts_inside_sbo and not self.is_nextn
         sbo_overlap_dispatch_flag = (
@@ -995,6 +1088,7 @@ class DeepseekV2MoE(nn.Module):
             hidden_states=hidden_states,
             topk_output=topk_output,
         )
+        self._log_elastic_hidden_trace("after_experts", final_hidden_states)
 
         if (
             hidden_states.shape[0] > 0
@@ -1019,6 +1113,7 @@ class DeepseekV2MoE(nn.Module):
             ):
                 final_hidden_states *= self.routed_scaling_factor
 
+        self._log_elastic_hidden_trace("moe_output", final_hidden_states)
         return final_hidden_states
 
     def _forward_shared_experts(
