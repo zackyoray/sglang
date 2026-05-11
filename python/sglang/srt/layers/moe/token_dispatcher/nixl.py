@@ -630,17 +630,36 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
         if self._corruption_trace_dispatch_count >= self._corruption_trace_limit():
             return
 
+        local_rank = dist.get_rank(self.group)
+        offset = ElasticEPStateManager.get_ep_join_rank_offset()
+        global_rank = local_rank + offset
+
         valid_mask = topk_ids >= 0
+        local_phys_min = local_phys_max = -1
+        local_idx_hist = []
+        local_idx_oob_count = 0
         nle = NixlEPBuffer._num_local_experts or self.num_local_experts
         if valid_mask.any() and nle:
-            target_ranks = topk_ids[valid_mask] // nle
+            valid_topk = topk_ids[valid_mask]
+            target_ranks = valid_topk // nle
             hist = torch.bincount(
                 target_ranks.clamp(min=0, max=ep_size - 1).to(torch.int64),
                 minlength=ep_size,
             ).cpu().tolist()
-            topk_min = int(topk_ids[valid_mask].min().item())
-            topk_max = int(topk_ids[valid_mask].max().item())
+            topk_min = int(valid_topk.min().item())
+            topk_max = int(valid_topk.max().item())
             oob_count = int((target_ranks >= ep_size).sum().item())
+
+            local_phys = valid_topk[target_ranks == global_rank]
+            if local_phys.numel() > 0:
+                local_idx = local_phys % nle
+                local_phys_min = int(local_phys.min().item())
+                local_phys_max = int(local_phys.max().item())
+                local_idx_hist = torch.bincount(
+                    local_idx.to(torch.int64),
+                    minlength=nle,
+                ).cpu().tolist()
+                local_idx_oob_count = int((local_idx >= nle).sum().item())
         else:
             hist, topk_min, topk_max, oob_count = [], -1, -1, 0
 
@@ -663,18 +682,18 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
         except Exception as exc:
             logger.warning("[Elastic EP][corr-trace] metadata read failed: %s", exc)
 
-        local_rank = dist.get_rank(self.group)
-        offset = ElasticEPStateManager.get_ep_join_rank_offset()
         logger.info(
             "[Elastic EP][corr-trace][dispatch] seq=%d local_rank=%d "
             "global_rank=%d offset=%d ep=%d hidden_tokens=%d topk_shape=%s "
             "topk_min=%d topk_max=%d target_hist=%s oob_count=%d "
+            "expected_phys_range=[%d,%d] local_phys_min=%d "
+            "local_phys_max=%d local_idx_oob_count=%d local_idx_hist=%s "
             "num_experts=%d nixl_num_experts=%d num_local_experts=%d "
             "expected_m=%d p2l_shape=%s p2l_sum=%s rtr_shape=%s "
             "rtr_head=%s rtr_tail=%s",
             self._corruption_trace_dispatch_count,
             local_rank,
-            local_rank + offset,
+            global_rank,
             offset,
             ep_size,
             int(hidden_states.shape[0]) if hidden_states.dim() > 0 else 0,
@@ -683,6 +702,12 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
             topk_max,
             hist,
             oob_count,
+            global_rank * nle if nle else -1,
+            global_rank * nle + nle - 1 if nle else -1,
+            local_phys_min,
+            local_phys_max,
+            local_idx_oob_count,
+            local_idx_hist,
             self.num_experts,
             (NixlEPBuffer._num_local_experts or 0) * ep_size,
             nle,
