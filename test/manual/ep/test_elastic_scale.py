@@ -575,6 +575,14 @@ class _ElasticScaleUpEndToEndBase(CustomTestCase):
 
         num_requests = int(os.environ.get("SGLANG_ELASTIC_WORKER_PROBE_REQUESTS", "8"))
         max_tokens = int(os.environ.get("SGLANG_ELASTIC_WORKER_PROBE_MAX_TOKENS", "128"))
+        fixed_prompt_index_env = os.environ.get(
+            "SGLANG_ELASTIC_WORKER_PROBE_FIXED_PROMPT_INDEX", ""
+        )
+        fixed_prompt_index = (
+            int(fixed_prompt_index_env)
+            if fixed_prompt_index_env.strip()
+            else None
+        )
         report_dir = os.environ.get(
             "SGLANG_ELASTIC_GSM8K_REPORT_DIR",
             "/lustre/fsw/portfolios/coreai/users/yorayz/logs",
@@ -586,15 +594,17 @@ class _ElasticScaleUpEndToEndBase(CustomTestCase):
         url = f"{self.base_url}/v1/completions"
         print(
             f"[TEST][worker-probe] start url={url} "
-            f"num_requests={num_requests} max_tokens={max_tokens}",
+            f"num_requests={num_requests} max_tokens={max_tokens} "
+            f"fixed_prompt_index={fixed_prompt_index}",
             flush=True,
         )
 
         results = []
         for i in range(num_requests):
+            prompt_index = fixed_prompt_index if fixed_prompt_index is not None else i
             payload = {
                 "model": self.model,
-                "prompt": _worker_probe_prompt(i),
+                "prompt": _worker_probe_prompt(prompt_index),
                 "max_tokens": max_tokens,
                 "temperature": 0.0,
                 "stop": ["Question", "Assistant:", "<|separator|>"],
@@ -609,6 +619,7 @@ class _ElasticScaleUpEndToEndBase(CustomTestCase):
             rid = body.get("id")
             result = {
                 "probe_index": i,
+                "prompt_index": prompt_index,
                 "rid": rid,
                 "status_code": resp.status_code,
                 "latency": latency,
@@ -617,7 +628,7 @@ class _ElasticScaleUpEndToEndBase(CustomTestCase):
             }
             results.append(result)
             print(
-                f"[TEST][worker-probe] request {i} done rid={rid} "
+                f"[TEST][worker-probe] request {i} prompt_index={prompt_index} done rid={rid} "
                 f"status={resp.status_code} latency={latency:.2f}s "
                 f"looks_correct={result['looks_correct']} "
                 f"text={text[:120].replace(chr(10), ' ')}",
