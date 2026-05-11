@@ -26,6 +26,8 @@ from torch import nn
 from sglang.srt.distributed import (
     get_moe_expert_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_tensor_model_parallel_rank,
+    get_tp_group,
     tensor_model_parallel_all_gather,
 )
 from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
@@ -288,6 +290,7 @@ class LogitsProcessor(nn.Module):
         # chunk size for logprobs processing
         self.logprobs_chunk_size = envs.SGLANG_LOGITS_PROCESSER_CHUNK_SIZE.get()
         self._elastic_readout_trace_count = 0
+        self._elastic_tp_gather_branch_markers = 0
         self._elastic_tp_gather_entry_markers = 0
         self._elastic_tp_gather_trace_events = 0
 
@@ -298,7 +301,7 @@ class LogitsProcessor(nn.Module):
         except ValueError:
             return default
 
-    def _elastic_readout_trace_enabled(self) -> bool:
+    def _elastic_readout_trace_enabled(self, ignore_limit: bool = False) -> bool:
         if os.environ.get("SGLANG_ELASTIC_READOUT_TRACE", "0") != "1":
             return False
 
@@ -313,6 +316,9 @@ class LogitsProcessor(nn.Module):
             and (get_global_server_args().ep_join_rank_offset or 0) == 0
         ):
             return False
+
+        if ignore_limit:
+            return True
 
         limit = self._elastic_trace_int_env("SGLANG_ELASTIC_READOUT_TRACE_LIMIT", 64)
         return self._elastic_readout_trace_count < limit
@@ -436,7 +442,7 @@ class LogitsProcessor(nn.Module):
         )
 
     def _elastic_tp_gather_bad_trace_should_log(self, is_bad: bool) -> bool:
-        if not self._elastic_readout_trace_enabled():
+        if not self._elastic_readout_trace_enabled(ignore_limit=True):
             return False
         if not is_bad:
             return False
@@ -448,10 +454,67 @@ class LogitsProcessor(nn.Module):
         self._elastic_tp_gather_trace_events += 1
         return True
 
+    def _get_elastic_rank_info(self):
+        offset = get_global_server_args().ep_join_rank_offset or 0
+        try:
+            local_ep_rank = get_moe_expert_parallel_rank()
+        except Exception:
+            local_ep_rank = get_attention_dp_rank()
+        return local_ep_rank, local_ep_rank + offset, offset
+
+    def _log_elastic_tp_gather_branch(
+        self, branch: str, logits: torch.Tensor, logits_metadata: LogitsMetadata
+    ) -> None:
+        if not self._elastic_readout_trace_enabled(ignore_limit=True):
+            return
+
+        limit = self._elastic_trace_int_env(
+            "SGLANG_ELASTIC_TP_GATHER_BRANCH_TRACE_LIMIT", 16
+        )
+        if self._elastic_tp_gather_branch_markers >= limit:
+            return
+        self._elastic_tp_gather_branch_markers += 1
+
+        local_ep_rank, global_ep_rank, offset = self._get_elastic_rank_info()
+        tp_group = get_tp_group()
+        attn_tp_group = get_attention_tp_group()
+        logger.info(
+            "[Elastic EP][tp-gather-branch] marker=%d branch=%s local_ep_rank=%d "
+            "global_ep_rank=%d is_joiner=%s forward_mode=%s "
+            "do_tensor_parallel_all_gather=%s use_attn_tp_group=%s "
+            "do_tensor_parallel_all_gather_dp_attn=%s enable_dp_lm_head=%s "
+            "tp_rank=%d tp_world_size=%d tp_group_rank=%d tp_group_world_size=%d "
+            "tp_group_ranks=%s attn_tp_rank=%d attn_tp_size=%d "
+            "attn_tp_group_rank=%d attn_tp_group_world_size=%d "
+            "attn_tp_group_ranks=%s input_shape=%s input_dtype=%s",
+            self._elastic_tp_gather_branch_markers,
+            branch,
+            local_ep_rank,
+            global_ep_rank,
+            offset > 0,
+            logits_metadata.forward_mode,
+            self.do_tensor_parallel_all_gather,
+            self.use_attn_tp_group,
+            self.do_tensor_parallel_all_gather_dp_attn,
+            get_global_server_args().enable_dp_lm_head,
+            get_tensor_model_parallel_rank(),
+            get_tensor_model_parallel_world_size(),
+            tp_group.rank_in_group,
+            tp_group.world_size,
+            tp_group.ranks,
+            get_attention_tp_rank(),
+            self.attn_tp_size,
+            attn_tp_group.rank_in_group,
+            attn_tp_group.world_size,
+            attn_tp_group.ranks,
+            list(logits.shape),
+            logits.dtype,
+        )
+
     def _log_elastic_tp_gather_entry(
         self, branch: str, logits: torch.Tensor, logits_metadata: LogitsMetadata
     ) -> None:
-        if not self._elastic_readout_trace_enabled():
+        if not self._elastic_readout_trace_enabled(ignore_limit=True):
             return
 
         limit = self._elastic_trace_int_env(
@@ -461,12 +524,7 @@ class LogitsProcessor(nn.Module):
             return
         self._elastic_tp_gather_entry_markers += 1
 
-        offset = get_global_server_args().ep_join_rank_offset or 0
-        try:
-            local_ep_rank = get_moe_expert_parallel_rank()
-        except Exception:
-            local_ep_rank = get_attention_dp_rank()
-        global_ep_rank = local_ep_rank + offset
+        local_ep_rank, global_ep_rank, offset = self._get_elastic_rank_info()
 
         attn_tp_group = get_attention_tp_group()
         logger.info(
@@ -492,15 +550,10 @@ class LogitsProcessor(nn.Module):
     def _log_elastic_tp_gather_metadata(
         self, branch: str, logits: torch.Tensor, logits_metadata: LogitsMetadata
     ) -> None:
-        if not self._elastic_readout_trace_enabled():
+        if not self._elastic_readout_trace_enabled(ignore_limit=True):
             return
 
-        offset = get_global_server_args().ep_join_rank_offset or 0
-        try:
-            local_ep_rank = get_moe_expert_parallel_rank()
-        except Exception:
-            local_ep_rank = get_attention_dp_rank()
-        global_ep_rank = local_ep_rank + offset
+        local_ep_rank, global_ep_rank, offset = self._get_elastic_rank_info()
 
         attn_tp_group = get_attention_tp_group()
         try:
@@ -1113,11 +1166,43 @@ class LogitsProcessor(nn.Module):
 
         if self.do_tensor_parallel_all_gather:
             if self.use_attn_tp_group:
+                self._log_elastic_tp_gather_branch(
+                    "attn_tp_group", logits, logits_metadata
+                )
                 logits = self._gather_attn_tp_logits(logits, logits_metadata)
             else:
+                self._log_elastic_tp_gather_branch(
+                    "generic_tensor_model_parallel_all_gather",
+                    logits,
+                    logits_metadata,
+                )
+                input_logits = logits
                 logits = tensor_model_parallel_all_gather(logits)
+                if self._elastic_tp_gather_bad_trace_should_log(
+                    self._elastic_readout_tensor_is_bad(input_logits)
+                    or self._elastic_readout_tensor_is_bad(logits)
+                ):
+                    self._log_elastic_tp_gather_metadata(
+                        "generic_tensor_model_parallel_all_gather",
+                        input_logits,
+                        logits_metadata,
+                    )
+                    self._log_elastic_readout_trace(
+                        "generic_tp_gather_anomaly_input_local_shard",
+                        input_logits,
+                        logits_metadata,
+                    )
+                    self._log_elastic_readout_trace(
+                        "generic_tp_gather_anomaly_output",
+                        logits,
+                        logits_metadata,
+                    )
             self._log_elastic_readout_trace(
                 "logits_after_tp_gather", logits, logits_metadata
+            )
+        else:
+            self._log_elastic_tp_gather_branch(
+                "no_tensor_parallel_all_gather", logits, logits_metadata
             )
 
         logits = self._scatter_dp_attn_logits(
