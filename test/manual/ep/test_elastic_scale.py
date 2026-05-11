@@ -39,6 +39,7 @@ Run with:
       -v -s
 """
 
+import json
 import os
 import shutil
 import subprocess
@@ -282,6 +283,26 @@ def _preserve_gsm8k_report(model: str) -> None:
             print(f"[TEST][step 6] preserved GSM8K {ext} report: {dst}", flush=True)
         else:
             print(f"[TEST][step 6] GSM8K {ext} report missing: {src}", flush=True)
+
+
+def _worker_probe_prompt(index: int) -> str:
+    return f"""Question: Janet's ducks lay 16 eggs per day. She eats three for breakfast every morning and bakes muffins for her friends every day with four. She sells the remainder at the farmers' market daily for $2 per fresh duck egg. How much in dollars does she make every day at the farmers' market?
+Answer: Janet sells 16 - 3 - 4 = <<16-3-4=9>>9 duck eggs a day.
+She makes 9 * 2 = $<<9*2=18>>18 every day at the farmer's market.
+#### 18
+
+Question: A robe takes 2 bolts of blue fiber and half that much white fiber. How many bolts in total does it take?
+Answer: It takes 2/2=<<2/2=1>>1 bolt of white fiber.
+So the total amount of fabric is 2+1=<<2+1=3>>3 bolts of fabric.
+#### 3
+
+Question: James decides to run 3 sprints 3 times a week. He runs 60 meters each sprint. How many total meters does he run a week?
+Answer: He sprints 3*3=<<3*3=9>>9 times.
+So he runs 9*60=<<9*60=540>>540 meters.
+#### 540
+
+Question: Eliza's rate per hour for the first 40 hours she works each week is $10. She also receives an overtime pay of 1.2 times her regular hourly rate. If Eliza worked for 45 hours this week, how much are her earnings for this week? Probe index {index}.
+Answer:"""
 
 
 def _scale_up_common_args(
@@ -542,6 +563,72 @@ class _ElasticScaleUpEndToEndBase(CustomTestCase):
             flush=True,
         )
 
+    def _worker_correlation_probe(self) -> None:
+        """Send deterministic sequential completions and preserve raw outputs.
+
+        The DP controller logs rid→target worker when
+        SGLANG_ELASTIC_WORKER_TRACE=1. This JSON preserves probe index→rid→text,
+        so the logs can be joined with output quality after the run.
+        """
+        if os.environ.get("SGLANG_ELASTIC_WORKER_CORRELATION_PROBE", "0") != "1":
+            return
+
+        num_requests = int(os.environ.get("SGLANG_ELASTIC_WORKER_PROBE_REQUESTS", "8"))
+        max_tokens = int(os.environ.get("SGLANG_ELASTIC_WORKER_PROBE_MAX_TOKENS", "128"))
+        report_dir = os.environ.get(
+            "SGLANG_ELASTIC_GSM8K_REPORT_DIR",
+            "/lustre/fsw/portfolios/coreai/users/yorayz/logs",
+        )
+        os.makedirs(report_dir, exist_ok=True)
+        out_path = os.path.join(
+            report_dir, f"elastic_scale_worker_probe_{int(time.time())}.json"
+        )
+        url = f"{self.base_url}/v1/completions"
+        print(
+            f"[TEST][worker-probe] start url={url} "
+            f"num_requests={num_requests} max_tokens={max_tokens}",
+            flush=True,
+        )
+
+        results = []
+        for i in range(num_requests):
+            payload = {
+                "model": self.model,
+                "prompt": _worker_probe_prompt(i),
+                "max_tokens": max_tokens,
+                "temperature": 0.0,
+                "stop": ["Question", "Assistant:", "<|separator|>"],
+            }
+            t0 = time.perf_counter()
+            resp = requests.post(url, json=payload, timeout=180)
+            latency = time.perf_counter() - t0
+            body = resp.json() if resp.ok else {"error": resp.text[:1000]}
+            text = ""
+            if resp.ok:
+                text = body.get("choices", [{}])[0].get("text") or ""
+            rid = body.get("id")
+            result = {
+                "probe_index": i,
+                "rid": rid,
+                "status_code": resp.status_code,
+                "latency": latency,
+                "text": text,
+                "looks_correct": "#### 460" in text or text.rstrip().endswith("460"),
+            }
+            results.append(result)
+            print(
+                f"[TEST][worker-probe] request {i} done rid={rid} "
+                f"status={resp.status_code} latency={latency:.2f}s "
+                f"looks_correct={result['looks_correct']} "
+                f"text={text[:120].replace(chr(10), ' ')}",
+                flush=True,
+            )
+            resp.raise_for_status()
+
+        with open(out_path, "w") as f:
+            json.dump(results, f, indent=2, ensure_ascii=False)
+        print(f"[TEST][worker-probe] wrote {out_path}", flush=True)
+
     def test_scale_up_on_demand(self):
         """The real scale use case: serve on N ranks, then attach N more.
 
@@ -665,6 +752,11 @@ class _ElasticScaleUpEndToEndBase(CustomTestCase):
                 flush=True,
             )
             return
+
+        # Step 5.6: deterministic worker/output correlation probe.
+        print("[TEST][step 5.6] optional worker correlation probe start", flush=True)
+        self._worker_correlation_probe()
+        print("[TEST][step 5.6] optional worker correlation probe done", flush=True)
 
         # Step 6: accuracy check on primary post-scale.
         print("[TEST][step 6] post-scale GSM8K run_eval start", flush=True)

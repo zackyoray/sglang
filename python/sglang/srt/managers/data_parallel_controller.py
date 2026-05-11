@@ -249,7 +249,10 @@ class DataParallelController:
     def dispatching_with_trace(self, req: Req):
         req.time_stats = DPControllerReqTimeStats.new_from_obj(req.time_stats)
 
-        if os.environ.get("SGLANG_ELASTIC_FRONTEND_TRACE", "0") == "1":
+        if (
+            os.environ.get("SGLANG_ELASTIC_FRONTEND_TRACE", "0") == "1"
+            or os.environ.get("SGLANG_ELASTIC_WORKER_TRACE", "0") == "1"
+        ):
             logger.info(
                 "[Elastic EP][frontend] dp-controller.dispatch.enter "
                 "rid=%s req_type=%s workers=%d status=%s rr=%d",
@@ -262,7 +265,10 @@ class DataParallelController:
         req.time_stats.set_dp_dispatch_time()
         self.dispatching(req)
         req.time_stats.set_dp_dispatch_finish_time()
-        if os.environ.get("SGLANG_ELASTIC_FRONTEND_TRACE", "0") == "1":
+        if (
+            os.environ.get("SGLANG_ELASTIC_FRONTEND_TRACE", "0") == "1"
+            or os.environ.get("SGLANG_ELASTIC_WORKER_TRACE", "0") == "1"
+        ):
             logger.info(
                 "[Elastic EP][frontend] dp-controller.dispatch.exit rid=%s",
                 getattr(req, "rid", None),
@@ -696,7 +702,10 @@ class DataParallelController:
         while True:
             if self.status[self.round_robin_counter]:
                 target = self.round_robin_counter
-                if os.environ.get("SGLANG_ELASTIC_FRONTEND_TRACE", "0") == "1":
+                if (
+                    os.environ.get("SGLANG_ELASTIC_FRONTEND_TRACE", "0") == "1"
+                    or os.environ.get("SGLANG_ELASTIC_WORKER_TRACE", "0") == "1"
+                ):
                     logger.info(
                         "[Elastic EP][frontend] dp-controller.dispatch.rr "
                         "rid=%s target=%d workers=%d status=%s",
