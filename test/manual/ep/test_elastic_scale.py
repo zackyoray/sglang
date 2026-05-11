@@ -40,6 +40,7 @@ Run with:
 """
 
 import os
+import shutil
 import subprocess
 import time
 import unittest
@@ -262,6 +263,25 @@ DIST_INIT_ADDR = os.environ.get(
 PORT_A = int(os.environ.get("SGLANG_ELASTIC_SCALE_PORT_A", "21000"))
 PORT_B = int(os.environ.get("SGLANG_ELASTIC_SCALE_PORT_B", "21001"))
 BASE_URL_A = f"http://127.0.0.1:{PORT_A}"
+
+
+def _preserve_gsm8k_report(model: str) -> None:
+    report_dir = os.environ.get(
+        "SGLANG_ELASTIC_GSM8K_REPORT_DIR",
+        "/lustre/fsw/portfolios/coreai/users/yorayz/logs",
+    )
+    os.makedirs(report_dir, exist_ok=True)
+
+    src_stem = f"/tmp/gsm8k_{model.replace('/', '_')}"
+    dst_stem = os.path.join(report_dir, f"elastic_scale_gsm8k_{int(time.time())}")
+    for ext in ("html", "json"):
+        src = f"{src_stem}.{ext}"
+        dst = f"{dst_stem}.{ext}"
+        if os.path.exists(src):
+            shutil.copy2(src, dst)
+            print(f"[TEST][step 6] preserved GSM8K {ext} report: {dst}", flush=True)
+        else:
+            print(f"[TEST][step 6] GSM8K {ext} report missing: {src}", flush=True)
 
 
 def _scale_up_common_args(
@@ -670,6 +690,7 @@ class _ElasticScaleUpEndToEndBase(CustomTestCase):
             num_threads=gsm8k_num_threads,
         )
         metrics = run_eval(args)
+        _preserve_gsm8k_report(self.model)
         print("[TEST][step 6] post-scale GSM8K run_eval done", flush=True)
         print(f"[TEST] Post-scale GSM8K accuracy: {metrics['score']:.2%}")
         self.assertGreater(
