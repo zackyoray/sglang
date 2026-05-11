@@ -757,6 +757,13 @@ class _ElasticScaleUpEndToEndBase(CustomTestCase):
         print("[TEST][step 5.6] optional worker correlation probe start", flush=True)
         self._worker_correlation_probe()
         print("[TEST][step 5.6] optional worker correlation probe done", flush=True)
+        if os.environ.get("SGLANG_ELASTIC_STOP_AFTER_WORKER_PROBE", "0") == "1":
+            print(
+                "[TEST][step 5.6] stop-after-worker-probe requested; "
+                "skipping GSM8K accuracy phase",
+                flush=True,
+            )
+            return
 
         # Step 6: accuracy check on primary post-scale.
         print("[TEST][step 6] post-scale GSM8K run_eval start", flush=True)
