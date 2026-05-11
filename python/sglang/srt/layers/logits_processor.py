@@ -15,6 +15,7 @@
 
 import dataclasses
 import logging
+import os
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -23,9 +24,11 @@ import triton.language as tl
 from torch import nn
 
 from sglang.srt.distributed import (
+    get_moe_expert_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
+from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -282,6 +285,127 @@ class LogitsProcessor(nn.Module):
         self.enable_logprobs_chunk = envs.SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK.get()
         # chunk size for logprobs processing
         self.logprobs_chunk_size = envs.SGLANG_LOGITS_PROCESSER_CHUNK_SIZE.get()
+        self._elastic_readout_trace_count = 0
+
+    @staticmethod
+    def _elastic_trace_int_env(name: str, default: int) -> int:
+        try:
+            return int(os.environ.get(name, str(default)))
+        except ValueError:
+            return default
+
+    def _elastic_readout_trace_enabled(self) -> bool:
+        if os.environ.get("SGLANG_ELASTIC_READOUT_TRACE", "0") != "1":
+            return False
+
+        if os.environ.get("SGLANG_ELASTIC_READOUT_TRACE_POST_SCALE_ONLY", "1") == "1":
+            inst = ElasticEPStateManager.instance()
+            max_ep_size = get_global_server_args().max_ep_size or 0
+            if inst is None or max_ep_size <= 0 or inst.effective_ep_size < max_ep_size:
+                return False
+
+        if (
+            os.environ.get("SGLANG_ELASTIC_READOUT_TRACE_JOINER_ONLY", "0") == "1"
+            and (get_global_server_args().ep_join_rank_offset or 0) == 0
+        ):
+            return False
+
+        limit = self._elastic_trace_int_env("SGLANG_ELASTIC_READOUT_TRACE_LIMIT", 64)
+        return self._elastic_readout_trace_count < limit
+
+    def _log_elastic_readout_trace(
+        self,
+        tag: str,
+        tensor: Optional[torch.Tensor],
+        logits_metadata: LogitsMetadata,
+    ) -> None:
+        if not self._elastic_readout_trace_enabled():
+            return
+
+        limit = self._elastic_trace_int_env("SGLANG_ELASTIC_READOUT_TRACE_LIMIT", 64)
+        if self._elastic_readout_trace_count >= limit:
+            return
+
+        offset = get_global_server_args().ep_join_rank_offset or 0
+        try:
+            local_ep_rank = get_moe_expert_parallel_rank()
+        except Exception:
+            local_ep_rank = get_attention_dp_rank()
+        global_ep_rank = local_ep_rank + offset
+        self._elastic_readout_trace_count += 1
+
+        if tensor is None:
+            logger.info(
+                "[Elastic EP][readout-trace] tag=%s count=%d local_ep_rank=%d "
+                "global_ep_rank=%d is_joiner=%s forward_mode=%s tensor=None",
+                tag,
+                self._elastic_readout_trace_count,
+                local_ep_rank,
+                global_ep_rank,
+                offset > 0,
+                logits_metadata.forward_mode,
+            )
+            return
+
+        with torch.no_grad():
+            detached = tensor.detach()
+            numel = detached.numel()
+            if numel == 0:
+                logger.info(
+                    "[Elastic EP][readout-trace] tag=%s count=%d local_ep_rank=%d "
+                    "global_ep_rank=%d is_joiner=%s forward_mode=%s shape=%s "
+                    "dtype=%s numel=0",
+                    tag,
+                    self._elastic_readout_trace_count,
+                    local_ep_rank,
+                    global_ep_rank,
+                    offset > 0,
+                    logits_metadata.forward_mode,
+                    list(detached.shape),
+                    detached.dtype,
+                )
+                return
+
+            values = detached.float()
+            finite = torch.isfinite(values)
+            finite_count = int(finite.sum().item())
+            nan_count = int(torch.isnan(values).sum().item())
+            inf_count = int(torch.isinf(values).sum().item())
+            if finite_count > 0:
+                finite_values = values[finite]
+                mean = float(finite_values.mean().item())
+                std = float(finite_values.std(unbiased=False).item())
+                min_value = float(finite_values.min().item())
+                max_value = float(finite_values.max().item())
+                max_abs = float(finite_values.abs().max().item())
+            else:
+                mean = std = min_value = max_value = max_abs = float("nan")
+            checksum = float(values.flatten()[: min(1024, numel)].sum().item())
+
+        logger.info(
+            "[Elastic EP][readout-trace] tag=%s count=%d local_ep_rank=%d "
+            "global_ep_rank=%d is_joiner=%s forward_mode=%s shape=%s dtype=%s "
+            "numel=%d finite=%d nan=%d inf=%d mean=%.6g std=%.6g "
+            "min=%.6g max=%.6g max_abs=%.6g checksum1024=%.6g",
+            tag,
+            self._elastic_readout_trace_count,
+            local_ep_rank,
+            global_ep_rank,
+            offset > 0,
+            logits_metadata.forward_mode,
+            list(detached.shape),
+            detached.dtype,
+            numel,
+            finite_count,
+            nan_count,
+            inf_count,
+            mean,
+            std,
+            min_value,
+            max_value,
+            max_abs,
+            checksum,
+        )
 
     def forward(
         self,
@@ -844,26 +968,45 @@ class LogitsProcessor(nn.Module):
         last position (e.g., extend without input logprobs). The caller should
         guarantee the given hidden_states follow this constraint.
         """
+        self._log_elastic_readout_trace(
+            "logits_input_pruned_hidden", hidden_states, logits_metadata
+        )
         hidden_states, local_hidden_states = self._gather_dp_attn_hidden_states(
             hidden_states, logits_metadata
         )
+        self._log_elastic_readout_trace(
+            "logits_after_dp_gather_hidden", hidden_states, logits_metadata
+        )
 
         logits = self._compute_lm_head(hidden_states, lm_head, embedding_bias)
+        self._log_elastic_readout_trace("logits_after_lm_head", logits, logits_metadata)
 
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
+            self._log_elastic_readout_trace(
+                "logits_after_logit_scale", logits, logits_metadata
+            )
 
         if self.do_tensor_parallel_all_gather:
             if self.use_attn_tp_group:
                 logits = self._gather_attn_tp_logits(logits)
             else:
                 logits = tensor_model_parallel_all_gather(logits)
+            self._log_elastic_readout_trace(
+                "logits_after_tp_gather", logits, logits_metadata
+            )
 
         logits = self._scatter_dp_attn_logits(
             logits, local_hidden_states, logits_metadata
         )
+        self._log_elastic_readout_trace(
+            "logits_after_dp_scatter", logits, logits_metadata
+        )
 
         logits = self._copy_logits_to_buffer(logits, logits_metadata)
+        self._log_elastic_readout_trace(
+            "logits_after_buffer_copy", logits, logits_metadata
+        )
 
         if self.final_logit_softcapping:
             if not _is_npu:
@@ -872,6 +1015,9 @@ class LogitsProcessor(nn.Module):
                 logits = self.final_logit_softcapping * torch.tanh(
                     logits / self.final_logit_softcapping
                 )
+            self._log_elastic_readout_trace(
+                "logits_after_softcap", logits, logits_metadata
+            )
 
         return logits
 

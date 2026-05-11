@@ -2073,6 +2073,7 @@ class DeepseekV2Model(nn.Module):
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer(return_tuple=True)
+        self._elastic_readout_trace_count = 0
 
         self.gemm_output_zero_allocator_size = 0
         if (
@@ -2124,6 +2125,125 @@ class DeepseekV2Model(nn.Module):
 
     def get_input_embeddings(self) -> torch.Tensor:
         return self.embed_tokens
+
+    @staticmethod
+    def _elastic_readout_trace_int_env(name: str, default: int) -> int:
+        try:
+            return int(os.environ.get(name, str(default)))
+        except ValueError:
+            return default
+
+    def _elastic_readout_trace_enabled(self) -> bool:
+        if os.environ.get("SGLANG_ELASTIC_READOUT_TRACE", "0") != "1":
+            return False
+        if os.environ.get("SGLANG_ELASTIC_READOUT_TRACE_POST_SCALE_ONLY", "1") == "1":
+            inst = ElasticEPStateManager.instance()
+            max_ep_size = get_global_server_args().max_ep_size or 0
+            if (
+                inst is None
+                or max_ep_size <= 0
+                or inst.effective_ep_size < max_ep_size
+            ):
+                return False
+        if (
+            os.environ.get("SGLANG_ELASTIC_READOUT_TRACE_JOINER_ONLY", "0") == "1"
+            and (get_global_server_args().ep_join_rank_offset or 0) == 0
+        ):
+            return False
+        limit = self._elastic_readout_trace_int_env(
+            "SGLANG_ELASTIC_READOUT_TRACE_LIMIT", 64
+        )
+        return self._elastic_readout_trace_count < limit
+
+    def _log_elastic_readout_trace(
+        self, tag: str, tensor: Optional[torch.Tensor], forward_batch: ForwardBatch
+    ) -> None:
+        if not self._elastic_readout_trace_enabled():
+            return
+
+        limit = self._elastic_readout_trace_int_env(
+            "SGLANG_ELASTIC_READOUT_TRACE_LIMIT", 64
+        )
+        if self._elastic_readout_trace_count >= limit:
+            return
+
+        local_ep_rank = get_moe_expert_parallel_rank()
+        offset = get_global_server_args().ep_join_rank_offset or 0
+        global_ep_rank = local_ep_rank + offset
+        self._elastic_readout_trace_count += 1
+
+        if tensor is None:
+            logger.info(
+                "[Elastic EP][readout-trace] tag=%s count=%d local_ep_rank=%d "
+                "global_ep_rank=%d is_joiner=%s forward_mode=%s tensor=None",
+                tag,
+                self._elastic_readout_trace_count,
+                local_ep_rank,
+                global_ep_rank,
+                offset > 0,
+                forward_batch.forward_mode,
+            )
+            return
+
+        with torch.no_grad():
+            detached = tensor.detach()
+            numel = detached.numel()
+            if numel == 0:
+                logger.info(
+                    "[Elastic EP][readout-trace] tag=%s count=%d local_ep_rank=%d "
+                    "global_ep_rank=%d is_joiner=%s forward_mode=%s shape=%s "
+                    "dtype=%s numel=0",
+                    tag,
+                    self._elastic_readout_trace_count,
+                    local_ep_rank,
+                    global_ep_rank,
+                    offset > 0,
+                    forward_batch.forward_mode,
+                    list(detached.shape),
+                    detached.dtype,
+                )
+                return
+
+            values = detached.float()
+            finite = torch.isfinite(values)
+            finite_count = int(finite.sum().item())
+            nan_count = int(torch.isnan(values).sum().item())
+            inf_count = int(torch.isinf(values).sum().item())
+            if finite_count > 0:
+                finite_values = values[finite]
+                mean = float(finite_values.mean().item())
+                std = float(finite_values.std(unbiased=False).item())
+                min_value = float(finite_values.min().item())
+                max_value = float(finite_values.max().item())
+                max_abs = float(finite_values.abs().max().item())
+            else:
+                mean = std = min_value = max_value = max_abs = float("nan")
+            checksum = float(values.flatten()[: min(1024, numel)].sum().item())
+
+        logger.info(
+            "[Elastic EP][readout-trace] tag=%s count=%d local_ep_rank=%d "
+            "global_ep_rank=%d is_joiner=%s forward_mode=%s shape=%s dtype=%s "
+            "numel=%d finite=%d nan=%d inf=%d mean=%.6g std=%.6g "
+            "min=%.6g max=%.6g max_abs=%.6g checksum1024=%.6g",
+            tag,
+            self._elastic_readout_trace_count,
+            local_ep_rank,
+            global_ep_rank,
+            offset > 0,
+            forward_batch.forward_mode,
+            list(detached.shape),
+            detached.dtype,
+            numel,
+            finite_count,
+            nan_count,
+            inf_count,
+            mean,
+            std,
+            min_value,
+            max_value,
+            max_abs,
+            checksum,
+        )
 
     def forward(
         self,
@@ -2246,10 +2366,19 @@ class DeepseekV2Model(nn.Module):
             )
         else:
             if not forward_batch.forward_mode.is_idle():
+                self._log_elastic_readout_trace(
+                    "before_final_norm_hidden", hidden_states, forward_batch
+                )
                 if residual is None:
                     hidden_states = self.norm(hidden_states)
                 else:
+                    self._log_elastic_readout_trace(
+                        "before_final_norm_residual", residual, forward_batch
+                    )
                     hidden_states, _ = self.norm(hidden_states, residual)
+                self._log_elastic_readout_trace(
+                    "after_final_norm_hidden", hidden_states, forward_batch
+                )
 
         if self.pp_group.is_last_rank and nsa_use_prefill_cp(forward_batch):
             # allgather + rerrange
@@ -2258,6 +2387,9 @@ class DeepseekV2Model(nn.Module):
                 self.cp_size,
                 forward_batch,
                 torch.cuda.current_stream(),
+            )
+            self._log_elastic_readout_trace(
+                "after_cp_gather_hidden", hidden_states, forward_batch
             )
         if len(aux_hidden_states) == 0:
             return hidden_states
