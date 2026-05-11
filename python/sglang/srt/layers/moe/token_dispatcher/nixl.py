@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from enum import Enum, auto
 from typing import List, Optional
@@ -607,6 +608,133 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
         """
         self.return_recv_hook = return_recv_hook
         self.device_module = torch.get_device_module()
+        self._corruption_trace_dispatch_count = 0
+        self._corruption_trace_postwait_count = 0
+
+    def _corruption_trace_enabled(self) -> bool:
+        return os.environ.get("SGLANG_ELASTIC_JOINER_CORRUPTION_TRACE", "0") == "1"
+
+    def _corruption_trace_limit(self) -> int:
+        return int(os.environ.get("SGLANG_ELASTIC_JOINER_CORRUPTION_TRACE_LIMIT", "256"))
+
+    def _log_corruption_dispatch_trace(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        ep_size: int,
+        expected_m: int,
+    ) -> None:
+        if not self._corruption_trace_enabled() or ep_size < 8:
+            return
+        if self._corruption_trace_dispatch_count >= self._corruption_trace_limit():
+            return
+
+        valid_mask = topk_ids >= 0
+        nle = NixlEPBuffer._num_local_experts or self.num_local_experts
+        if valid_mask.any() and nle:
+            target_ranks = topk_ids[valid_mask] // nle
+            hist = torch.bincount(
+                target_ranks.clamp(min=0, max=ep_size - 1).to(torch.int64),
+                minlength=ep_size,
+            ).cpu().tolist()
+            topk_min = int(topk_ids[valid_mask].min().item())
+            topk_max = int(topk_ids[valid_mask].max().item())
+            oob_count = int((target_ranks >= ep_size).sum().item())
+        else:
+            hist, topk_min, topk_max, oob_count = [], -1, -1, 0
+
+        p2l_shape = p2l_sum = rtr_shape = rtr_head = rtr_tail = None
+        try:
+            from sglang.srt.eplb.expert_location import (
+                get_global_expert_location_metadata,
+            )
+
+            md = get_global_expert_location_metadata()
+            if md is not None:
+                p2l = md.physical_to_logical_map
+                rtr = md.logical_to_rank_dispatch_physical_map
+                p2l_shape = list(p2l.shape)
+                p2l_sum = int(p2l.sum().item())
+                if rtr is not None:
+                    rtr_shape = list(rtr.shape)
+                    rtr_head = rtr[0, :8].tolist()
+                    rtr_tail = rtr[0, -8:].tolist()
+        except Exception as exc:
+            logger.warning("[Elastic EP][corr-trace] metadata read failed: %s", exc)
+
+        local_rank = dist.get_rank(self.group)
+        offset = ElasticEPStateManager.get_ep_join_rank_offset()
+        logger.info(
+            "[Elastic EP][corr-trace][dispatch] seq=%d local_rank=%d "
+            "global_rank=%d offset=%d ep=%d hidden_tokens=%d topk_shape=%s "
+            "topk_min=%d topk_max=%d target_hist=%s oob_count=%d "
+            "num_experts=%d nixl_num_experts=%d num_local_experts=%d "
+            "expected_m=%d p2l_shape=%s p2l_sum=%s rtr_shape=%s "
+            "rtr_head=%s rtr_tail=%s",
+            self._corruption_trace_dispatch_count,
+            local_rank,
+            local_rank + offset,
+            offset,
+            ep_size,
+            int(hidden_states.shape[0]) if hidden_states.dim() > 0 else 0,
+            list(topk_ids.shape),
+            topk_min,
+            topk_max,
+            hist,
+            oob_count,
+            self.num_experts,
+            (NixlEPBuffer._num_local_experts or 0) * ep_size,
+            nle,
+            expected_m,
+            p2l_shape,
+            p2l_sum,
+            rtr_shape,
+            rtr_head,
+            rtr_tail,
+        )
+        self._corruption_trace_dispatch_count += 1
+
+    def _log_corruption_postwait_trace(
+        self,
+        *,
+        masked_m: torch.Tensor,
+        ep_size: int,
+        expected_m: int,
+    ) -> None:
+        if not self._corruption_trace_enabled() or ep_size < 8:
+            return
+        if self._corruption_trace_postwait_count >= self._corruption_trace_limit():
+            return
+
+        try:
+            masked = masked_m.cpu().tolist()
+            masked_sum = int(sum(masked))
+            masked_max = int(max(masked)) if masked else 0
+            non_zero = sum(1 for value in masked if value > 0)
+        except Exception as exc:
+            logger.warning("[Elastic EP][corr-trace] masked_m read failed: %s", exc)
+            return
+
+        local_rank = dist.get_rank(self.group)
+        offset = ElasticEPStateManager.get_ep_join_rank_offset()
+        logger.info(
+            "[Elastic EP][corr-trace][postwait] seq=%d local_rank=%d "
+            "global_rank=%d offset=%d ep=%d masked_m_sum=%d "
+            "masked_m_max=%d nonzero_experts=%d/%d expected_m=%d masked_m=%s",
+            self._corruption_trace_postwait_count,
+            local_rank,
+            local_rank + offset,
+            offset,
+            ep_size,
+            masked_sum,
+            masked_max,
+            non_zero,
+            len(masked),
+            expected_m,
+            masked,
+        )
+        self._corruption_trace_postwait_count += 1
 
     def dispatch_a(
         self,
@@ -640,6 +768,13 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
                 topk_ids[topk_ids >= 0].min().item() if topk_ids.numel() > 0 and (topk_ids >= 0).any() else -1,
                 topk_ids.max().item() if topk_ids.numel() > 0 else -1,
             )
+
+        self._log_corruption_dispatch_trace(
+            hidden_states=hidden_states,
+            topk_ids=topk_ids,
+            ep_size=ep_size,
+            expected_m=expected_m,
+        )
 
         # Idea 1: per-target-rank token histogram for the first few
         # dispatches after each ep_size change. This is what tells us
@@ -764,6 +899,12 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
                     "[Elastic EP][nixl][post-wait] probe failed: %s", _e,
                 )
             self._postwait_diag_count += 1
+
+        self._log_corruption_postwait_trace(
+            masked_m=masked_m,
+            ep_size=_ep or 0,
+            expected_m=expected_m,
+        )
 
         get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency(
             masked_m
