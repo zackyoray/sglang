@@ -599,6 +599,37 @@ class LogitsProcessor(nn.Module):
 
         return True
 
+    @staticmethod
+    def _logits_row_counts_from_token_counts(
+        logits: torch.Tensor, token_counts: List[int]
+    ) -> List[int]:
+        """Map hidden-token counts to the pruned logits rows being gathered.
+
+        LogitsProcessor often reduces a long prefill/extend to one sampled
+        next-token row, while global_num_tokens_gpu still describes all prompt
+        hidden tokens. In that common case, the single logits row belongs to the
+        only DP rank with tokens.
+        """
+        total_tokens = sum(token_counts)
+        num_logit_rows = int(logits.shape[0])
+        if total_tokens == num_logit_rows:
+            return token_counts
+
+        nonzero = [idx for idx, count in enumerate(token_counts) if count > 0]
+        if num_logit_rows == 1 and len(nonzero) == 1:
+            row_counts = [0] * len(token_counts)
+            row_counts[nonzero[0]] = 1
+            return row_counts
+
+        logger.warning(
+            "[Elastic EP][world-logits-gather] unable to map token counts to "
+            "logits rows exactly: token_counts=%s total_tokens=%d logits_rows=%d",
+            token_counts,
+            total_tokens,
+            num_logit_rows,
+        )
+        return token_counts
+
     def _gather_logits_via_world_all_reduce(
         self, logits: torch.Tensor, logits_metadata: LogitsMetadata
     ) -> torch.Tensor:
@@ -627,11 +658,13 @@ class LogitsProcessor(nn.Module):
 
         tp_ranks = set(get_tp_group().ranks)
         if logits_metadata.global_num_tokens_gpu is not None:
-            counts = [
+            token_counts = [
                 int(x)
                 for x in logits_metadata.global_num_tokens_gpu.detach().cpu().tolist()
             ]
+            counts = self._logits_row_counts_from_token_counts(logits, token_counts)
         else:
+            token_counts = None
             counts = [int(logits.shape[0])]
 
         row_start = 0
@@ -659,14 +692,15 @@ class LogitsProcessor(nn.Module):
             logger.info(
                 "[Elastic EP][world-logits-gather] local_ep_rank=%d global_ep_rank=%d "
                 "is_joiner=%s forward_mode=%s tp_rank=%d tp_group_ranks=%s "
-                "counts=%s contributed_ranges=%s shard=[%d,%d) input_shape=%s "
-                "output_shape=%s",
+                "token_counts=%s row_counts=%s contributed_ranges=%s "
+                "shard=[%d,%d) input_shape=%s output_shape=%s",
                 local_ep_rank,
                 global_ep_rank,
                 offset > 0,
                 logits_metadata.forward_mode,
                 local_tp_rank,
                 get_tp_group().ranks,
+                token_counts,
                 counts,
                 contributed_ranges,
                 shard_start,
