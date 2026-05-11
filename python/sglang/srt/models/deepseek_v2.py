@@ -607,15 +607,24 @@ class DeepseekV2MoE(nn.Module):
     def _log_elastic_hidden_trace(self, tag: str, tensor: torch.Tensor) -> None:
         if not self._elastic_hidden_trace_enabled():
             return
+        local_ep_rank = get_moe_expert_parallel_rank()
+        offset = get_global_server_args().ep_join_rank_offset or 0
+        global_ep_rank = local_ep_rank + offset
+        if (
+            os.environ.get("SGLANG_ELASTIC_HIDDEN_TRACE_JOINER_ONLY", "0") == "1"
+            and offset == 0
+        ):
+            return
+        if (
+            os.environ.get("SGLANG_ELASTIC_HIDDEN_TRACE_NON_EMPTY_ONLY", "0") == "1"
+            and (tensor is None or tensor.numel() == 0)
+        ):
+            return
         limit = int(os.environ.get("SGLANG_ELASTIC_HIDDEN_TRACE_LIMIT", "32"))
         count = self._elastic_hidden_trace_counts.get(tag, 0)
         if count >= limit:
             return
         self._elastic_hidden_trace_counts[tag] = count + 1
-
-        local_ep_rank = get_moe_expert_parallel_rank()
-        offset = get_global_server_args().ep_join_rank_offset or 0
-        global_ep_rank = local_ep_rank + offset
 
         if tensor is None:
             logger.info(
