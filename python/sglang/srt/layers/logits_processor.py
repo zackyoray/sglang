@@ -288,6 +288,7 @@ class LogitsProcessor(nn.Module):
         # chunk size for logprobs processing
         self.logprobs_chunk_size = envs.SGLANG_LOGITS_PROCESSER_CHUNK_SIZE.get()
         self._elastic_readout_trace_count = 0
+        self._elastic_tp_gather_entry_markers = 0
         self._elastic_tp_gather_trace_events = 0
 
     @staticmethod
@@ -430,7 +431,14 @@ class LogitsProcessor(nn.Module):
     def _elastic_tp_gather_trace_should_log(self, tensor: torch.Tensor) -> bool:
         if not self._elastic_readout_trace_enabled():
             return False
-        if not self._elastic_readout_tensor_is_bad(tensor):
+        return self._elastic_tp_gather_bad_trace_should_log(
+            self._elastic_readout_tensor_is_bad(tensor)
+        )
+
+    def _elastic_tp_gather_bad_trace_should_log(self, is_bad: bool) -> bool:
+        if not self._elastic_readout_trace_enabled():
+            return False
+        if not is_bad:
             return False
 
         limit = self._elastic_trace_int_env("SGLANG_ELASTIC_TP_GATHER_TRACE_LIMIT", 32)
@@ -439,6 +447,47 @@ class LogitsProcessor(nn.Module):
 
         self._elastic_tp_gather_trace_events += 1
         return True
+
+    def _log_elastic_tp_gather_entry(
+        self, branch: str, logits: torch.Tensor, logits_metadata: LogitsMetadata
+    ) -> None:
+        if not self._elastic_readout_trace_enabled():
+            return
+
+        limit = self._elastic_trace_int_env(
+            "SGLANG_ELASTIC_TP_GATHER_ENTRY_TRACE_LIMIT", 8
+        )
+        if self._elastic_tp_gather_entry_markers >= limit:
+            return
+        self._elastic_tp_gather_entry_markers += 1
+
+        offset = get_global_server_args().ep_join_rank_offset or 0
+        try:
+            local_ep_rank = get_moe_expert_parallel_rank()
+        except Exception:
+            local_ep_rank = get_attention_dp_rank()
+        global_ep_rank = local_ep_rank + offset
+
+        attn_tp_group = get_attention_tp_group()
+        logger.info(
+            "[Elastic EP][tp-gather-entry] marker=%d branch=%s local_ep_rank=%d "
+            "global_ep_rank=%d is_joiner=%s forward_mode=%s attn_tp_rank=%d "
+            "attn_tp_size=%d group_rank=%d group_world_size=%d group_ranks=%s "
+            "input_shape=%s input_dtype=%s",
+            self._elastic_tp_gather_entry_markers,
+            branch,
+            local_ep_rank,
+            global_ep_rank,
+            offset > 0,
+            logits_metadata.forward_mode,
+            get_attention_tp_rank(),
+            self.attn_tp_size,
+            attn_tp_group.rank_in_group,
+            attn_tp_group.world_size,
+            attn_tp_group.ranks,
+            list(logits.shape),
+            logits.dtype,
+        )
 
     def _log_elastic_tp_gather_metadata(
         self, branch: str, logits: torch.Tensor, logits_metadata: LogitsMetadata
@@ -1156,6 +1205,9 @@ class LogitsProcessor(nn.Module):
         self, logits: torch.Tensor, logits_metadata: LogitsMetadata
     ) -> torch.Tensor:
         if self.vocab_size % self.attn_tp_size == 0:
+            self._log_elastic_tp_gather_entry(
+                "all_gather_into_tensor", logits, logits_metadata
+            )
             raw_global_logits = torch.empty(
                 (
                     self.attn_tp_size,
@@ -1166,7 +1218,13 @@ class LogitsProcessor(nn.Module):
                 dtype=logits.dtype,
             )
             attn_tp_all_gather_into_tensor(raw_global_logits, logits)
-            trace_anomaly = self._elastic_tp_gather_trace_should_log(raw_global_logits)
+            global_logits = raw_global_logits.permute(1, 0, 2).reshape(
+                logits.shape[0], self.vocab_size
+            )
+            trace_anomaly = self._elastic_tp_gather_bad_trace_should_log(
+                self._elastic_readout_tensor_is_bad(raw_global_logits)
+                or self._elastic_readout_tensor_is_bad(global_logits)
+            )
             if trace_anomaly:
                 self._log_elastic_tp_gather_metadata(
                     "all_gather_into_tensor", logits, logits_metadata
@@ -1194,16 +1252,15 @@ class LogitsProcessor(nn.Module):
                         logits_metadata,
                     )
 
-            global_logits = raw_global_logits.permute(1, 0, 2).reshape(
-                logits.shape[0], self.vocab_size
-            )
-            if trace_anomaly:
                 self._log_elastic_readout_trace(
                     "tp_gather_anomaly_after_reshape",
                     global_logits,
                     logits_metadata,
                 )
         else:
+            self._log_elastic_tp_gather_entry(
+                "all_gather_list", logits, logits_metadata
+            )
             global_logits = torch.empty(
                 (self.vocab_size, logits.shape[0]),
                 device=logits.device,
