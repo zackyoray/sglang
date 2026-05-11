@@ -587,6 +587,101 @@ class LogitsProcessor(nn.Module):
             logits.dtype,
         )
 
+    def _elastic_world_logits_gather_enabled(self) -> bool:
+        if os.environ.get("SGLANG_ELASTIC_WORLD_LOGITS_GATHER", "0") != "1":
+            return False
+
+        if os.environ.get("SGLANG_ELASTIC_WORLD_LOGITS_GATHER_POST_SCALE_ONLY", "1") == "1":
+            inst = ElasticEPStateManager.instance()
+            max_ep_size = get_global_server_args().max_ep_size or 0
+            if inst is None or max_ep_size <= 0 or inst.effective_ep_size < max_ep_size:
+                return False
+
+        return True
+
+    def _gather_logits_via_world_all_reduce(
+        self, logits: torch.Tensor, logits_metadata: LogitsMetadata
+    ) -> torch.Tensor:
+        """Gather vocab shards with Mooncake WORLD all-reduce.
+
+        The generic TP all-gather path is unsafe after elastic joiner adoption.
+        This path writes only the row ranges owned by DP ranks in the current
+        TP group, then uses WORLD all_reduce(SUM) to assemble full-vocab logits.
+        """
+        if logits.shape[-1] * get_tensor_model_parallel_world_size() != self.vocab_size:
+            raise RuntimeError(
+                "Elastic WORLD logits gather expects evenly sharded vocab: "
+                f"local={logits.shape[-1]} tp={get_tensor_model_parallel_world_size()} "
+                f"vocab={self.vocab_size}"
+            )
+
+        output = torch.zeros(
+            (logits.shape[0], self.vocab_size),
+            device=logits.device,
+            dtype=logits.dtype,
+        )
+        local_tp_rank = get_tensor_model_parallel_rank()
+        shard_size = logits.shape[-1]
+        shard_start = local_tp_rank * shard_size
+        shard_end = shard_start + shard_size
+
+        tp_ranks = set(get_tp_group().ranks)
+        if logits_metadata.global_num_tokens_gpu is not None:
+            counts = [
+                int(x)
+                for x in logits_metadata.global_num_tokens_gpu.detach().cpu().tolist()
+            ]
+        else:
+            counts = [int(logits.shape[0])]
+
+        row_start = 0
+        contributed_ranges = []
+        for owner_dp_rank, count in enumerate(counts):
+            row_end = row_start + count
+            if count > 0 and owner_dp_rank in tp_ranks:
+                output[row_start:row_end, shard_start:shard_end] = logits[
+                    row_start:row_end
+                ]
+                contributed_ranges.append((owner_dp_rank, row_start, row_end))
+            row_start = row_end
+
+        if row_start != logits.shape[0]:
+            logger.warning(
+                "[Elastic EP][world-logits-gather] row count mismatch: "
+                "sum(global_num_tokens)=%d logits_rows=%d counts=%s",
+                row_start,
+                logits.shape[0],
+                counts,
+            )
+
+        if os.environ.get("SGLANG_ELASTIC_WORLD_LOGITS_GATHER_TRACE", "0") == "1":
+            local_ep_rank, global_ep_rank, offset = self._get_elastic_rank_info()
+            logger.info(
+                "[Elastic EP][world-logits-gather] local_ep_rank=%d global_ep_rank=%d "
+                "is_joiner=%s forward_mode=%s tp_rank=%d tp_group_ranks=%s "
+                "counts=%s contributed_ranges=%s shard=[%d,%d) input_shape=%s "
+                "output_shape=%s",
+                local_ep_rank,
+                global_ep_rank,
+                offset > 0,
+                logits_metadata.forward_mode,
+                local_tp_rank,
+                get_tp_group().ranks,
+                counts,
+                contributed_ranges,
+                shard_start,
+                shard_end,
+                list(logits.shape),
+                list(output.shape),
+            )
+
+        torch.distributed.all_reduce(
+            output,
+            op=torch.distributed.ReduceOp.SUM,
+            group=torch.distributed.group.WORLD,
+        )
+        return output
+
     def forward(
         self,
         input_ids,
@@ -1180,13 +1275,20 @@ class LogitsProcessor(nn.Module):
                     logits_metadata,
                 )
                 input_logits = logits
-                logits = tensor_model_parallel_all_gather(logits)
+                if self._elastic_world_logits_gather_enabled():
+                    logits = self._gather_logits_via_world_all_reduce(
+                        logits, logits_metadata
+                    )
+                    gather_branch = "generic_world_all_reduce_logits_gather"
+                else:
+                    logits = tensor_model_parallel_all_gather(logits)
+                    gather_branch = "generic_tensor_model_parallel_all_gather"
                 if self._elastic_tp_gather_bad_trace_should_log(
                     self._elastic_readout_tensor_is_bad(input_logits)
                     or self._elastic_readout_tensor_is_bad(logits)
                 ):
                     self._log_elastic_tp_gather_metadata(
-                        "generic_tensor_model_parallel_all_gather",
+                        gather_branch,
                         input_logits,
                         logits_metadata,
                     )
