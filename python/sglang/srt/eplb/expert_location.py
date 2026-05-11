@@ -393,6 +393,15 @@ def _compute_logical_to_all_physical_map(
 
     # Replace by the physical expert on local GPU or node if possible
     if moe_ep_rank is not None:
+        force_joiner_to_primary = (
+            os.environ.get("SGLANG_ELASTIC_JOINER_ROUTE_TO_PRIMARY", "0") == "1"
+        )
+        primary_ep_size = getattr(server_args, "ep_join_rank_offset", 0) or 0
+        skip_joiner_prune = (
+            force_joiner_to_primary
+            and primary_ep_size > 0
+            and moe_ep_rank >= primary_ep_size
+        )
         num_gpus_per_node = server_args.ep_size // server_args.nnodes
         num_local_gpu_physical_experts = num_physical_experts // ep_size
         num_local_node_physical_experts = (
@@ -400,6 +409,8 @@ def _compute_logical_to_all_physical_map(
         )
         for layer_id in range(num_layers):
             for logical_expert_id in range(num_logical_experts):
+                if skip_joiner_prune:
+                    continue
                 # Try to find the nearest physical expert
                 nearest_expert = _find_nearest_expert(
                     candidate_physical_expert_ids=logical_to_all_physical_map[layer_id][

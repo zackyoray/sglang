@@ -202,6 +202,14 @@ class DataParallelController:
         self.dp_budget.update_budget(obj)
 
     def update_active_ranks(self, ranks: ActiveRanksOutput):
+        if os.environ.get("SGLANG_ELASTIC_FORCE_ALL_WORKERS_ACTIVE", "0") == "1":
+            self.status = [True] * len(self.workers)
+            logger.info(
+                "[Elastic EP] Forcing all DP workers active for diagnostics: %s",
+                self.status,
+            )
+            return
+
         # `ranks.status` is sourced from the primary's NCCL TP group view
         # (see scheduler.py: dp_active_ranks from tp_group.active_ranks).
         # That TP group stays at the original dp_size (4) forever — post-
