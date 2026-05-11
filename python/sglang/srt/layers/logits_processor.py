@@ -462,6 +462,9 @@ class LogitsProcessor(nn.Module):
             local_ep_rank = get_attention_dp_rank()
         return local_ep_rank, local_ep_rank + offset, offset
 
+    def _elastic_attn_tp_size(self) -> int:
+        return getattr(self, "attn_tp_size", get_attention_tp_size())
+
     def _log_elastic_tp_gather_branch(
         self, branch: str, logits: torch.Tensor, logits_metadata: LogitsMetadata
     ) -> None:
@@ -503,7 +506,7 @@ class LogitsProcessor(nn.Module):
             tp_group.world_size,
             tp_group.ranks,
             get_attention_tp_rank(),
-            self.attn_tp_size,
+            self._elastic_attn_tp_size(),
             attn_tp_group.rank_in_group,
             attn_tp_group.world_size,
             attn_tp_group.ranks,
@@ -539,7 +542,7 @@ class LogitsProcessor(nn.Module):
             offset > 0,
             logits_metadata.forward_mode,
             get_attention_tp_rank(),
-            self.attn_tp_size,
+            self._elastic_attn_tp_size(),
             attn_tp_group.rank_in_group,
             attn_tp_group.world_size,
             attn_tp_group.ranks,
