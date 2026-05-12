@@ -356,6 +356,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.forward_pass_id = 0
         self._elastic_logits_trace_count = 0
         self._elastic_sample_trace_count = 0
+        self._elastic_forward_batch_trace_count = 0
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
         self.enable_hisparse = server_args.enable_hisparse
@@ -3459,6 +3460,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
 
+        self._log_elastic_forward_batch_trace("pre_forward", forward_batch)
         if forward_batch.forward_mode.is_decode():
             ret = self.forward_decode(
                 forward_batch,
@@ -3482,6 +3484,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         else:
             raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
 
+        self._log_elastic_forward_batch_trace("post_forward", forward_batch)
         if (
             forward_batch.global_num_tokens_cpu is not None
             and self.pp_group.is_last_rank
@@ -3515,6 +3518,35 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return default
 
     @staticmethod
+    def _elastic_trace_global_rank_allowed(
+        global_ep_rank: int, *specific_env_names: str
+    ) -> bool:
+        raw_values = [
+            os.environ.get(name, "").strip()
+            for name in (*specific_env_names, "SGLANG_ELASTIC_TRACE_GLOBAL_RANKS")
+        ]
+        raw_values = [raw for raw in raw_values if raw]
+        if not raw_values:
+            return True
+
+        allowed = set()
+        for raw in raw_values:
+            for item in raw.split(","):
+                item = item.strip()
+                if not item:
+                    continue
+                try:
+                    allowed.add(int(item))
+                except ValueError:
+                    logger.warning(
+                        "[Elastic EP][trace-filter] ignoring invalid global rank %r "
+                        "from trace filter %r",
+                        item,
+                        raw,
+                    )
+        return not allowed or global_ep_rank in allowed
+
+    @staticmethod
     def _elastic_trace_tensor_head(tensor: Optional[torch.Tensor], limit: int):
         if tensor is None:
             return None
@@ -3523,6 +3555,172 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if tensor.numel() == 0:
             return []
         return tensor.detach().flatten()[:limit].cpu().tolist()
+
+    def _elastic_forward_batch_trace_enabled(self) -> bool:
+        if os.environ.get("SGLANG_ELASTIC_FORWARD_BATCH_TRACE", "0") != "1":
+            return False
+
+        if (
+            os.environ.get("SGLANG_ELASTIC_FORWARD_BATCH_TRACE_POST_SCALE_ONLY", "1")
+            == "1"
+        ):
+            inst = ElasticEPStateManager.instance()
+            max_ep_size = self.server_args.max_ep_size or 0
+            if inst is None or max_ep_size <= 0 or inst.effective_ep_size < max_ep_size:
+                return False
+
+        if (
+            os.environ.get("SGLANG_ELASTIC_FORWARD_BATCH_TRACE_JOINER_ONLY", "0") == "1"
+            and (self.server_args.ep_join_rank_offset or 0) == 0
+        ):
+            return False
+
+        global_ep_rank = self.tp_rank + (self.server_args.ep_join_rank_offset or 0)
+        if not self._elastic_trace_global_rank_allowed(
+            global_ep_rank, "SGLANG_ELASTIC_FORWARD_BATCH_TRACE_GLOBAL_RANKS"
+        ):
+            return False
+
+        limit = self._elastic_trace_int_env(
+            "SGLANG_ELASTIC_FORWARD_BATCH_TRACE_LIMIT", 128
+        )
+        return self._elastic_forward_batch_trace_count < limit
+
+    def _elastic_trace_req_to_token_tails(
+        self, forward_batch: ForwardBatch, row_limit: int, tail_limit: int
+    ):
+        if (
+            self.req_to_token_pool is None
+            or forward_batch.req_pool_indices is None
+            or forward_batch.seq_lens is None
+        ):
+            return None
+
+        req_indices = (
+            forward_batch.req_pool_indices.detach()
+            .flatten()[:row_limit]
+            .to(torch.long)
+            .cpu()
+            .tolist()
+        )
+        seq_lens = (
+            forward_batch.seq_lens.detach()
+            .flatten()[: len(req_indices)]
+            .to(torch.long)
+            .cpu()
+            .tolist()
+        )
+
+        tails = []
+        with torch.no_grad():
+            table = self.req_to_token_pool.req_to_token
+            for req_idx, seq_len in zip(req_indices, seq_lens):
+                start = max(0, int(seq_len) - tail_limit)
+                end = int(seq_len)
+                if end <= start:
+                    locs = []
+                else:
+                    locs = table[int(req_idx), start:end].detach().cpu().tolist()
+                tails.append(
+                    {
+                        "req_pool": int(req_idx),
+                        "seq_len": int(seq_len),
+                        "range": [start, end],
+                        "locs": locs,
+                    }
+                )
+        return tails
+
+    def _elastic_trace_current_kv_checksum(
+        self, forward_batch: ForwardBatch, row_limit: int, head_limit: int
+    ):
+        if os.environ.get("SGLANG_ELASTIC_FORWARD_BATCH_TRACE_KV", "0") != "1":
+            return None
+        if self.token_to_kv_pool is None or forward_batch.out_cache_loc is None:
+            return None
+
+        layer_id = self._elastic_trace_int_env(
+            "SGLANG_ELASTIC_FORWARD_BATCH_TRACE_KV_LAYER", 0
+        )
+        try:
+            locs = forward_batch.out_cache_loc.detach().flatten()[:row_limit].to(
+                torch.long
+            )
+            if locs.numel() == 0:
+                return {"layer": layer_id, "locs": [], "shape": [], "checksum": 0.0}
+            key_buffer = self.token_to_kv_pool.get_key_buffer(layer_id)
+            selected = key_buffer.index_select(0, locs.to(key_buffer.device))
+            values = selected.detach().flatten()[:head_limit].float()
+            finite = torch.isfinite(values)
+            return {
+                "layer": layer_id,
+                "locs": locs.cpu().tolist(),
+                "shape": list(selected.shape),
+                "finite": int(finite.sum().item()),
+                "checksum_head": float(values.sum().item()) if values.numel() else 0.0,
+                "head": values.cpu().tolist(),
+            }
+        except Exception as exc:
+            return {"layer": layer_id, "error": repr(exc)}
+
+    def _log_elastic_forward_batch_trace(
+        self, tag: str, forward_batch: ForwardBatch
+    ) -> None:
+        if not self._elastic_forward_batch_trace_enabled():
+            return
+
+        row_limit = max(
+            1, self._elastic_trace_int_env("SGLANG_ELASTIC_FORWARD_BATCH_TRACE_ROWS", 2)
+        )
+        head_limit = max(
+            1, self._elastic_trace_int_env("SGLANG_ELASTIC_FORWARD_BATCH_TRACE_HEAD", 8)
+        )
+        tail_limit = max(
+            1, self._elastic_trace_int_env("SGLANG_ELASTIC_FORWARD_BATCH_TRACE_TAIL", 8)
+        )
+
+        offset = self.server_args.ep_join_rank_offset or 0
+        global_ep_rank = self.tp_rank + offset
+        rids_head = (
+            forward_batch.rids[:row_limit]
+            if getattr(forward_batch, "rids", None) is not None
+            else None
+        )
+        req_token_tails = self._elastic_trace_req_to_token_tails(
+            forward_batch, row_limit, tail_limit
+        )
+        kv_current = self._elastic_trace_current_kv_checksum(
+            forward_batch, row_limit, head_limit
+        )
+
+        self._elastic_forward_batch_trace_count += 1
+        logger.info(
+            "[Elastic EP][forward-batch-trace] tag=%s count=%d local_rank=%d "
+            "global_ep_rank=%d is_joiner=%s forward_mode=%s batch_size=%s "
+            "rids_head=%s input_ids_head=%s req_pool_head=%s seq_lens_head=%s "
+            "positions_head=%s out_cache_head=%s global_num_tokens=%s "
+            "global_num_tokens_for_logprob=%s dp_local_start=%s "
+            "dp_local_num_tokens=%s req_token_tails=%s kv_current=%s",
+            tag,
+            self._elastic_forward_batch_trace_count,
+            self.tp_rank,
+            global_ep_rank,
+            offset > 0,
+            forward_batch.forward_mode,
+            forward_batch.batch_size,
+            rids_head,
+            self._elastic_trace_tensor_head(forward_batch.input_ids, head_limit),
+            self._elastic_trace_tensor_head(forward_batch.req_pool_indices, head_limit),
+            self._elastic_trace_tensor_head(forward_batch.seq_lens, head_limit),
+            self._elastic_trace_tensor_head(forward_batch.positions, head_limit),
+            self._elastic_trace_tensor_head(forward_batch.out_cache_loc, head_limit),
+            forward_batch.global_num_tokens_cpu,
+            forward_batch.global_num_tokens_for_logprob_cpu,
+            self._elastic_trace_tensor_head(forward_batch.dp_local_start_pos, head_limit),
+            self._elastic_trace_tensor_head(forward_batch.dp_local_num_tokens, head_limit),
+            req_token_tails,
+            kv_current,
+        )
 
     def _elastic_logits_trace_enabled(self) -> bool:
         if os.environ.get("SGLANG_ELASTIC_LOGITS_TRACE", "0") != "1":
@@ -3537,6 +3735,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if (
             os.environ.get("SGLANG_ELASTIC_LOGITS_TRACE_JOINER_ONLY", "0") == "1"
             and (self.server_args.ep_join_rank_offset or 0) == 0
+        ):
+            return False
+
+        global_ep_rank = self.tp_rank + (self.server_args.ep_join_rank_offset or 0)
+        if not self._elastic_trace_global_rank_allowed(
+            global_ep_rank, "SGLANG_ELASTIC_LOGITS_TRACE_GLOBAL_RANKS"
         ):
             return False
 
@@ -3668,6 +3872,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if (
             os.environ.get("SGLANG_ELASTIC_SAMPLE_TRACE_JOINER_ONLY", "0") == "1"
             and (self.server_args.ep_join_rank_offset or 0) == 0
+        ):
+            return False
+
+        global_ep_rank = self.tp_rank + (self.server_args.ep_join_rank_offset or 0)
+        if not self._elastic_trace_global_rank_allowed(
+            global_ep_rank, "SGLANG_ELASTIC_SAMPLE_TRACE_GLOBAL_RANKS"
         ):
             return False
 

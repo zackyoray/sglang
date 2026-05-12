@@ -302,6 +302,35 @@ class LogitsProcessor(nn.Module):
         except ValueError:
             return default
 
+    @staticmethod
+    def _elastic_trace_global_rank_allowed(
+        global_ep_rank: int, *specific_env_names: str
+    ) -> bool:
+        raw_values = [
+            os.environ.get(name, "").strip()
+            for name in (*specific_env_names, "SGLANG_ELASTIC_TRACE_GLOBAL_RANKS")
+        ]
+        raw_values = [raw for raw in raw_values if raw]
+        if not raw_values:
+            return True
+
+        allowed = set()
+        for raw in raw_values:
+            for item in raw.split(","):
+                item = item.strip()
+                if not item:
+                    continue
+                try:
+                    allowed.add(int(item))
+                except ValueError:
+                    logger.warning(
+                        "[Elastic EP][trace-filter] ignoring invalid global rank %r "
+                        "from trace filter %r",
+                        item,
+                        raw,
+                    )
+        return not allowed or global_ep_rank in allowed
+
     def _elastic_readout_trace_enabled(self, ignore_limit: bool = False) -> bool:
         if os.environ.get("SGLANG_ELASTIC_READOUT_TRACE", "0") != "1":
             return False
@@ -315,6 +344,12 @@ class LogitsProcessor(nn.Module):
         if (
             os.environ.get("SGLANG_ELASTIC_READOUT_TRACE_JOINER_ONLY", "0") == "1"
             and (get_global_server_args().ep_join_rank_offset or 0) == 0
+        ):
+            return False
+
+        _, global_ep_rank, _ = self._get_elastic_rank_info()
+        if not self._elastic_trace_global_rank_allowed(
+            global_ep_rank, "SGLANG_ELASTIC_READOUT_TRACE_GLOBAL_RANKS"
         ):
             return False
 
@@ -613,6 +648,12 @@ class LogitsProcessor(nn.Module):
         if (
             os.environ.get("SGLANG_ELASTIC_CONTENT_TRACE_JOINER_ONLY", "0") == "1"
             and (get_global_server_args().ep_join_rank_offset or 0) == 0
+        ):
+            return False
+
+        _, global_ep_rank, _ = self._get_elastic_rank_info()
+        if not self._elastic_trace_global_rank_allowed(
+            global_ep_rank, "SGLANG_ELASTIC_CONTENT_TRACE_GLOBAL_RANKS"
         ):
             return False
 
