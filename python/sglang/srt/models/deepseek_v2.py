@@ -189,6 +189,52 @@ else:
 logger = logging.getLogger(__name__)
 
 
+def _elastic_trace_int_env(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+
+
+def _elastic_trace_global_rank_allowed(
+    global_ep_rank: int, *specific_env_names: str
+) -> bool:
+    raw_values = [
+        os.environ.get(name, "").strip()
+        for name in (*specific_env_names, "SGLANG_ELASTIC_TRACE_GLOBAL_RANKS")
+    ]
+    raw_values = [raw for raw in raw_values if raw]
+    if not raw_values:
+        return True
+
+    allowed = set()
+    for raw in raw_values:
+        for item in raw.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            try:
+                allowed.add(int(item))
+            except ValueError:
+                logger.warning(
+                    "[Elastic EP][trace-filter] ignoring invalid global rank %r "
+                    "from trace filter %r",
+                    item,
+                    raw,
+                )
+    return not allowed or global_ep_rank in allowed
+
+
+def _elastic_trace_tensor_head(tensor: Optional[torch.Tensor], limit: int):
+    if tensor is None:
+        return None
+    if not isinstance(tensor, torch.Tensor):
+        return tensor
+    if tensor.numel() == 0:
+        return []
+    return tensor.detach().flatten()[:limit].cpu().tolist()
+
+
 class DeepseekV2MLP(nn.Module):
     def __init__(
         self,
@@ -610,6 +656,10 @@ class DeepseekV2MoE(nn.Module):
         local_ep_rank = get_moe_expert_parallel_rank()
         offset = get_global_server_args().ep_join_rank_offset or 0
         global_ep_rank = local_ep_rank + offset
+        if not _elastic_trace_global_rank_allowed(
+            global_ep_rank, "SGLANG_ELASTIC_HIDDEN_TRACE_GLOBAL_RANKS"
+        ):
+            return
         if (
             os.environ.get("SGLANG_ELASTIC_HIDDEN_TRACE_JOINER_ONLY", "0") == "1"
             and offset == 0
@@ -2074,6 +2124,7 @@ class DeepseekV2Model(nn.Module):
         else:
             self.norm = PPMissingLayer(return_tuple=True)
         self._elastic_readout_trace_count = 0
+        self._elastic_layer_trace_counts = {}
 
         self.gemm_output_zero_allocator_size = 0
         if (
@@ -2245,6 +2296,186 @@ class DeepseekV2Model(nn.Module):
             checksum,
         )
 
+    def _elastic_layer_trace_enabled(self, layer_id: Optional[int]) -> bool:
+        if os.environ.get("SGLANG_ELASTIC_LAYER_TRACE", "0") != "1":
+            return False
+
+        if os.environ.get("SGLANG_ELASTIC_LAYER_TRACE_POST_SCALE_ONLY", "1") == "1":
+            inst = ElasticEPStateManager.instance()
+            max_ep_size = get_global_server_args().max_ep_size or 0
+            if (
+                inst is None
+                or max_ep_size <= 0
+                or inst.effective_ep_size < max_ep_size
+            ):
+                return False
+
+        offset = get_global_server_args().ep_join_rank_offset or 0
+        if (
+            os.environ.get("SGLANG_ELASTIC_LAYER_TRACE_JOINER_ONLY", "0") == "1"
+            and offset == 0
+        ):
+            return False
+
+        local_ep_rank = get_moe_expert_parallel_rank()
+        global_ep_rank = local_ep_rank + offset
+        if not _elastic_trace_global_rank_allowed(
+            global_ep_rank, "SGLANG_ELASTIC_LAYER_TRACE_GLOBAL_RANKS"
+        ):
+            return False
+
+        if layer_id is None:
+            return True
+
+        layers = os.environ.get("SGLANG_ELASTIC_LAYER_TRACE_LAYERS", "0")
+        if layers.strip() == "*":
+            return True
+        try:
+            return layer_id in {int(x) for x in layers.split(",") if x.strip()}
+        except ValueError:
+            return layer_id == 0
+
+    def _log_elastic_layer_trace(
+        self,
+        tag: str,
+        tensor: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+        layer_id: Optional[int] = None,
+    ) -> None:
+        if not self._elastic_layer_trace_enabled(layer_id):
+            return
+
+        limit = _elastic_trace_int_env("SGLANG_ELASTIC_LAYER_TRACE_LIMIT", 128)
+        key = (tag, layer_id)
+        count = self._elastic_layer_trace_counts.get(key, 0)
+        if count >= limit:
+            return
+        self._elastic_layer_trace_counts[key] = count + 1
+
+        row_limit = max(1, _elastic_trace_int_env("SGLANG_ELASTIC_LAYER_TRACE_ROWS", 1))
+        head_limit = max(1, _elastic_trace_int_env("SGLANG_ELASTIC_LAYER_TRACE_HEAD", 8))
+        topk = max(1, _elastic_trace_int_env("SGLANG_ELASTIC_LAYER_TRACE_TOPK", 8))
+
+        local_ep_rank = get_moe_expert_parallel_rank()
+        offset = get_global_server_args().ep_join_rank_offset or 0
+        global_ep_rank = local_ep_rank + offset
+        rids_head = (
+            forward_batch.rids[:row_limit]
+            if getattr(forward_batch, "rids", None) is not None
+            else None
+        )
+
+        if tensor is None:
+            logger.info(
+                "[Elastic EP][layer-trace] tag=%s count=%d layer=%s "
+                "local_ep_rank=%d global_ep_rank=%d is_joiner=%s "
+                "forward_mode=%s batch_size=%s rids_head=%s input_ids_head=%s "
+                "req_pool_head=%s seq_lens_head=%s positions_head=%s "
+                "out_cache_head=%s tensor=None",
+                tag,
+                count + 1,
+                layer_id,
+                local_ep_rank,
+                global_ep_rank,
+                offset > 0,
+                forward_batch.forward_mode,
+                forward_batch.batch_size,
+                rids_head,
+                _elastic_trace_tensor_head(forward_batch.input_ids, head_limit),
+                _elastic_trace_tensor_head(forward_batch.req_pool_indices, head_limit),
+                _elastic_trace_tensor_head(forward_batch.seq_lens, head_limit),
+                _elastic_trace_tensor_head(forward_batch.positions, head_limit),
+                _elastic_trace_tensor_head(forward_batch.out_cache_loc, head_limit),
+            )
+            return
+
+        with torch.no_grad():
+            detached = tensor.detach()
+            numel = detached.numel()
+            if numel == 0:
+                logger.info(
+                    "[Elastic EP][layer-trace] tag=%s count=%d layer=%s "
+                    "local_ep_rank=%d global_ep_rank=%d is_joiner=%s "
+                    "forward_mode=%s batch_size=%s rids_head=%s shape=%s "
+                    "dtype=%s numel=0",
+                    tag,
+                    count + 1,
+                    layer_id,
+                    local_ep_rank,
+                    global_ep_rank,
+                    offset > 0,
+                    forward_batch.forward_mode,
+                    forward_batch.batch_size,
+                    rids_head,
+                    list(detached.shape),
+                    detached.dtype,
+                )
+                return
+
+            values = detached.float()
+            finite = torch.isfinite(values)
+            finite_count = int(finite.sum().item())
+            nan_count = int(torch.isnan(values).sum().item())
+            inf_count = int(torch.isinf(values).sum().item())
+            if finite_count > 0:
+                finite_values = values[finite]
+                mean = float(finite_values.mean().item())
+                std = float(finite_values.std(unbiased=False).item())
+                min_value = float(finite_values.min().item())
+                max_value = float(finite_values.max().item())
+                max_abs = float(finite_values.abs().max().item())
+            else:
+                mean = std = min_value = max_value = max_abs = float("nan")
+
+            checksum = float(values.flatten()[: min(1024, numel)].sum().item())
+            rows = values.reshape(-1, values.shape[-1])[:row_limit]
+            top_ids = []
+            top_values = []
+            for row in rows:
+                finite_row = torch.where(torch.isfinite(row), row, torch.zeros_like(row))
+                k = min(topk, finite_row.numel())
+                vals, ids = torch.topk(finite_row, k=k)
+                top_ids.append(ids.cpu().tolist())
+                top_values.append(vals.cpu().tolist())
+
+        logger.info(
+            "[Elastic EP][layer-trace] tag=%s count=%d layer=%s "
+            "local_ep_rank=%d global_ep_rank=%d is_joiner=%s forward_mode=%s "
+            "batch_size=%s rids_head=%s input_ids_head=%s req_pool_head=%s "
+            "seq_lens_head=%s positions_head=%s out_cache_head=%s shape=%s "
+            "dtype=%s numel=%d finite=%d nan=%d inf=%d mean=%.6g std=%.6g "
+            "min=%.6g max=%.6g max_abs=%.6g checksum1024=%.6g "
+            "top_ids=%s top_values=%s",
+            tag,
+            count + 1,
+            layer_id,
+            local_ep_rank,
+            global_ep_rank,
+            offset > 0,
+            forward_batch.forward_mode,
+            forward_batch.batch_size,
+            rids_head,
+            _elastic_trace_tensor_head(forward_batch.input_ids, head_limit),
+            _elastic_trace_tensor_head(forward_batch.req_pool_indices, head_limit),
+            _elastic_trace_tensor_head(forward_batch.seq_lens, head_limit),
+            _elastic_trace_tensor_head(forward_batch.positions, head_limit),
+            _elastic_trace_tensor_head(forward_batch.out_cache_loc, head_limit),
+            list(detached.shape),
+            detached.dtype,
+            numel,
+            finite_count,
+            nan_count,
+            inf_count,
+            mean,
+            std,
+            min_value,
+            max_value,
+            max_abs,
+            checksum,
+            top_ids,
+            top_values,
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -2291,6 +2522,13 @@ class DeepseekV2Model(nn.Module):
                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
 
+        self._log_elastic_layer_trace(
+            "model_input_hidden", hidden_states, forward_batch, layer_id=None
+        )
+        self._log_elastic_layer_trace(
+            "model_input_residual", residual, forward_batch, layer_id=None
+        )
+
         # llama_4_scaling: for supporting Mistral-Large-3 model
         # Compute llama 4 scaling once per forward pass if enabled
         llama_4_scaling: Optional[torch.Tensor] = None
@@ -2323,6 +2561,12 @@ class DeepseekV2Model(nn.Module):
                 else get_global_expert_distribution_recorder().with_current_layer(i)
             )
             with ctx:
+                self._log_elastic_layer_trace(
+                    "layer_input_hidden", hidden_states, forward_batch, layer_id=i
+                )
+                self._log_elastic_layer_trace(
+                    "layer_input_residual", residual, forward_batch, layer_id=i
+                )
                 if i in self.layers_to_capture:
                     if self.enable_a2a_moe and i > self.first_k_dense_replace:
                         aux_hidden_state = get_attention_tp_group().all_gather(
@@ -2341,6 +2585,12 @@ class DeepseekV2Model(nn.Module):
                     gemm_output_zero_allocator,
                     llama_4_scaling,
                     prev_topk_indices=topk_indices,
+                )
+                self._log_elastic_layer_trace(
+                    "layer_output_hidden", hidden_states, forward_batch, layer_id=i
+                )
+                self._log_elastic_layer_trace(
+                    "layer_output_residual", residual, forward_batch, layer_id=i
                 )
 
         if normal_end_layer != self.end_layer:

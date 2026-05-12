@@ -3647,18 +3647,28 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 torch.long
             )
             if locs.numel() == 0:
-                return {"layer": layer_id, "locs": [], "shape": [], "checksum": 0.0}
+                return {"layer": layer_id, "locs": [], "key": None, "value": None}
+
+            def summarize_buffer(buffer: torch.Tensor):
+                selected = buffer.index_select(0, locs.to(buffer.device))
+                values = selected.detach().flatten()[:head_limit].float()
+                finite = torch.isfinite(values)
+                return {
+                    "shape": list(selected.shape),
+                    "finite": int(finite.sum().item()),
+                    "checksum_head": (
+                        float(values.sum().item()) if values.numel() else 0.0
+                    ),
+                    "head": values.cpu().tolist(),
+                }
+
             key_buffer = self.token_to_kv_pool.get_key_buffer(layer_id)
-            selected = key_buffer.index_select(0, locs.to(key_buffer.device))
-            values = selected.detach().flatten()[:head_limit].float()
-            finite = torch.isfinite(values)
+            value_buffer = self.token_to_kv_pool.get_value_buffer(layer_id)
             return {
                 "layer": layer_id,
                 "locs": locs.cpu().tolist(),
-                "shape": list(selected.shape),
-                "finite": int(finite.sum().item()),
-                "checksum_head": float(values.sum().item()) if values.numel() else 0.0,
-                "head": values.cpu().tolist(),
+                "key": summarize_buffer(key_buffer),
+                "value": summarize_buffer(value_buffer),
             }
         except Exception as exc:
             return {"layer": layer_id, "error": repr(exc)}
