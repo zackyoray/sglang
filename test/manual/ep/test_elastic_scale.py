@@ -583,6 +583,18 @@ class _ElasticScaleUpEndToEndBase(CustomTestCase):
             if fixed_prompt_index_env.strip()
             else None
         )
+        target_sequence_env = os.environ.get(
+            "SGLANG_ELASTIC_WORKER_PROBE_TARGETS", ""
+        ).strip()
+        target_sequence = (
+            [
+                int(item.strip())
+                for item in target_sequence_env.split(",")
+                if item.strip()
+            ]
+            if target_sequence_env
+            else []
+        )
         report_dir = os.environ.get(
             "SGLANG_ELASTIC_GSM8K_REPORT_DIR",
             "/lustre/fsw/portfolios/coreai/users/yorayz/logs",
@@ -595,13 +607,17 @@ class _ElasticScaleUpEndToEndBase(CustomTestCase):
         print(
             f"[TEST][worker-probe] start url={url} "
             f"num_requests={num_requests} max_tokens={max_tokens} "
-            f"fixed_prompt_index={fixed_prompt_index}",
+            f"fixed_prompt_index={fixed_prompt_index} "
+            f"targets={target_sequence}",
             flush=True,
         )
 
         results = []
         for i in range(num_requests):
             prompt_index = fixed_prompt_index if fixed_prompt_index is not None else i
+            routed_dp_rank = (
+                target_sequence[i % len(target_sequence)] if target_sequence else None
+            )
             payload = {
                 "model": self.model,
                 "prompt": _worker_probe_prompt(prompt_index),
@@ -609,6 +625,8 @@ class _ElasticScaleUpEndToEndBase(CustomTestCase):
                 "temperature": 0.0,
                 "stop": ["Question", "Assistant:", "<|separator|>"],
             }
+            if routed_dp_rank is not None:
+                payload["routed_dp_rank"] = routed_dp_rank
             t0 = time.perf_counter()
             resp = requests.post(url, json=payload, timeout=180)
             latency = time.perf_counter() - t0
@@ -620,6 +638,7 @@ class _ElasticScaleUpEndToEndBase(CustomTestCase):
             result = {
                 "probe_index": i,
                 "prompt_index": prompt_index,
+                "routed_dp_rank": routed_dp_rank,
                 "rid": rid,
                 "status_code": resp.status_code,
                 "latency": latency,
@@ -628,7 +647,8 @@ class _ElasticScaleUpEndToEndBase(CustomTestCase):
             }
             results.append(result)
             print(
-                f"[TEST][worker-probe] request {i} prompt_index={prompt_index} done rid={rid} "
+                f"[TEST][worker-probe] request {i} prompt_index={prompt_index} "
+                f"routed_dp_rank={routed_dp_rank} done rid={rid} "
                 f"status={resp.status_code} latency={latency:.2f}s "
                 f"looks_correct={result['looks_correct']} "
                 f"text={text[:120].replace(chr(10), ' ')}",
