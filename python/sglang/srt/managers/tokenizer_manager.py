@@ -225,6 +225,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
     ):
         # Parse args
         self.server_args = server_args
+        self.elastic_worker_count = server_args.dp_size
         self.enable_metrics = server_args.enable_metrics
         self.preferred_sampling_params = server_args.preferred_sampling_params
         self.crash_dump_folder = server_args.crash_dump_folder
@@ -545,7 +546,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
             )
 
         if isinstance(obj, GenerateReqInput) and obj.routed_dp_rank is not None:
-            dp_size = self.server_args.dp_size
+            dp_size = self.elastic_worker_count
             if dp_size <= 1 and obj.routed_dp_rank == 0:
                 logger.warning(
                     f"routed_dp_rank={obj.routed_dp_rank} is ignored because dp_size={dp_size}"
@@ -2414,6 +2415,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
 
     def forward_elastic_scale_ports(self, msg: ElasticScaleWorkerPortsReq):
         worker_count = self.server_args.dp_size + len(msg.new_worker_ports)
+        self.elastic_worker_count = worker_count
         self.update_control_communicator_fan_out(worker_count)
         logger.info(
             "[Elastic EP] TokenizerManager observed elastic worker count %d",
