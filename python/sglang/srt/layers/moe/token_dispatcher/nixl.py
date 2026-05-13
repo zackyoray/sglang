@@ -525,6 +525,13 @@ class _NixlEPDispatcherImplBase:
         self._phase_heartbeat = (
             _os.environ.get("SGLANG_NIXL_PHASE_HEARTBEAT", "0") == "1"
         )
+        # SGLANG_ELASTIC_NIXL_DIAG gates the bounded `[nixl][traffic]`,
+        # `[nixl][post-wait]`, `[nixl][debug]`, `[nixl][mapping]`, and
+        # `[nixl][mask-flip]` diagnostics. Each is also self-capped per
+        # ep-change; this gate lets us turn them all off in a clean run.
+        self._nixl_diag = (
+            _os.environ.get("SGLANG_ELASTIC_NIXL_DIAG", "0") == "1"
+        )
         self._phase_seq = 0
         # Track previous mask snapshot so we only log mask transitions
         # (flips), not the every-combine state. This avoids spam.
@@ -808,12 +815,14 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
         # post-scale, NIXL is innocent — the bug is in the per-rank
         # `logical_to_rank_dispatch_physical_map`, not the late-add
         # NIXL handshake. Logged on EVERY rank so we get a symmetric
-        # picture for each scale event.
-        if getattr(self, "_traffic_diag_ep", None) != _ep:
+        # picture for each scale event. Gated by SGLANG_ELASTIC_NIXL_DIAG
+        # since session 68; was indispensable for sessions 9-13.
+        if self._nixl_diag and getattr(self, "_traffic_diag_ep", None) != _ep:
             self._traffic_diag_ep = _ep
             self._traffic_diag_count = 0
         if (
-            getattr(self, "_traffic_diag_count", 0) < 5
+            self._nixl_diag
+            and getattr(self, "_traffic_diag_count", 0) < 5
             and NixlEPBuffer._num_local_experts
             and _ep
         ):
@@ -901,10 +910,14 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
         # Use the BUFFER-level `_ep_size` so the gate fires both pre- and
         # post-scale.
         _ep = NixlEPBuffer._ep_size
-        if getattr(self, "_postwait_diag_ep", None) != _ep:
+        if self._nixl_diag and getattr(self, "_postwait_diag_ep", None) != _ep:
             self._postwait_diag_ep = _ep
             self._postwait_diag_count = 0
-        if getattr(self, "_postwait_diag_count", 0) < 5 and _ep:
+        if (
+            self._nixl_diag
+            and getattr(self, "_postwait_diag_count", 0) < 5
+            and _ep
+        ):
             try:
                 m_list = masked_m.cpu().tolist()
                 m_sum = int(sum(m_list))
@@ -977,53 +990,55 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
             #    what the primary broadcast + local expansion produced
             #    (p2l.sum is a global identity check across ranks; rtr
             #    rows show where THIS rank routes its own logicals).
-            try:
-                mask_vals: Optional[List[int]] = None
-                if self._mask_buffer is not None:
-                    tmp_mask = torch.zeros_like(self._mask_buffer)
-                    buffer.query_mask_buffer(tmp_mask)
-                    mask_vals = tmp_mask[: max(_cep, 8)].tolist()
-                logger.info(
-                    "[Elastic EP][nixl][debug] pre-dispatch NIXL state: "
-                    "buffer.num_ranks=%s buffer.group_size=%s "
-                    "mask[0:%d](0=alive,1=faulted)=%s",
-                    getattr(buffer, "num_ranks", "N/A"),
-                    buffer.group_size,
-                    max(_cep, 8),
-                    mask_vals,
-                )
-            except Exception as _e:
-                logger.warning(
-                    "[Elastic EP][nixl][debug] pre-dispatch state probe failed: %s",
-                    _e,
-                )
-
-            try:
-                from sglang.srt.eplb.expert_location import (
-                    get_global_expert_location_metadata,
-                )
-                md = get_global_expert_location_metadata()
-                if md is not None:
-                    p2l = md.physical_to_logical_map
-                    rtr = md.logical_to_rank_dispatch_physical_map
+            # Gated by SGLANG_ELASTIC_NIXL_DIAG since session 68.
+            if self._nixl_diag:
+                try:
+                    mask_vals: Optional[List[int]] = None
+                    if self._mask_buffer is not None:
+                        tmp_mask = torch.zeros_like(self._mask_buffer)
+                        buffer.query_mask_buffer(tmp_mask)
+                        mask_vals = tmp_mask[: max(_cep, 8)].tolist()
                     logger.info(
-                        "[Elastic EP][nixl][mapping] live metadata: "
-                        "p2l.shape=%s p2l.sum=%d "
-                        "p2l[0,0:8]=%s p2l[0,-8:]=%s "
-                        "rtr.shape=%s rtr[0,0:8]=%s rtr[0,-8:]=%s",
-                        list(p2l.shape),
-                        int(p2l.sum().item()),
-                        p2l[0, :8].tolist(),
-                        p2l[0, -8:].tolist(),
-                        list(rtr.shape) if rtr is not None else None,
-                        rtr[0, :8].tolist() if rtr is not None else None,
-                        rtr[0, -8:].tolist() if rtr is not None else None,
+                        "[Elastic EP][nixl][debug] pre-dispatch NIXL state: "
+                        "buffer.num_ranks=%s buffer.group_size=%s "
+                        "mask[0:%d](0=alive,1=faulted)=%s",
+                        getattr(buffer, "num_ranks", "N/A"),
+                        buffer.group_size,
+                        max(_cep, 8),
+                        mask_vals,
                     )
-            except Exception as _e:
-                logger.warning(
-                    "[Elastic EP][nixl][mapping] metadata probe failed: %s",
-                    _e,
-                )
+                except Exception as _e:
+                    logger.warning(
+                        "[Elastic EP][nixl][debug] pre-dispatch state probe failed: %s",
+                        _e,
+                    )
+
+                try:
+                    from sglang.srt.eplb.expert_location import (
+                        get_global_expert_location_metadata,
+                    )
+                    md = get_global_expert_location_metadata()
+                    if md is not None:
+                        p2l = md.physical_to_logical_map
+                        rtr = md.logical_to_rank_dispatch_physical_map
+                        logger.info(
+                            "[Elastic EP][nixl][mapping] live metadata: "
+                            "p2l.shape=%s p2l.sum=%d "
+                            "p2l[0,0:8]=%s p2l[0,-8:]=%s "
+                            "rtr.shape=%s rtr[0,0:8]=%s rtr[0,-8:]=%s",
+                            list(p2l.shape),
+                            int(p2l.sum().item()),
+                            p2l[0, :8].tolist(),
+                            p2l[0, -8:].tolist(),
+                            list(rtr.shape) if rtr is not None else None,
+                            rtr[0, :8].tolist() if rtr is not None else None,
+                            rtr[0, -8:].tolist() if rtr is not None else None,
+                        )
+                except Exception as _e:
+                    logger.warning(
+                        "[Elastic EP][nixl][mapping] metadata probe failed: %s",
+                        _e,
+                    )
             self._last_logged_cep = _cep
         nixl_num_experts = NixlEPBuffer._num_local_experts * NixlEPBuffer._ep_size
         if hidden_states.shape[0] > self.num_max_dispatch_tokens_per_rank:
