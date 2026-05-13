@@ -867,6 +867,88 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
                     total_tokens,
                 )
 
+        # Diagnostic: per-dispatch max tokens routed from this source rank to
+        # any single destination physical expert. NIXL's per-(src_rank, dst
+        # expert) receive buffer is capped at `num_max_dispatch_tokens_per_rank`
+        # (set to 1024 in run_scale.sh). If a single dispatch crosses that
+        # cap — possible under THREADS>=4 prefill bursts when the rtr is
+        # frozen by the disabled post-scale EPLB rebalance and a hot logical
+        # expert routes all its traffic to one physical copy from this rank
+        # — the kernel writes past the buffer and we get
+        # `nixl_ep_ll.cu:444 'illegal memory access'`. Gated by
+        # SGLANG_ELASTIC_HOTSPOT_CHECK=1. Logs at most
+        # SGLANG_ELASTIC_HOTSPOT_CHECK_LIMIT samples per process when the
+        # observed max approaches or exceeds the cap.
+        if (
+            os.environ.get("SGLANG_ELASTIC_HOTSPOT_CHECK", "0") == "1"
+            and topk_ids.numel() > 0
+            and NixlEPBuffer._num_local_experts
+            and ep_size
+        ):
+            with torch.no_grad():
+                valid = topk_ids[topk_ids >= 0]
+                if valid.numel() > 0:
+                    num_total_physical = (
+                        NixlEPBuffer._num_local_experts * ep_size
+                    )
+                    counts = torch.bincount(
+                        valid.to(torch.int64),
+                        minlength=num_total_physical,
+                    )
+                    hot_count = int(counts.max().item())
+                    hot_expert = int(counts.argmax().item())
+                    hot_rank = hot_expert // NixlEPBuffer._num_local_experts
+                else:
+                    hot_count = 0
+                    hot_expert = -1
+                    hot_rank = -1
+
+            cap = self.num_max_dispatch_tokens_per_rank
+            warn_pct = int(
+                os.environ.get("SGLANG_ELASTIC_HOTSPOT_CHECK_WARN_PCT", "50")
+            )
+            warn_threshold = (cap * warn_pct) // 100
+            if hot_count >= warn_threshold:
+                if not hasattr(self, "_hotspot_logged"):
+                    self._hotspot_logged = 0
+                limit = int(
+                    os.environ.get(
+                        "SGLANG_ELASTIC_HOTSPOT_CHECK_LIMIT", "16"
+                    )
+                )
+                if self._hotspot_logged < limit:
+                    self._hotspot_logged += 1
+                    offset = (
+                        ElasticEPStateManager.get_ep_join_rank_offset() or 0
+                    )
+                    try:
+                        local_rank = dist.get_rank(self.group)
+                    except Exception:
+                        local_rank = -1
+                    over_cap = "OVER_CAP" if hot_count >= cap else "warn"
+                    logger.warning(
+                        "[Elastic EP][topk-hotspot] sample=%d/%d severity=%s "
+                        "local_rank=%d global_rank=%d ep=%d "
+                        "num_hidden_tokens=%d topk=%d "
+                        "max_tokens_to_one_dst_expert=%d "
+                        "(cap=%d, warn=%d at %d%%) "
+                        "hot_dst_physical_expert=%d hot_dst_rank=%d",
+                        self._hotspot_logged,
+                        limit,
+                        over_cap,
+                        local_rank,
+                        local_rank + offset,
+                        ep_size,
+                        int(topk_ids.shape[0]),
+                        int(topk_ids.shape[1]) if topk_ids.dim() > 1 else 1,
+                        hot_count,
+                        cap,
+                        warn_threshold,
+                        warn_pct,
+                        hot_expert,
+                        hot_rank,
+                    )
+
         _ep = NixlEPBuffer._ep_size
         if getattr(self, "_shapes_logged_ep", None) != _ep:
             logger.info(
