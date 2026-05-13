@@ -800,10 +800,27 @@ class LogitsProcessor(nn.Module):
     ) -> List[int]:
         """Map hidden-token counts to the pruned logits rows being gathered.
 
-        LogitsProcessor often reduces a long prefill/extend to one sampled
-        next-token row, while global_num_tokens_gpu still describes all prompt
-        hidden tokens. In that common case, the single logits row belongs to the
-        only DP rank with tokens.
+        LogitsProcessor often reduces long prefill/extend hidden states to one
+        sampled next-token row per DP rank that has tokens, while
+        global_num_tokens_gpu still describes the full prompt token spread.
+        Three cases this function distinguishes:
+
+          1. ``total_tokens == num_logit_rows``: full per-token logits
+             (e.g. greedy logprobs, draft-token expansion). Identity map.
+          2. ``num_logit_rows == 1`` and only one rank has tokens: the single
+             logits row belongs to that rank. Map [0,...,1,...,0].
+          3. ``num_logit_rows == len(nonzero)``: last-token-only prefill across
+             multiple DP ranks (the GSM8K post-scale shape). Each rank with
+             tokens contributes exactly one row in order.
+          4. Otherwise: warn and fall back to a safe last-token-only mapping if
+             ``num_logit_rows <= len(nonzero)``, else identity.
+
+        Returning the wrong mapping causes the caller's
+        ``output[row_start:row_end, shard_start:shard_end] = logits[...]`` to
+        attempt OOB slices (silently empty in PyTorch), so the WORLD all-reduce
+        observes garbage for any DP rank whose `row_end > num_logit_rows`. That
+        used to silently corrupt joiner-owned prefill logits during concurrent
+        GSM8K decodes.
         """
         total_tokens = sum(token_counts)
         num_logit_rows = int(logits.shape[0])
@@ -811,9 +828,34 @@ class LogitsProcessor(nn.Module):
             return token_counts
 
         nonzero = [idx for idx, count in enumerate(token_counts) if count > 0]
+
         if num_logit_rows == 1 and len(nonzero) == 1:
             row_counts = [0] * len(token_counts)
             row_counts[nonzero[0]] = 1
+            return row_counts
+
+        if num_logit_rows == len(nonzero):
+            row_counts = [0] * len(token_counts)
+            for idx in nonzero:
+                row_counts[idx] = 1
+            return row_counts
+
+        if num_logit_rows < len(nonzero) and num_logit_rows > 0:
+            # Defensive: bind the first `num_logit_rows` nonzero rank slots,
+            # leave the rest at zero. Caller still gets a valid mapping; any
+            # joiner-owned rows beyond the cut will be skipped rather than
+            # producing OOB slices.
+            logger.warning(
+                "[Elastic EP][world-logits-gather] truncating token-to-row "
+                "mapping: num_logit_rows=%d < nonzero_dp_ranks=%d "
+                "token_counts=%s",
+                num_logit_rows,
+                len(nonzero),
+                token_counts,
+            )
+            row_counts = [0] * len(token_counts)
+            for idx in nonzero[:num_logit_rows]:
+                row_counts[idx] = 1
             return row_counts
 
         logger.warning(
