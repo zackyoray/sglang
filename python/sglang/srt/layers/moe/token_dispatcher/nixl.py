@@ -786,6 +786,87 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
             + self.num_experts
         ) // self.num_experts
 
+        # Diagnostic: a single token must not list the same physical expert id
+        # more than once in its topk vector. If it does, the NIXL low-latency
+        # dispatch kernel will enqueue an extra slot for the same
+        # (src_rank, dst_expert) destination per duplicate, burning per-rank
+        # send-buffer capacity (Phase 4.5). The synthetic standalone probe
+        # `probe_rtr_duplicates.py` showed that the trivial post-scale rtr is
+        # duplicate-free, but the runtime rtr could differ if EPLB rebalances
+        # mutate the layout. Gated by SGLANG_ELASTIC_TOPK_DEDUP_CHECK=1; logs
+        # at most SGLANG_ELASTIC_TOPK_DEDUP_CHECK_LIMIT (default 8) sample
+        # offending rows per process, and emits a one-time "clean" line per
+        # ep_size when no duplicates are observed.
+        if (
+            os.environ.get("SGLANG_ELASTIC_TOPK_DEDUP_CHECK", "0") == "1"
+            and topk_ids.numel() > 0
+        ):
+            with torch.no_grad():
+                # Replace -1 placeholders so they don't compare equal to each
+                # other after sorting; per-row sort + adjacent-equal is the
+                # cheapest GPU check.
+                masked = torch.where(
+                    topk_ids >= 0,
+                    topk_ids,
+                    torch.full_like(topk_ids, -1),
+                )
+                sorted_ids, _ = torch.sort(masked, dim=-1)
+                adj_eq = (sorted_ids[:, 1:] == sorted_ids[:, :-1]) & (
+                    sorted_ids[:, :-1] >= 0
+                )
+                dup_rows_mask = adj_eq.any(dim=-1)
+                dup_token_count = int(dup_rows_mask.sum().item())
+                total_tokens = int(topk_ids.shape[0])
+
+            if dup_token_count > 0:
+                if not hasattr(self, "_topk_dedup_logged"):
+                    self._topk_dedup_logged = 0
+                limit = int(
+                    os.environ.get(
+                        "SGLANG_ELASTIC_TOPK_DEDUP_CHECK_LIMIT", "8"
+                    )
+                )
+                if self._topk_dedup_logged < limit:
+                    self._topk_dedup_logged += 1
+                    with torch.no_grad():
+                        first_dup_idx = int(
+                            dup_rows_mask.nonzero(as_tuple=False)[0, 0].item()
+                        )
+                        bad_row = topk_ids[first_dup_idx].cpu().tolist()
+                    offset = (
+                        ElasticEPStateManager.get_ep_join_rank_offset() or 0
+                    )
+                    try:
+                        local_rank = dist.get_rank(self.group)
+                    except Exception:
+                        local_rank = -1
+                    logger.warning(
+                        "[Elastic EP][topk-dedup] sample=%d/%d local_rank=%d "
+                        "global_rank=%d ep_size=%d "
+                        "dup_tokens_this_dispatch=%d/%d "
+                        "first_dup_row_idx=%d row=%s",
+                        self._topk_dedup_logged,
+                        limit,
+                        local_rank,
+                        local_rank + offset,
+                        ep_size,
+                        dup_token_count,
+                        total_tokens,
+                        first_dup_idx,
+                        bad_row,
+                    )
+            elif (
+                not hasattr(self, "_topk_dedup_ok_logged_ep")
+                or self._topk_dedup_ok_logged_ep != ep_size
+            ):
+                self._topk_dedup_ok_logged_ep = ep_size
+                logger.info(
+                    "[Elastic EP][topk-dedup] ep=%d clean: 0/%d tokens "
+                    "have duplicate physical-ids in their topk vector",
+                    ep_size,
+                    total_tokens,
+                )
+
         _ep = NixlEPBuffer._ep_size
         if getattr(self, "_shapes_logged_ep", None) != _ep:
             logger.info(
