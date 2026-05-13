@@ -356,15 +356,36 @@ def initialize_dp_attention(
             # at init — use local TP group. Switch when adopted by primary.
             global _ELASTIC_JOINER_SKIP_ALL_GATHER
             if server_args.ep_join_mode in ("scale", "recover"):
+                # Skip runtime DP collectives (prepare_mlp_sync_batch,
+                # _dp_gather_via_all_reduce, _dp_gather_via_all_gather) until
+                # the joiner is adopted by the primary's DataParallelController.
+                # `enable_joiner_all_gather()` clears this flag at adoption.
                 _ELASTIC_JOINER_SKIP_ALL_GATHER = True
-                # Joiner's warmup / forward_idle must not exercise the
-                # dp_attention machinery: its globals (_DpGatheredBufferWrapper
-                # class vars, dp_padding_mode, …) are populated by
-                # prepare_mlp_sync_batch, which the joiner skips until it is
-                # adopted by the primary's DataParallelController. Keep
-                # dp_attention fully disabled on the joiner until
-                # enable_joiner_all_gather() flips it back on at adoption.
-                _ENABLE_DP_ATTENTION_FLAG = False
+                # NOTE (elastic-ep, session 68): we deliberately do NOT clear
+                # `_ENABLE_DP_ATTENTION_FLAG` here. The previous "disable
+                # dp_attention fully on joiner until adoption" approach
+                # (commit 2cfaeb473) cascaded into construction-time decisions
+                # because several modules read `is_dp_attention_enabled()` at
+                # __init__ time:
+                #   - VocabParallelEmbedding(use_attn_tp_group=...)
+                #     (deepseek_v2.py:2074)
+                #   - Sampler.tp_sync_group (sampler.py:46)
+                #   - AttnTpContext.allow_input_scattered
+                #     (communicator.py:264)
+                #   - cache_controller.tp_size/tp_rank
+                #     (cache_controller.py:591)
+                # With the flag cleared, the joiner constructed `embed_tokens`
+                # / `Sampler` / `AttnTpContext` as a standalone TP=4 model
+                # rather than a DP=4-attn_tp=1 participant matching the
+                # primary. Re-enabling the flag at adoption fixed only the
+                # runtime view; the model's parameters and shapes stayed in
+                # the TP=4 layout, producing semantically wrong joiner-owned
+                # logits after WORLD logits gather. The unified-forward
+                # design requires both halves to be DP=N-attn_tp=1 with the
+                # same vocab/embedding/sampler shapes, so we keep
+                # `_ENABLE_DP_ATTENTION_FLAG=True` at init and rely
+                # exclusively on `_ELASTIC_JOINER_SKIP_ALL_GATHER` to suppress
+                # the runtime collectives that would deadlock pre-adoption.
         if moe_dense_tp_size is None:
             _LOCAL_ATTN_DP_SIZE = _ATTN_DP_SIZE
         else:
