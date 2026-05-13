@@ -66,6 +66,22 @@ os.environ.setdefault("SGLANG_NIXL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK", "1024")
 
 ib_devices = get_rdma_devices_args()
 
+
+def _extra_server_args() -> list[str]:
+    """Optional extra `--flag [value]` tokens to append to every spawned
+    server. Set via SGLANG_ELASTIC_EXTRA_SERVER_ARGS as a single
+    space-separated string; e.g.
+
+        SGLANG_ELASTIC_EXTRA_SERVER_ARGS='--disable-overlap-schedule'
+
+    Used as a per-run knob to probe specific server-arg combinations
+    (e.g. overlap-schedule on/off for the NIXL concurrency-cliff bug)
+    without permanently changing SERVER_ARGS.
+    """
+    raw = os.environ.get("SGLANG_ELASTIC_EXTRA_SERVER_ARGS", "").strip()
+    return raw.split() if raw else []
+
+
 SERVER_ARGS = [
     "--trust-remote-code",
     "--moe-a2a-backend",
@@ -88,7 +104,7 @@ SERVER_ARGS = [
     "8",
     "--mem-fraction-static",
     "0.5",
-]
+] + _extra_server_args()
 
 
 class TestElasticScaleServerLaunch(CustomTestCase):
@@ -203,7 +219,7 @@ COLD_START_8RANK_ARGS = [
     "--chunked-prefill-size",
     "1024",
     "--disable-cuda-graph",
-]
+] + _extra_server_args()
 
 
 @unittest.skipUnless(
@@ -346,7 +362,7 @@ def _scale_up_common_args(
         str(node_rank),
         "--dist-init-addr",
         dist_init_addr,
-    ]
+    ] + _extra_server_args()
 
 
 class _ElasticScaleUpEndToEndBase(CustomTestCase):
