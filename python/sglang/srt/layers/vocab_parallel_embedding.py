@@ -1,6 +1,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.3.post1/vllm/model_executor/layers/vocab_parallel_embedding.py
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
@@ -9,6 +10,7 @@ from torch.nn.parameter import Parameter, UninitializedParameter
 
 from sglang.srt.distributed import (
     divide,
+    get_moe_expert_parallel_rank,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tp_group,
@@ -47,6 +49,153 @@ _is_cpu = is_cpu()
 _is_npu = is_npu()
 
 logger = logging.getLogger(__name__)
+
+
+def _elastic_embedding_trace_global_ranks() -> Optional[set]:
+    raw = os.environ.get("SGLANG_ELASTIC_EMBEDDING_TRACE_GLOBAL_RANKS", "").strip()
+    if not raw:
+        raw = os.environ.get("SGLANG_ELASTIC_TRACE_GLOBAL_RANKS", "").strip()
+    if not raw:
+        return None
+    out = set()
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            out.add(int(item))
+        except ValueError:
+            continue
+    return out or None
+
+
+_ELASTIC_EMBEDDING_TRACE_COUNT = 0
+
+
+def _elastic_embedding_trace_enabled(global_ep_rank: int) -> bool:
+    if os.environ.get("SGLANG_ELASTIC_EMBEDDING_TRACE", "0") != "1":
+        return False
+    allowed = _elastic_embedding_trace_global_ranks()
+    if allowed is None:
+        return True
+    return global_ep_rank in allowed
+
+
+def _elastic_embedding_trace_limit() -> int:
+    raw = os.environ.get("SGLANG_ELASTIC_EMBEDDING_TRACE_LIMIT", "64").strip()
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 64
+
+
+def _elastic_embedding_global_ep_rank() -> int:
+    try:
+        local_ep_rank = get_moe_expert_parallel_rank()
+    except Exception:
+        local_ep_rank = 0
+    try:
+        from sglang.srt.server_args import get_global_server_args
+
+        offset = get_global_server_args().ep_join_rank_offset or 0
+    except Exception:
+        offset = 0
+    return local_ep_rank + offset
+
+
+def _elastic_embedding_log(
+    embedding,
+    input_: torch.Tensor,
+    masked_input: torch.Tensor,
+    input_mask: Optional[torch.Tensor],
+    output_before_reduce: torch.Tensor,
+    output_after_reduce: Optional[torch.Tensor],
+    reduced: bool,
+    input_scattered: bool,
+) -> None:
+    global _ELASTIC_EMBEDDING_TRACE_COUNT
+    global_ep_rank = _elastic_embedding_global_ep_rank()
+    if not _elastic_embedding_trace_enabled(global_ep_rank):
+        return
+    if _ELASTIC_EMBEDDING_TRACE_COUNT >= _elastic_embedding_trace_limit():
+        return
+    _ELASTIC_EMBEDDING_TRACE_COUNT += 1
+
+    with torch.no_grad():
+        in_detached = input_.detach()
+        in_numel = in_detached.numel()
+        in_min = int(in_detached.min().item()) if in_numel else 0
+        in_max = int(in_detached.max().item()) if in_numel else 0
+        in_head = in_detached.flatten()[:8].cpu().tolist()
+
+        masked_head = masked_input.detach().flatten()[:8].cpu().tolist()
+        if input_mask is not None:
+            masked_count = int(input_mask.detach().sum().item())
+            total_tokens = int(input_mask.detach().numel())
+        else:
+            masked_count = 0
+            total_tokens = in_numel
+
+        before = output_before_reduce.detach().float()
+        before_checksum = float(before.flatten()[: min(1024, before.numel())].sum().item())
+        before_abs_max = float(before.abs().max().item()) if before.numel() else 0.0
+        before_top_vals = []
+        before_top_ids = []
+        rows = before.reshape(-1, before.shape[-1])[:1]
+        for row in rows:
+            finite_row = torch.where(torch.isfinite(row), row, torch.zeros_like(row))
+            k = min(8, finite_row.numel())
+            vals, ids = torch.topk(finite_row, k=k)
+            before_top_ids.append(ids.cpu().tolist())
+            before_top_vals.append(vals.cpu().tolist())
+
+        if output_after_reduce is not None and reduced:
+            after = output_after_reduce.detach().float()
+            after_checksum = float(after.flatten()[: min(1024, after.numel())].sum().item())
+            after_abs_max = float(after.abs().max().item()) if after.numel() else 0.0
+        else:
+            after_checksum = before_checksum
+            after_abs_max = before_abs_max
+
+    shard = embedding.shard_indices
+    logger.info(
+        "[Elastic EP][embedding-trace] count=%d global_ep_rank=%d "
+        "tp_size=%d use_attn_tp_group=%s input_scattered=%s reduced=%s "
+        "org_vocab_start=%d org_vocab_end=%d "
+        "added_vocab_start=%d added_vocab_end=%d num_org_vocab_padding=%d "
+        "input_shape=%s input_min=%d input_max=%d input_head=%s "
+        "masked_head=%s total_tokens=%d masked_count=%d "
+        "out_shape=%s out_dtype=%s "
+        "before_checksum1024=%.6g before_abs_max=%.6g "
+        "before_top_ids=%s before_top_values=%s "
+        "after_checksum1024=%.6g after_abs_max=%.6g",
+        _ELASTIC_EMBEDDING_TRACE_COUNT,
+        global_ep_rank,
+        embedding.tp_size,
+        embedding.use_attn_tp_group,
+        input_scattered,
+        reduced,
+        shard.org_vocab_start_index,
+        shard.org_vocab_end_index,
+        shard.added_vocab_start_index,
+        shard.added_vocab_end_index,
+        shard.num_org_vocab_padding,
+        list(in_detached.shape),
+        in_min,
+        in_max,
+        in_head,
+        masked_head,
+        total_tokens,
+        masked_count,
+        list(output_before_reduce.shape),
+        output_before_reduce.dtype,
+        before_checksum,
+        before_abs_max,
+        before_top_ids,
+        before_top_vals,
+        after_checksum,
+        after_abs_max,
+    )
 
 
 def pad_vocab_size(vocab_size: int, pad_to: int = DEFAULT_VOCAB_PADDING_SIZE) -> int:
@@ -481,6 +630,7 @@ class VocabParallelEmbedding(torch.nn.Module):
             )
         else:
             masked_input = input_
+            input_mask = None
 
         # Get the embeddings.
         with use_symmetric_memory(
@@ -488,15 +638,31 @@ class VocabParallelEmbedding(torch.nn.Module):
         ):
             output_parallel = self.quant_method.embedding(self, masked_input.long())
 
+        output_before_reduce = output_parallel
+        reduced = False
+        input_scattered = False
         if self.tp_size > 1:
             # Mask the output embedding.
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
-            if not get_attn_tp_context().input_scattered:
+            input_scattered = get_attn_tp_context().input_scattered
+            if not input_scattered:
                 if self.use_attn_tp_group:
                     output_parallel = attn_tp_all_reduce(output_parallel)
                 else:
                     # Reduce across all the model parallel GPUs.
                     output_parallel = tensor_model_parallel_all_reduce(output_parallel)
+                reduced = True
+
+        _elastic_embedding_log(
+            self,
+            input_,
+            masked_input,
+            input_mask,
+            output_before_reduce,
+            output_parallel,
+            reduced,
+            input_scattered,
+        )
         return output_parallel
 
     def extra_repr(self) -> str:
