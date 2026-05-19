@@ -488,15 +488,80 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if (
             self.server_args.elastic_ep_backend is not None
-            and self.server_args.elastic_ep_rejoin
+            and self.server_args.ep_join_mode in ("scale", "recover")
         ):
+            logger.info(
+                "[Elastic EP][join_rank] mode=%s calling join_process_groups...",
+                self.server_args.ep_join_mode,
+            )
             join_process_groups()
+            logger.info(
+                "[Elastic EP][join_rank] join_process_groups returned. "
+                "Broadcasting expert-location metadata...",
+            )
             broadcast_global_expert_location_metadata(
                 src_rank=self._get_healthy_expert_location_src_rank(
-                    invoked_in_elastic_ep_rejoin_path=True
+                    invoked_in_ep_join_path=True
                 )
             )
-            ElasticEPStateManager.instance().reset()
+
+            # The joiner received the primary's pre-scale metadata; extend it
+            # with trivial slots for all newly-joined ranks (including self).
+            if self.server_args.max_ep_size:
+                self._expand_eplb_metadata_for_scale(
+                    from_ep_size=self.server_args.ep_size,
+                    effective_size=self.server_args.max_ep_size,
+                    log_tag="JOINER",
+                )
+
+            # Re-enable dp_attention on this joiner (was disabled at init to
+            # keep forward_idle local during warmup), then switch dp_attention
+            # allreduce to the Mooncake PG WORLD group.
+            from sglang.srt.layers.dp_attention import (
+                enable_joiner_all_gather,
+                update_dp_attention_post_scale,
+            )
+            enable_joiner_all_gather()
+            update_dp_attention_post_scale(
+                new_dp_size=self.server_args.max_ep_size,
+                new_dp_rank=self.tp_rank + self.server_args.ep_join_rank_offset,
+            )
+            self.server_args.dp_size = self.server_args.max_ep_size
+            if (
+                self.eplb_manager is not None
+                and self.server_args.ep_join_mode == "scale"
+            ):
+                self.eplb_manager.disable_rebalance(
+                    "elastic scale-up post-scale EPLB rebalance is not implemented yet"
+                )
+
+            if self.server_args.ep_join_mode == "recover":
+                # Recovery: the original world is healthy. Mark all peers
+                # active so cuda graphs and routing immediately resume the
+                # full topology after rejoin.
+                ElasticEPStateManager.instance().reset()
+            # After join_process_groups returns, all ranks (primary + joiner) are
+            # confirmed active. Set active_ranks to all-ones so the joiner doesn't
+            # falsely detect "rank faults" and trigger spurious EPLB rebalance.
+            inst = ElasticEPStateManager.instance()
+            if inst is not None:
+                inst.active_ranks.fill_(1)
+                inst.snapshot_active_to_last()
+                inst.sync_active_to_cpu()
+            logger.info(
+                "[Elastic EP][JOINER] ready; active_ranks=%s "
+                "effective_ep_size=%d is_scaling=%s",
+                inst.active_ranks.tolist() if inst is not None else None,
+                inst.effective_ep_size if inst is not None else -1,
+                ElasticEPStateManager.is_scaling(),
+            )
+
+            # Now that join_group is done and NIXL connections can be
+            # established, capture CUDA graphs (skipped during init).
+            if self.device in ("cuda", "musa") and not self.server_args.disable_cuda_graph:
+                logger.info("[Elastic EP][join_rank] Capturing CUDA graphs post-join")
+                self.init_device_graphs()
+                self.init_piecewise_cuda_graphs()
 
         if self.is_multimodal:
             sanity_check_mm_pad_shift_value(self.model_config.vocab_size)
@@ -733,14 +798,31 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # runs with aux hidden state capture enabled.
         self.init_aux_hidden_state_capture()
 
+        # Elastic EP joiners skip CUDA graph capture during init because
+        # NIXL connections aren't established yet (no peers to dispatch to).
+        # Graphs will be captured after join_group() + activation.
+        skip_graphs = self.server_args.ep_join_mode in ("scale", "recover")
+
         if self.device == "cuda" or self.device == "musa":
             self.init_cublas()
             self.init_attention_backend()
             self.kernel_warmup()
-            self.init_device_graphs()
+            if not skip_graphs:
+                self.init_device_graphs()
+            else:
+                self.graph_runner = None
+                self.graph_mem_usage = 0
+                logger.info(
+                    "[Elastic EP] Skipping CUDA graph capture for joiner "
+                    "(will capture after join_group + activation)"
+                )
         elif self.device in ["npu", "cpu"]:
             self.init_attention_backend()
-            self.init_device_graphs()
+            if not skip_graphs:
+                self.init_device_graphs()
+            else:
+                self.graph_runner = None
+                self.graph_mem_usage = 0
         else:
             self.graph_runner = None
             self.graph_mem_usage = 0
@@ -749,8 +831,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if server_args.forward_hooks:
             register_forward_hooks(self.model, server_args.forward_hooks)
 
-        # Initialize piecewise CUDA graph
-        self.init_piecewise_cuda_graphs()
+        # Initialize piecewise CUDA graph (skip for elastic EP joiners)
+        if not skip_graphs:
+            self.init_piecewise_cuda_graphs()
+        else:
+            self.piecewise_cuda_graph_runner = None
 
         self.prealloc_symmetric_memory_pool()
 
@@ -1069,15 +1154,31 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     )
 
             # Only initialize the distributed environment on the target model worker.
+            # Elastic joiners initialize WORLD with max_ep_size and an offset rank
+            # so process-group rank IDs align with post-scale global rank space.
+            is_ep_joiner = self.server_args.ep_join_mode in ("scale", "recover")
+            if is_ep_joiner and self.server_args.ep_join_rank_offset > 0:
+                pg_world_size = self.server_args.max_ep_size
+                pg_rank = (
+                    self.server_args.ep_join_rank_offset
+                    + self.tp_size * self.pp_rank
+                    + self.tp_rank
+                )
+            else:
+                pg_world_size = self.tp_size * self.pp_size
+                pg_rank = self.tp_size * self.pp_rank + self.tp_rank
+
             init_distributed_environment(
                 backend=backend,
-                world_size=self.tp_size * self.pp_size,
-                rank=self.tp_size * self.pp_rank + self.tp_rank,
+                world_size=pg_world_size,
+                rank=pg_rank,
                 local_rank=self.gpu_id,
                 distributed_init_method=dist_init_method,
                 timeout=self.server_args.dist_timeout,
                 moe_a2a_backend=self.server_args.moe_a2a_backend,
-                recovered_rank=self.server_args.elastic_ep_rejoin,
+                recovered_rank=is_ep_joiner,
+                rank_offset=self.server_args.ep_join_rank_offset,
+                max_world_size=self.server_args.max_ep_size,
             )
             initialize_model_parallel(
                 tensor_model_parallel_size=self.tp_size,
@@ -1088,7 +1189,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 moe_data_model_parallel_size=self.moe_dp_size,
                 duplicate_tp_group=self.server_args.enable_pdmux,
                 enable_symm_mem=self.server_args.enable_symm_mem,
-                recovered_rank=self.server_args.elastic_ep_rejoin,
+                recovered_rank=is_ep_joiner,
+                rank_offset=self.server_args.ep_join_rank_offset,
+                max_world_size=self.server_args.max_ep_size,
             )
             initialize_dp_attention(
                 server_args=self.server_args,
@@ -1458,38 +1561,222 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     weight_name_filter=weight_name_filter,
                 )
 
-    def maybe_recover_ep_ranks(self):
-        # TODO(perf): `active_ranks.all()` on a CUDA tensor triggers host-device
-        # synchronization, and this function is on the forward-path.
-        # This check only runs when `--elastic-ep-backend` is enabled, so the
-        # synchronization overhead does not propagate to other configs.
-        # Leave for future optimization of the elastic EP path.
-        if self.tp_group.active_ranks.all() and self.tp_group.active_ranks_cpu.all():
+    def _expand_eplb_metadata_for_scale(
+        self,
+        from_ep_size: int,
+        effective_size: int,
+        *,
+        log_tag: str,
+    ) -> None:
+        """Extend physical_to_logical_map with trivial slots for new ranks.
+
+        New ranks loaded the same weights as the primary, so the appended
+        slots follow the trivial assignment (rotating through num_logical).
+        Mutates server_args.ep_size / ep_num_redundant_experts and
+        republishes the metadata. ep_join_rank_offset is 0 on the primary
+        (so global_ep_rank == tp_rank); on a joiner it shifts tp_rank into
+        the post-scale global EP rank space.
+        """
+        metadata = get_global_expert_location_metadata()
+        if metadata is None:
+            return
+        old_num_physical = metadata.num_physical_experts
+        num_local = old_num_physical // from_ep_size
+        new_num_physical = num_local * effective_size
+        added = new_num_physical - old_num_physical
+        if added <= 0:
             return
 
-        tp_active_ranks = self.tp_group.active_ranks.detach().cpu().numpy()
-        tp_active_ranks_cpu = self.tp_group.active_ranks_cpu.detach().numpy()
-        tp_active_ranks &= tp_active_ranks_cpu
-        # NOTE: `ranks_to_recover` uses indices in `tp_group`. For the current
-        # Mooncake elastic EP implementation we assume `--pp-size=1`, so the
-        # tp-group index is the same as the global rank index.
-        ranks_to_recover = [
-            i for i in range(len(tp_active_ranks)) if not tp_active_ranks[i]
+        self.server_args.ep_num_redundant_experts += added
+        self.server_args.ep_size = effective_size
+
+        old_p2l = metadata.physical_to_logical_map
+        num_layers = old_p2l.shape[0]
+        num_logical = metadata.num_logical_experts
+        trivial_new = (
+            torch.arange(0, added, device=old_p2l.device)
+            .unsqueeze(0)
+            .expand(num_layers, -1)
+            % num_logical
+        )
+        expanded_p2l = torch.cat([old_p2l, trivial_new], dim=1)
+
+        offset = self.server_args.ep_join_rank_offset or 0
+        global_ep_rank = self.tp_rank + offset
+        new_metadata = ExpertLocationMetadata.init_by_mapping(
+            self.server_args,
+            self.model_config,
+            physical_to_logical_map=expanded_p2l,
+            moe_ep_rank=global_ep_rank,
+        )
+        set_global_expert_location_metadata(new_metadata, allow_overwrite=True)
+        logger.info(
+            "[Elastic EP][%s] expanded expert pool: num_physical %d->%d, "
+            "ep_size=%d, moe_ep_rank=%d",
+            log_tag, old_num_physical, new_num_physical, effective_size,
+            global_ep_rank,
+        )
+
+    def _fetch_joiner_worker_ports(self) -> Optional[List[int]]:
+        """Synchronous REQ to the joiner's DP handshake endpoint.
+
+        Returns the joiner's scheduler-worker port list, or None on
+        timeout / connection failure. Failure is logged at ERROR level
+        because it leaves the cluster partially scaled: PG/NIXL admit
+        the joiner ranks but the DataParallelController never registers
+        the joiner's scheduler workers, so dispatch routes only to
+        primary slots. A retry/state-machine for adoption is a planned
+        follow-up; today the operator must observe the error log and
+        re-issue the scale request.
+        """
+        import zmq
+
+        from sglang.srt.server_args import DP_ATTENTION_HANDSHAKE_PORT_DELTA
+        from sglang.srt.utils.network import NetworkAddress
+
+        host = self.server_args.host or "127.0.0.1"
+        joiner_port = self.server_args.port + 1
+        endpoint = NetworkAddress(
+            host, joiner_port + DP_ATTENTION_HANDSHAKE_PORT_DELTA
+        ).to_tcp()
+
+        ctx = zmq.Context()
+        req = ctx.socket(zmq.REQ)
+        req.setsockopt(zmq.RCVTIMEO, 10000)
+        try:
+            req.connect(endpoint)
+            req.send(b"0")
+            return req.recv_pyobj()
+        except Exception as exc:
+            logger.error(
+                "[Elastic EP] failed to fetch joiner worker ports from %s: %s "
+                "(cluster partially scaled — joiner workers not registered)",
+                endpoint, exc,
+            )
+            return None
+        finally:
+            req.close()
+            ctx.term()
+
+    def maybe_join_ep_ranks(self):
+        """Poll for inactive ranks within effective_ep_size and accept them.
+
+        ``is_scaling()`` returns True for both flows we handle here:
+        scale-up (reserved slots beyond the live world) and recovery
+        (an active slot that NIXL marked faulted). Runs at end-of-forward
+        when --elastic-ep-backend is set.
+        """
+        if not ElasticEPStateManager.is_scaling():
+            return
+
+        effective_size = ElasticEPStateManager.get_effective_ep_size()
+        active = ElasticEPStateManager.instance().active_ranks_cpu.detach().numpy()
+        ranks_to_join = [
+            i for i in range(effective_size) if not active[i]
         ]
 
-        # try_recover_ranks polls peer state via Mooncake EP backend.
-        # Mooncake's internal semantics guarantee that all ranks observe
-        # consistent peer readiness state, so collective operations below
-        # are safe even though polling appears local.
-        if ranks_to_recover and try_recover_ranks(ranks_to_recover):
-            self.forward_pass_id = 0
-            self.eplb_manager.reset_generator()
-            broadcast_global_expert_location_metadata(
-                src_rank=self._get_healthy_expert_location_src_rank(
-                    invoked_in_elastic_ep_rejoin_path=False
+        # Log first detection of each target set, plus periodic reminders
+        # while we're still waiting. Keeps the log readable during long
+        # scale-up waits.
+        if ranks_to_join:
+            seen = getattr(self, "_logged_ranks_to_join", None)
+            if seen != tuple(ranks_to_join):
+                logger.info(
+                    "[Elastic EP][poll] detected ranks_to_join=%s "
+                    "effective_ep_size=%d active_ranks=%s",
+                    ranks_to_join, effective_size, active.tolist(),
                 )
+                self._logged_ranks_to_join = tuple(ranks_to_join)
+                self._last_poll_log_id = self.forward_pass_id
+            elif self.forward_pass_id - getattr(self, "_last_poll_log_id", 0) >= 200:
+                logger.info(
+                    "[Elastic EP][poll] still waiting for ranks_to_join=%s "
+                    "(forward_pass_id=%d)",
+                    ranks_to_join, self.forward_pass_id,
+                )
+                self._last_poll_log_id = self.forward_pass_id
+
+        # try_recover_ranks uses a collective peer-state check, so every active
+        # rank must participate in this call path.
+        if ranks_to_join and try_recover_ranks(ranks_to_join):
+            self.forward_pass_id = 0
+
+            # Use src_rank=0 directly. The all_gather_object in
+            # _get_healthy_expert_location_src_rank would deadlock because
+            # joiners skip it (they call broadcast directly).
+            broadcast_global_expert_location_metadata(src_rank=0)
+
+            # Snapshot the pre-join active count for _on_scale before reset()
+            # below clobbers last_active_ranks.
+            from_ep_size = int(
+                ElasticEPStateManager.instance().last_active_ranks.sum().item()
             )
-            ElasticEPStateManager.instance().reset()
+
+            if ElasticEPStateManager.is_recovery_join(ranks_to_join):
+                # Recovery path skips EPLB rebalance because metadata can be
+                # stale immediately after rank recovery.
+                self.eplb_manager.reset_generator()
+                ElasticEPStateManager.instance().reset()
+            else:
+                # Scale-up path mirrors recovery post-join state sync and
+                # EPLB reset.
+                inst = ElasticEPStateManager.instance()
+                for r in ranks_to_join:
+                    inst.active_ranks[r] = 1
+                inst.snapshot_active_to_last()
+                inst.sync_active_to_cpu()
+                if self.eplb_manager is not None:
+                    self.eplb_manager.reset_generator()
+                logger.info(
+                    "[Elastic EP] scale-up complete: active_ranks=%s "
+                    "effective_ep_size=%d",
+                    inst.active_ranks.tolist(),
+                    ElasticEPStateManager.get_effective_ep_size(),
+                )
+
+            # Trigger NIXL buffer connections. Must come AFTER activate_ranks
+            # (which is inside try_recover_ranks) so new ranks are unblocked
+            # and can publish their buffer metadata on first dispatch.
+            if ElasticEPStateManager._on_scale is not None:
+                ElasticEPStateManager._on_scale(from_ep_size, effective_size)
+
+            # Expand EPLB metadata locally with trivial slots for the new
+            # ranks (no collectives, no P2P).
+            self._expand_eplb_metadata_for_scale(
+                from_ep_size=from_ep_size,
+                effective_size=effective_size,
+                log_tag="EPLB",
+            )
+
+            if self.eplb_manager is not None:
+                self.eplb_manager.disable_rebalance(
+                    "elastic scale-up post-scale EPLB rebalance is not implemented yet"
+                )
+
+            # Switch dp_attention allreduce to Mooncake PG WORLD group
+            # so all ranks (old + new) participate in unified dp_gather.
+            from sglang.srt.layers.dp_attention import update_dp_attention_post_scale
+            update_dp_attention_post_scale(
+                new_dp_size=effective_size,
+                new_dp_rank=self.tp_rank,
+            )
+            self.server_args.dp_size = effective_size
+
+            # Controller leader fetches the joiner's scheduler worker
+            # ports via the DP handshake endpoint and stores the message
+            # for the scheduler loop to forward to the controller.
+            if self.tp_rank == 0:
+                worker_ports = self._fetch_joiner_worker_ports()
+                if worker_ports is not None:
+                    from sglang.srt.managers.io_struct import (
+                        ElasticScaleWorkerPortsReq,
+                    )
+                    self._pending_elastic_scale_msg = ElasticScaleWorkerPortsReq(
+                        new_worker_ports=worker_ports
+                    )
+
+            ElasticEPStateManager.instance().snapshot_active_to_last()
+            ElasticEPStateManager.instance().sync_active_to_cpu()
 
             broadcast_pyobj(
                 [self.server_args.random_seed],
@@ -1497,16 +1784,35 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 get_world_group().cpu_group,
                 src=get_world_group().ranks[0],
             )
-            logger.info(f"recover ranks {ranks_to_recover} done")
+            logger.info(
+                "[Elastic EP][poll] joined ranks %s done "
+                "(effective_ep_size=%d, from_ep_size=%d)",
+                ranks_to_join, effective_size, from_ep_size,
+            )
+            self._logged_ranks_to_join = None
+
+            # Recapture CUDA graphs: the old graphs were captured with
+            # the previous EP topology and are now invalid.
+            if self.graph_runner is not None:
+                logger.info(
+                    "[Elastic EP][poll] Recapturing CUDA graphs for new "
+                    "EP topology (ep_size=%d)", effective_size,
+                )
+                self.init_device_graphs()
+            if self.piecewise_cuda_graph_runner is not None:
+                self.init_piecewise_cuda_graphs()
 
     def _get_healthy_expert_location_src_rank(
-        self, invoked_in_elastic_ep_rejoin_path: bool
+        self, invoked_in_ep_join_path: bool
     ) -> int:
+        # For elastic EP joiners: skip the all_gather_object collective.
+        # The joiner's WORLD cpu_group may not be aligned with the primary's
+        # for collectives yet.  The primary (rank 0) always has healthy metadata.
+        if invoked_in_ep_join_path:
+            return 0
+
         world_group = get_world_group()
-        # NOTE: do not key off `self.server_args.elastic_ep_rejoin` here.
-        # A rank that was started as a rejoin rank may later act as a healthy
-        # rank in a subsequent recovery cycle.
-        local_rejoin_flag = bool(invoked_in_elastic_ep_rejoin_path)
+        local_rejoin_flag = bool(invoked_in_ep_join_path)
         gathered_rejoin_flags = world_group.all_gather_object(local_rejoin_flag)
 
         for rank_in_group, is_rejoin_rank in enumerate(gathered_rejoin_flags):
@@ -1515,7 +1821,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         raise RuntimeError(
             "No healthy rank found for broadcasting expert location metadata. "
-            "All ranks are marked as elastic_ep_rejoin."
+            "All ranks are marked as ep_join_mode (scale/recover)."
         )
 
     def update_weights_from_disk(
@@ -2964,9 +3270,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 split_forward_count,
             )
             elastic_ep_state = ElasticEPStateManager.instance()
+            is_joiner = (
+                self.server_args.ep_join_mode in ("scale", "recover")
+            )
             if (
                 elastic_ep_state is not None
                 and not elastic_ep_state.is_active_equal_last()
+                and not is_joiner
             ):
                 elastic_ep_state.snapshot_active_to_last()
                 elastic_ep_state.sync_active_to_cpu()
@@ -3000,7 +3310,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             dumper.step()
 
         if self.server_args.elastic_ep_backend is not None:
-            self.maybe_recover_ep_ranks()
+            self.maybe_join_ep_ranks()
 
         return output
 
