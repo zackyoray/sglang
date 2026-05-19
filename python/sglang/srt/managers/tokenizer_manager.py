@@ -50,6 +50,7 @@ from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
+    ElasticScaleWorkerPortsReq,
     BatchEmbeddingOutput,
     BatchStrOutput,
     BatchTokenIDOutput,
@@ -64,6 +65,8 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     OpenSessionReqOutput,
     PauseGenerationReqInput,
+    ScaleElasticEPReqInput,
+    ScaleElasticEPReqOutput,
     SessionParams,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -222,6 +225,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
     ):
         # Parse args
         self.server_args = server_args
+        self.elastic_worker_count = server_args.dp_size
         self.enable_metrics = server_args.enable_metrics
         self.preferred_sampling_params = server_args.preferred_sampling_params
         self.crash_dump_folder = server_args.crash_dump_folder
@@ -505,6 +509,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 # For handling case when scheduler skips detokenizer and forwards back to the tokenizer manager, we ignore it.
                 (HealthCheckOutput, lambda x: None),
                 (ActiveRanksOutput, self.update_active_ranks),
+                (ElasticScaleWorkerPortsReq, self.forward_elastic_scale_ports),
             ]
         )
         self.init_communicators(self.server_args)
@@ -524,7 +529,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
         self._set_default_priority(obj)
 
         if isinstance(obj, GenerateReqInput) and obj.routed_dp_rank is not None:
-            dp_size = self.server_args.dp_size
+            dp_size = self.elastic_worker_count
             if dp_size <= 1 and obj.routed_dp_rank == 0:
                 logger.warning(
                     f"routed_dp_rank={obj.routed_dp_rank} is ignored because dp_size={dp_size}"
@@ -2358,6 +2363,32 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
 
     def update_active_ranks(self, ranks: ActiveRanksOutput):
         self.send_to_scheduler.send_pyobj(ranks)
+
+    def forward_elastic_scale_ports(self, msg: ElasticScaleWorkerPortsReq):
+        worker_count = self.server_args.dp_size + len(msg.new_worker_ports)
+        self.elastic_worker_count = worker_count
+        self.update_control_communicator_fan_out(worker_count)
+        self.send_to_scheduler.send_pyobj(msg)
+
+    async def scale_elastic_ep(
+        self, obj: ScaleElasticEPReqInput
+    ) -> ScaleElasticEPReqOutput:
+        """Send scaling request to scheduler and aggregate per-DP responses.
+
+        Uses the standard _Communicator pattern so all DP schedulers get the
+        request and we wait for all responses. Aggregation rule: if any
+        scheduler reports failure, the call fails with that scheduler's
+        message (validation guards run identically on every scheduler so
+        all should agree).
+        """
+        self.auto_create_handle_loop()
+        responses: List[ScaleElasticEPReqOutput] = (
+            await self.scale_elastic_ep_communicator(obj)
+        )
+        for res in responses:
+            if not res.success:
+                return res
+        return responses[0]
 
     def _handle_open_session_req_output(self, recv_obj):
         future = self.session_futures.get(recv_obj.session_id)
