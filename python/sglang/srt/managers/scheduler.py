@@ -131,6 +131,8 @@ from sglang.srt.managers.io_struct import (
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
     RpcReqOutput,
+    ScaleElasticEPReqInput,
+    ScaleElasticEPReqOutput,
     SendWeightsToRemoteInstanceReqInput,
     SendWeightsToRemoteInstanceReqOutput,
     SetInternalStateReq,
@@ -1325,6 +1327,7 @@ class Scheduler(
                 (GetLoadsReqInput, self.get_loads),
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
+                (ScaleElasticEPReqInput, self.handle_scale_elastic_ep),
                 (DumperControlReqInput, self.handle_dumper_control),
                 (AddExternalCorpusReqInput, self.add_external_corpus),
                 (
@@ -3237,6 +3240,12 @@ class Scheduler(
         }
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
 
+        if self.server_args.elastic_ep_backend is not None:
+            from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+
+            ret["is_scaling_elastic_ep"] = ElasticEPStateManager.is_scaling()
+            ret["effective_ep_size"] = ElasticEPStateManager.get_effective_ep_size()
+
         if not self.spec_algorithm.is_none() and self.spec_total_num_forward_ct > 0:
             ret["avg_spec_accept_length"] = (
                 self.spec_total_num_accepted_tokens / self.spec_total_num_forward_ct
@@ -3468,6 +3477,80 @@ class Scheduler(
 
     def continue_generation(self, recv_req: ContinueGenerationReqInput):
         self._engine_paused = False
+
+    def handle_scale_elastic_ep(
+        self, recv_req: ScaleElasticEPReqInput
+    ) -> ScaleElasticEPReqOutput:
+        """Handle elastic EP scaling: extend PG + set effective_ep_size."""
+        from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+
+        old_ep_size = ElasticEPStateManager.get_effective_ep_size()
+        new_ep_size = recv_req.new_ep_size
+        max_ep_size = self.server_args.max_ep_size or old_ep_size
+
+        logger.info(
+            "[Elastic EP][scale] request received: new_ep_size=%d "
+            "old_ep_size=%d max_ep_size=%d",
+            new_ep_size, old_ep_size, max_ep_size,
+        )
+
+        # Validate before touching the backend.
+        if new_ep_size <= old_ep_size:
+            return ScaleElasticEPReqOutput(
+                success=False,
+                message=(
+                    f"new_ep_size ({new_ep_size}) must be greater than current "
+                    f"effective_ep_size ({old_ep_size}); scale-down is handled separately."
+                ),
+                old_ep_size=old_ep_size,
+                new_ep_size=new_ep_size,
+            )
+        if new_ep_size > max_ep_size:
+            return ScaleElasticEPReqOutput(
+                success=False,
+                message=(
+                    f"new_ep_size ({new_ep_size}) exceeds --max-ep-size "
+                    f"({max_ep_size}). Restart with a larger --max-ep-size."
+                ),
+                old_ep_size=old_ep_size,
+                new_ep_size=new_ep_size,
+            )
+        if ElasticEPStateManager.is_scaling():
+            return ScaleElasticEPReqOutput(
+                success=False,
+                message=(
+                    "A previous scale operation has not completed yet. Wait until "
+                    "all pending ranks have joined before issuing another scale."
+                ),
+                old_ep_size=old_ep_size,
+                new_ep_size=new_ep_size,
+            )
+
+        try:
+            # WORLD group has max_world_size — no extend needed.
+            # Sub-groups will be extended in try_recover_ranks after
+            # get_peer_state confirms joiners are ready.
+            ElasticEPStateManager.set_effective_ep_size(new_ep_size)
+            logger.info(
+                "[Elastic EP][scale] set_effective_ep_size(%d). "
+                "Poll loop will pick up new ranks on next forward pass.",
+                new_ep_size,
+            )
+
+            return ScaleElasticEPReqOutput(
+                success=True,
+                message=f"Scaling initiated from {old_ep_size} to {new_ep_size}",
+                old_ep_size=old_ep_size,
+                new_ep_size=new_ep_size,
+            )
+        except Exception as e:
+            logger.error("[Elastic EP] Scale failed: %s", e)
+            return ScaleElasticEPReqOutput(
+                success=False,
+                message=str(e),
+                old_ep_size=old_ep_size,
+                new_ep_size=new_ep_size,
+            )
 
     def load_lora_adapter(
         self, recv_req: LoadLoRAAdapterReqInput

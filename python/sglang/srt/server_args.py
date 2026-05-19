@@ -552,6 +552,9 @@ class ServerArgs:
     elastic_ep_backend: Literal[None, "mooncake", "nixl"] = None
     enable_elastic_expert_backup: bool = False
     mooncake_ib_device: Optional[str] = None
+    ep_join_mode: Optional[Literal["scale", "recover"]] = None
+    ep_join_rank_offset: int = 0
+    max_ep_size: Optional[int] = None
     elastic_ep_rejoin: bool = False
 
     # Mamba cache
@@ -2974,6 +2977,17 @@ class ServerArgs:
             assert self.ep_size > 1
 
     def _handle_elastic_ep(self):
+        if self.elastic_ep_rejoin:
+            if self.ep_join_mode is None:
+                logger.warning(
+                    "--elastic-ep-rejoin is deprecated, use --ep-join-mode recover instead."
+                )
+                self.ep_join_mode = "recover"
+            else:
+                assert self.ep_join_mode == "recover", (
+                    "--elastic-ep-rejoin (deprecated) conflicts with "
+                    f"--ep-join-mode {self.ep_join_mode}."
+                )
         if self.elastic_ep_backend is not None:
             if self.enable_eplb:
                 if self.eplb_algorithm == "auto":
@@ -2987,10 +3001,22 @@ class ServerArgs:
                 self.mooncake_ib_device = self._validate_ib_devices(
                     self.mooncake_ib_device
                 )
-        if self.elastic_ep_rejoin:
+        if self.ep_join_mode is not None:
             assert (
                 self.elastic_ep_backend is not None
-            ), "Elastic EP rejoin requires elastic_ep_backend to be set."
+            ), "--ep-join-mode requires --elastic-ep-backend to be set."
+        if self.ep_join_rank_offset != 0:
+            assert self.ep_join_mode is not None, (
+                "--ep-join-rank-offset requires --ep-join-mode."
+            )
+            assert (
+                self.ep_join_rank_offset >= 0
+            ), "--ep-join-rank-offset must be >= 0."
+        if self.max_ep_size is not None:
+            assert (
+                self.elastic_ep_backend is not None
+            ), "--max-ep-size requires --elastic-ep-backend to be set."
+            assert self.max_ep_size > 0, "--max-ep-size must be a positive integer."
 
     def _handle_expert_distribution_metrics(self):
         if self.enable_expert_distribution_metrics and (
@@ -5426,10 +5452,38 @@ class ServerArgs:
             "Default is None, which triggers automatic device detection when Mooncake Backend is enabled.",
         )
         parser.add_argument(
+            "--ep-join-mode",
+            type=str,
+            default=None,
+            choices=["scale", "recover"],
+            help="Join mode for elastic EP. 'recover' rejoins an existing slot after a fault "
+            "(replaces --elastic-ep-rejoin from PR #15771). 'scale' joins as a brand-new "
+            "rank beyond the original group size.",
+        )
+        parser.add_argument(
+            "--ep-join-rank-offset",
+            type=int,
+            default=ServerArgs.ep_join_rank_offset,
+            help="Global EP rank offset for joiner processes. A joiner launched with "
+            "--nnodes 1 --tp N computes local ranks 0..N-1; this offset shifts them "
+            "to global ranks [offset, offset+N) for elastic EP bookkeeping "
+            "(active_ranks, EPLB, NIXL connect_ranks). Default 0. "
+            "Requires --ep-join-mode.",
+        )
+        parser.add_argument(
             "--elastic-ep-rejoin",
             action="store_true",
-            default=ServerArgs.elastic_ep_rejoin,
-            help="Indicates that this process is a relaunched elastic EP rank that should rejoin an existing process group.",
+            default=False,
+            help="[Deprecated] Alias for --ep-join-mode recover. Will be removed in a "
+            "future release.",
+        )
+        parser.add_argument(
+            "--max-ep-size",
+            type=int,
+            default=ServerArgs.max_ep_size,
+            help="Maximum EP size the server can scale to at runtime. Pre-allocates "
+            "active_ranks tensor and backend buffers to this size. Defaults to the "
+            "launch-time world size (no scale headroom).",
         )
 
         # Mamba Cache
@@ -7039,7 +7093,14 @@ class PortArgs:
 
             dist_init_host = na.host
             dist_init_port = na.port
-            port_base = dist_init_port + 1
+
+            # Elastic EP joiners share the primary's dist_init_addr (for the
+            # Mooncake PG Store), but must not collide on ZMQ ports.  Derive
+            # ZMQ ports from the joiner's own HTTP port instead.
+            if server_args.ep_join_mode in ("scale", "recover"):
+                port_base = server_args.port + ZMQ_TCP_PORT_DELTA
+            else:
+                port_base = dist_init_port + 1
             detokenizer_port = port_base + 1
             rpc_port = port_base + 2
             metrics_port = port_base + 3
@@ -7050,9 +7111,11 @@ class PortArgs:
                 assert worker_ports is not None
                 scheduler_input_port = worker_ports[dp_rank]
 
+            is_joiner = server_args.ep_join_mode in ("scale", "recover")
             try:
                 if dp_rank is None:
-                    wait_port_available(dist_init_port, "dist_init_port")
+                    if not is_joiner:
+                        wait_port_available(dist_init_port, "dist_init_port")
                     wait_port_available(port_base, "port_base")
                     wait_port_available(detokenizer_port, "detokenizer_port")
                     wait_port_available(nccl_port, "nccl_port")
