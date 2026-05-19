@@ -560,7 +560,13 @@ class _DeepepLowLatencySinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
     def on_deepep_dispatch_low_latency(
         self, layer_idx: int, local_physical_count_of_layer: torch.Tensor
     ):
-        # Most naive implementation, can optimize later
+        n = self._data.shape[1]
+        if local_physical_count_of_layer.shape[0] > n:
+            local_physical_count_of_layer = local_physical_count_of_layer[:n]
+        elif local_physical_count_of_layer.shape[0] < n:
+            local_physical_count_of_layer = torch.nn.functional.pad(
+                local_physical_count_of_layer, (0, n - local_physical_count_of_layer.shape[0])
+            )
         self._data[layer_idx, :] += local_physical_count_of_layer
 
 
