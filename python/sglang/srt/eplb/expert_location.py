@@ -312,9 +312,10 @@ def get_global_expert_location_metadata():
     return _global_expert_location_metadata
 
 
-def set_global_expert_location_metadata(value):
+def set_global_expert_location_metadata(value, allow_overwrite=False):
     global _global_expert_location_metadata
-    assert _global_expert_location_metadata is None
+    if not allow_overwrite:
+        assert _global_expert_location_metadata is None
     _global_expert_location_metadata = value
 
 
@@ -537,7 +538,9 @@ def _find_nearest_expert(
     if len(same_gpu_physical_expert_ids) > 0:
         return same_gpu_physical_expert_ids[0]
 
-    # 3. Otherwise, prefer same-node experts
+    # 3. Prefer same-node experts only when that filter strictly narrows
+    #    choices; otherwise return -1 so caller-side fair selection
+    #    handles distribution.
     node_rank = moe_ep_rank // num_gpus_per_node
     same_node_physical_expert_ids = [
         physical_expert_id
@@ -547,7 +550,7 @@ def _find_nearest_expert(
         )
         == node_rank
     ]
-    if len(same_node_physical_expert_ids) > 0:
+    if 0 < len(same_node_physical_expert_ids) < len(candidate_physical_expert_ids):
         return same_node_physical_expert_ids[0]
 
     # 4. At last, leave it as -1 to indicate not found.
