@@ -33,6 +33,7 @@ from sglang.srt.managers.io_struct import (
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
     BlockReqInput,
+    ElasticScaleWorkerPortsReq,
     ProfileReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -200,7 +201,39 @@ class DataParallelController:
         self.dp_budget.update_budget(obj)
 
     def update_active_ranks(self, ranks: ActiveRanksOutput):
+        # In elastic mode, controller workers can exceed launch-time dp_size
+        # while ranks.status still reflects only the primary TP view, and
+        # joiner-half faults live in the joiner's own active_ranks tensor.
+        # Keep registered workers routable here; non-elastic mode uses the
+        # direct assignment below.
+        if self.server_args.elastic_ep_backend is not None:
+            self.status = [True] * len(self.workers)
+            return
         self.status = ranks.status
+
+    def add_elastic_workers(self, new_worker_ports: List[int]):
+        """Add joiner scheduler workers after elastic scale-up.
+
+        Creates new ZMQ PUSH sockets to the joiner's scheduler endpoints
+        and extends the workers/status lists. Called when the primary
+        detects new ranks have joined via Mooncake PG.
+        """
+        bind_host = "127.0.0.1"
+        if self.server_args.dist_init_addr:
+            bind_host = NetworkAddress.parse(self.server_args.dist_init_addr).host
+
+        # Primary binds PUSH sockets here; joiner schedulers connect PULL.
+        for port in new_worker_ports:
+            endpoint = NetworkAddress(bind_host, port).to_tcp()
+            sock = get_zmq_socket(self.context, zmq.PUSH, endpoint, True)
+            self.workers.append(sock)
+            self.status.append(True)
+
+        self.dp_budget = DPBudget(len(self.workers))
+        logger.info(
+            "[Elastic EP] DataParallelController grown to %d workers",
+            len(self.workers),
+        )
 
     def dispatching_with_trace(self, req: Req):
         req.time_stats = DPControllerReqTimeStats.new_from_obj(req.time_stats)
@@ -228,6 +261,7 @@ class DataParallelController:
                 (ProfileReq, self.send_to_all_workers),
                 (WatchLoadUpdateReq, self.handle_load_update_req),
                 (ActiveRanksOutput, self.update_active_ranks),
+                (ElasticScaleWorkerPortsReq, lambda msg: self.add_elastic_workers(msg.new_worker_ports)),
             ]
         )
         self._request_dispatcher.add_fallback_fn(self.send_control_message)
@@ -310,8 +344,12 @@ class DataParallelController:
         Returns:
             List of worker ports (same on all nodes after broadcast).
         """
-        # Determine the endpoint for inter-node communication
-        if server_args.dist_init_addr is None:
+        # Determine the endpoint for inter-node communication.
+        # Elastic EP joiners share the primary's dist_init_addr for the PG
+        # Store, but derive DP-handshake and ZMQ ports from their own HTTP
+        # port to avoid collisions with the primary.
+        is_joiner = server_args.ep_join_mode in ("scale", "recover")
+        if server_args.dist_init_addr is None or is_joiner:
             na = NetworkAddress(
                 server_args.host or "127.0.0.1",
                 server_args.port + DP_ATTENTION_HANDSHAKE_PORT_DELTA,
@@ -380,9 +418,37 @@ class DataParallelController:
                 continue
             logger.debug(f"Received handshake from node {client_rank}")
 
+            self._release_elastic_worker_sockets_for_primary()
+
             # Send worker ports to client
             rep_socket.send_pyobj(worker_ports)
             logger.debug(f"Sent worker ports to node {client_rank}")
+
+    def _release_elastic_worker_sockets_for_primary(self):
+        """Let the primary controller take ownership of joiner worker endpoints."""
+        if self.server_args.ep_join_mode not in ("scale", "recover"):
+            return
+        if getattr(self, "_elastic_worker_sockets_released", False):
+            return
+
+        for i, worker in enumerate(self.workers):
+            if worker is None:
+                continue
+            try:
+                worker.close(linger=0)
+                logger.info(
+                    "[Elastic EP] Released joiner local worker socket dp_rank=%d "
+                    "for primary controller binding",
+                    i,
+                )
+            except Exception:
+                logger.exception(
+                    "[Elastic EP] Failed to release joiner worker socket dp_rank=%d",
+                    i,
+                )
+            self.workers[i] = None
+
+        self._elastic_worker_sockets_released = True
 
     def _receive_ports_as_client(self, endpoint: str, node_rank: int) -> List[int]:
         """Receive worker ports from the server node."""
@@ -416,7 +482,11 @@ class DataParallelController:
         else:
             bind_host = NetworkAddress.parse(server_args.dist_init_addr).host
 
-        # Pre-allocate worker ports on node 0 to avoid conflicts
+        # Pre-allocate worker ports on node 0 to avoid conflicts. Elastic
+        # joiners still bind local PUSH sockets during startup so their normal
+        # warmup path can dispatch to local schedulers. When the primary later
+        # asks for these ports, the joiner releases them and the primary binds
+        # replacement PUSH sockets in add_elastic_workers().
         worker_ports = []
         if server_args.node_rank == 0:
             for dp_rank in range(server_args.dp_size):
@@ -489,6 +559,27 @@ class DataParallelController:
                     rank_port_args = PortArgs.init_new(
                         server_args, dp_rank, worker_ports
                     )
+                    if server_args.ep_join_mode in ("scale", "recover"):
+                        # After adoption, the primary tokenizer owns the HTTP
+                        # request state. Joiner schedulers still receive
+                        # requests through their adopted worker endpoints, but
+                        # their outputs must go back through the primary
+                        # detokenizer/tokenizer path.
+                        primary_addr = NetworkAddress.parse(server_args.dist_init_addr)
+                        primary_port_base = primary_addr.port + 1
+                        rank_port_args.tokenizer_ipc_name = NetworkAddress(
+                            primary_addr.host, primary_port_base
+                        ).to_tcp()
+                        rank_port_args.detokenizer_ipc_name = NetworkAddress(
+                            primary_addr.host, primary_port_base + 1
+                        ).to_tcp()
+                        logger.info(
+                            "[Elastic EP] Joiner DP%d outputs routed to primary "
+                            "tokenizer=%s detokenizer=%s",
+                            dp_rank,
+                            rank_port_args.tokenizer_ipc_name,
+                            rank_port_args.detokenizer_ipc_name,
+                        )
                     # Data parallelism reuses the tensor parallelism group,
                     # so all dp ranks should use the same nccl port.
                     rank_port_args.nccl_port = port_args.nccl_port
@@ -568,8 +659,9 @@ class DataParallelController:
 
         while True:
             if self.status[self.round_robin_counter]:
-                logger.debug(f"Choose worker {self.round_robin_counter}")
-                self.workers[self.round_robin_counter].send_pyobj(req)
+                target = self.round_robin_counter
+                logger.debug(f"Choose worker {target}")
+                self.workers[target].send_pyobj(req)
                 self.round_robin_counter = (self.round_robin_counter + 1) % len(
                     self.workers
                 )
