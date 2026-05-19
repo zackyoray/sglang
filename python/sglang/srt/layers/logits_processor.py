@@ -24,8 +24,11 @@ from torch import nn
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
+    get_tensor_model_parallel_rank,
+    get_tp_group,
     tensor_model_parallel_all_gather,
 )
+from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -282,6 +285,182 @@ class LogitsProcessor(nn.Module):
         self.enable_logprobs_chunk = envs.SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK.get()
         # chunk size for logprobs processing
         self.logprobs_chunk_size = envs.SGLANG_LOGITS_PROCESSER_CHUNK_SIZE.get()
+
+    def _elastic_world_logits_gather_enabled(self) -> bool:
+        """True once an elastic scale event has grown the live world.
+
+        The default `tensor_model_parallel_all_gather` would gather logits
+        across the launch-time NCCL TP group, which is disjoint from the
+        joiner's TP group post-scale and produces corrupt joiner-owned
+        rows. `_gather_logits_via_world_all_reduce` writes per-owner
+        slices into a zero-initialised buffer and SUM-reduces over the
+        Mooncake WORLD PG, which spans both halves.
+
+        Symmetric on primary and joiner: both compare ``effective_ep_size``
+        to ``server_args.tp_size`` (the launch-time NCCL TP group size).
+        On the joiner, ``original_ep_size`` already equals the post-scale
+        world (the joiner is launched into the grown world), so a check
+        against ``original_ep_size`` would be False on the joiner half
+        and the joiner would fall back to the broken NCCL all-gather.
+        """
+        inst = ElasticEPStateManager.instance()
+        if inst is None:
+            return False
+        sa = get_global_server_args()
+        max_ep_size = getattr(sa, "max_ep_size", None) or 0
+        if max_ep_size <= 0:
+            return False
+        # Off until we are fully scaled to max_ep_size on every rank, and
+        # only when max_ep_size actually exceeds the launch-time TP group.
+        return (
+            inst.effective_ep_size >= max_ep_size
+            and max_ep_size > sa.tp_size
+        )
+
+    @staticmethod
+    def _logits_row_counts_from_token_counts(
+        logits: torch.Tensor, token_counts: List[int]
+    ) -> List[int]:
+        """Map hidden-token counts to the pruned logits rows being gathered.
+
+        LogitsProcessor often reduces long prefill/extend hidden states to one
+        sampled next-token row per DP rank that has tokens, while
+        global_num_tokens_gpu still describes the full prompt token spread.
+        Three cases this function distinguishes:
+
+          1. ``total_tokens == num_logit_rows``: full per-token logits
+             (e.g. greedy logprobs, draft-token expansion). Identity map.
+          2. ``num_logit_rows == 1`` and only one rank has tokens: the single
+             logits row belongs to that rank. Map [0,...,1,...,0].
+          3. ``num_logit_rows == len(nonzero)``: last-token-only prefill across
+             multiple DP ranks (the GSM8K post-scale shape). Each rank with
+             tokens contributes exactly one row in order.
+          4. Otherwise: warn and fall back to a safe last-token-only mapping if
+             ``num_logit_rows <= len(nonzero)``, else identity.
+
+        Returning the wrong mapping causes the caller's
+        ``output[row_start:row_end, shard_start:shard_end] = logits[...]`` to
+        attempt OOB slices (silently empty in PyTorch), so the WORLD all-reduce
+        observes garbage for any DP rank whose `row_end > num_logit_rows`. That
+        used to silently corrupt joiner-owned prefill logits during concurrent
+        GSM8K decodes.
+        """
+        total_tokens = sum(token_counts)
+        num_logit_rows = int(logits.shape[0])
+        if total_tokens == num_logit_rows:
+            return token_counts
+
+        nonzero = [idx for idx, count in enumerate(token_counts) if count > 0]
+
+        if num_logit_rows == 1 and len(nonzero) == 1:
+            row_counts = [0] * len(token_counts)
+            row_counts[nonzero[0]] = 1
+            return row_counts
+
+        if num_logit_rows == len(nonzero):
+            row_counts = [0] * len(token_counts)
+            for idx in nonzero:
+                row_counts[idx] = 1
+            return row_counts
+
+        if num_logit_rows < len(nonzero) and num_logit_rows > 0:
+            # Defensive: bind the first `num_logit_rows` nonzero rank slots,
+            # leave the rest at zero. Caller still gets a valid mapping; any
+            # joiner-owned rows beyond the cut will be skipped rather than
+            # producing OOB slices.
+            logger.warning(
+                "[Elastic EP][world-logits-gather] truncating token-to-row "
+                "mapping: num_logit_rows=%d < nonzero_dp_ranks=%d "
+                "token_counts=%s",
+                num_logit_rows,
+                len(nonzero),
+                token_counts,
+            )
+            row_counts = [0] * len(token_counts)
+            for idx in nonzero[:num_logit_rows]:
+                row_counts[idx] = 1
+            return row_counts
+
+        logger.warning(
+            "[Elastic EP][world-logits-gather] unable to map token counts to "
+            "logits rows exactly: token_counts=%s total_tokens=%d logits_rows=%d",
+            token_counts,
+            total_tokens,
+            num_logit_rows,
+        )
+        return token_counts
+
+    def _gather_logits_via_world_all_reduce(
+        self, logits: torch.Tensor, logits_metadata: LogitsMetadata
+    ) -> torch.Tensor:
+        """Gather vocab shards with Mooncake WORLD all-reduce.
+
+        The generic TP all-gather path is unsafe after elastic joiner adoption.
+        This path writes only the row ranges owned by DP ranks in the current
+        TP group, then uses WORLD all_reduce(SUM) to assemble full-vocab logits.
+
+        Supported topology: dp_attention with attn_tp_size == 1, so each DP
+        owner index equals a global rank in get_tp_group().ranks. Other
+        topologies need a DP-owner -> global-rank mapping helper.
+        """
+        assert get_attention_tp_size() == 1, (
+            "Elastic WORLD logits gather currently requires attn_tp_size == 1; "
+            f"got {get_attention_tp_size()}"
+        )
+        if logits.shape[-1] * get_tensor_model_parallel_world_size() != self.vocab_size:
+            raise RuntimeError(
+                "Elastic WORLD logits gather expects evenly sharded vocab: "
+                f"local={logits.shape[-1]} tp={get_tensor_model_parallel_world_size()} "
+                f"vocab={self.vocab_size}"
+            )
+
+        output = torch.zeros(
+            (logits.shape[0], self.vocab_size),
+            device=logits.device,
+            dtype=logits.dtype,
+        )
+        local_tp_rank = get_tensor_model_parallel_rank()
+        shard_size = logits.shape[-1]
+        shard_start = local_tp_rank * shard_size
+        shard_end = shard_start + shard_size
+
+        tp_ranks = set(get_tp_group().ranks)
+        if logits_metadata.global_num_tokens_gpu is not None:
+            token_counts = [
+                int(x)
+                for x in logits_metadata.global_num_tokens_gpu.detach().cpu().tolist()
+            ]
+            counts = self._logits_row_counts_from_token_counts(logits, token_counts)
+        else:
+            token_counts = None
+            counts = [int(logits.shape[0])]
+
+        row_start = 0
+        contributed_ranges = []
+        for owner_dp_rank, count in enumerate(counts):
+            row_end = row_start + count
+            if count > 0 and owner_dp_rank in tp_ranks:
+                output[row_start:row_end, shard_start:shard_end] = logits[
+                    row_start:row_end
+                ]
+                contributed_ranges.append((owner_dp_rank, row_start, row_end))
+            row_start = row_end
+
+        if row_start != logits.shape[0]:
+            logger.warning(
+                "[Elastic EP][world-logits-gather] row count mismatch: "
+                "sum(global_num_tokens)=%d logits_rows=%d counts=%s",
+                row_start,
+                logits.shape[0],
+                counts,
+            )
+
+        torch.distributed.all_reduce(
+            output,
+            op=torch.distributed.ReduceOp.SUM,
+            group=torch.distributed.group.WORLD,
+        )
+        return output
 
     def forward(
         self,
@@ -855,9 +1034,14 @@ class LogitsProcessor(nn.Module):
 
         if self.do_tensor_parallel_all_gather:
             if self.use_attn_tp_group:
-                logits = self._gather_attn_tp_logits(logits)
+                logits = self._gather_attn_tp_logits(logits, logits_metadata)
             else:
-                logits = tensor_model_parallel_all_gather(logits)
+                if self._elastic_world_logits_gather_enabled():
+                    logits = self._gather_logits_via_world_all_reduce(
+                        logits, logits_metadata
+                    )
+                else:
+                    logits = tensor_model_parallel_all_gather(logits)
 
         logits = self._scatter_dp_attn_logits(
             logits, local_hidden_states, logits_metadata
@@ -931,9 +1115,11 @@ class LogitsProcessor(nn.Module):
             return hidden_states, local_hidden_states
         return hidden_states, hidden_states
 
-    def _gather_attn_tp_logits(self, logits: torch.Tensor) -> torch.Tensor:
+    def _gather_attn_tp_logits(
+        self, logits: torch.Tensor, logits_metadata: LogitsMetadata
+    ) -> torch.Tensor:
         if self.vocab_size % self.attn_tp_size == 0:
-            global_logits = torch.empty(
+            raw_global_logits = torch.empty(
                 (
                     self.attn_tp_size,
                     logits.shape[0],
@@ -942,8 +1128,8 @@ class LogitsProcessor(nn.Module):
                 device=logits.device,
                 dtype=logits.dtype,
             )
-            attn_tp_all_gather_into_tensor(global_logits, logits)
-            global_logits = global_logits.permute(1, 0, 2).reshape(
+            attn_tp_all_gather_into_tensor(raw_global_logits, logits)
+            global_logits = raw_global_logits.permute(1, 0, 2).reshape(
                 logits.shape[0], self.vocab_size
             )
         else:
