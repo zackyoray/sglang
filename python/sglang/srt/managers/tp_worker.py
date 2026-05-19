@@ -309,7 +309,7 @@ class TpModelWorker(BaseTpWorker):
         # Sync random seed across TP workers.
         # Elastic EP joiners skip the broadcast (WORLD group includes primary
         # ranks that aren't in this call). Just use the local seed.
-        if server_args.ep_join_mode in ("scale", "recover"):
+        if server_args.is_ep_joiner:
             self.random_seed = server_args.random_seed
         else:
             self.random_seed = broadcast_pyobj(

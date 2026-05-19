@@ -71,6 +71,7 @@ from sglang.srt.managers.io_struct import (
     RemoveExternalCorpusReqOutput,
     ResumeMemoryOccupationReqInput,
     ResumeMemoryOccupationReqOutput,
+    ScaleElasticEPReqOutput,
     SendWeightsToRemoteInstanceReqInput,
     SendWeightsToRemoteInstanceReqOutput,
     SetInternalStateReq,
@@ -157,7 +158,16 @@ class _Communicator(Generic[T]):
         else:
             return await self.watching_call(obj)
 
+    def set_fan_out(self, fan_out: int):
+        self._fan_out = fan_out
+
     def handle_recv(self, recv_obj: T):
+        if self._result_values is None or self._result_event is None:
+            logger.warning(
+                "Dropping stale communicator response without active waiter: %s",
+                type(recv_obj).__name__,
+            )
+            return
         self._result_values.append(recv_obj)
         if len(self._result_values) == self._fan_out:
             self._result_event.set()
@@ -256,8 +266,31 @@ class TokenizerCommunicatorMixin:
         self.dumper_control_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.scale_elastic_ep_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
 
         self._result_dispatcher += self._get_communicator_dispatcher()
+
+    def update_control_communicator_fan_out(
+        self: TokenizerManager, worker_count: int
+    ):
+        if (
+            self.server_args.enable_dp_attention
+            and not self.server_args.enable_dp_attention_local_control_broadcast
+        ):
+            control_fan_out = (
+                worker_count + self.server_args.tp_size - 1
+            ) // self.server_args.tp_size
+        else:
+            control_fan_out = worker_count
+
+        # Communicators whose responses come from every DP worker.
+        self.scale_elastic_ep_communicator.set_fan_out(worker_count)
+
+        # Communicators whose responses come from the dp-attention leader
+        # of each TP group (one response per leader, not per worker).
+        self.get_internal_state_communicator.set_fan_out(control_fan_out)
 
     def _get_communicator_dispatcher(self: TokenizerManager):
         return TypeBasedDispatcher(
@@ -369,6 +402,10 @@ class TokenizerCommunicatorMixin:
                 (
                     DumperControlReqOutput,
                     self.dumper_control_communicator.handle_recv,
+                ),
+                (
+                    ScaleElasticEPReqOutput,
+                    self.scale_elastic_ep_communicator.handle_recv,
                 ),
             ]
         )
