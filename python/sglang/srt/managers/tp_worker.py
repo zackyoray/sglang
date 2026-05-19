@@ -306,13 +306,18 @@ class TpModelWorker(BaseTpWorker):
             self.max_req_len > 0 and self.max_req_input_len > 0
         ), "Memory pool size is too small"
 
-        # Sync random seed across TP workers
-        self.random_seed = broadcast_pyobj(
-            [server_args.random_seed],
-            self.tp_size * self.pp_rank + tp_rank,
-            self.world_group.cpu_group,
-            src=self.world_group.ranks[0],
-        )[0]
+        # Sync random seed across TP workers.
+        # Elastic EP joiners skip the broadcast (WORLD group includes primary
+        # ranks that aren't in this call). Just use the local seed.
+        if server_args.ep_join_mode in ("scale", "recover"):
+            self.random_seed = server_args.random_seed
+        else:
+            self.random_seed = broadcast_pyobj(
+                [server_args.random_seed],
+                self.tp_size * self.pp_rank + tp_rank,
+                self.world_group.cpu_group,
+                src=self.world_group.ranks[0],
+            )[0]
         set_random_seed(self.random_seed)
 
         self.enable_overlap = not server_args.disable_overlap_schedule

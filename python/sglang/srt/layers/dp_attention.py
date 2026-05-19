@@ -43,6 +43,35 @@ _LOCAL_ATTN_DP_SIZE: Optional[int] = None
 _LOCAL_ATTN_DP_RANK: Optional[int] = None
 _ENABLE_DP_ATTENTION_FLAG: bool = False
 
+# After elastic scale, dp_gather allreduce uses the Mooncake PG WORLD group
+# (which has all ranks) instead of the NCCL TP group (which has only the
+# original ranks). Set by update_dp_attention_post_scale().
+_USE_WORLD_GROUP_FOR_DP_GATHER: bool = False
+
+# Elastic EP joiners skip the all_gather during their own init phase
+# because the primary's ranks aren't in the same call → deadlock.
+# Set True at joiner init, cleared when adopted by primary's controller.
+_ELASTIC_JOINER_SKIP_ALL_GATHER: bool = False
+
+
+def enable_joiner_all_gather():
+    """Re-enable joiner dp_attention collectives after primary adoption."""
+    global _ELASTIC_JOINER_SKIP_ALL_GATHER, _ENABLE_DP_ATTENTION_FLAG
+    _ELASTIC_JOINER_SKIP_ALL_GATHER = False
+    _ENABLE_DP_ATTENTION_FLAG = True
+
+
+def update_dp_attention_post_scale(new_dp_size: int, new_dp_rank: int):
+    """Switch dp_gather to the Mooncake WORLD group after scale-up."""
+    global _ATTN_DP_SIZE, _ATTN_DP_RANK, _USE_WORLD_GROUP_FOR_DP_GATHER
+    _ATTN_DP_SIZE = new_dp_size
+    _ATTN_DP_RANK = new_dp_rank
+    _USE_WORLD_GROUP_FOR_DP_GATHER = True
+    logger.info(
+        "[Elastic EP] dp_attention switched to WORLD: dp_size=%d dp_rank=%d",
+        new_dp_size, new_dp_rank,
+    )
+
 _is_hip = is_hip()
 _USE_ROCM700A_WA = _is_hip and get_bool_env_var("SGLANG_USE_ROCM700A")
 
@@ -99,9 +128,9 @@ class _DpGatheredBufferWrapper:
     _device: torch.device
     _global_dp_buffer_len: int
     _local_dp_buffer_len: int
-    _dp_max_padding: bool
-    _global_num_tokens: Optional[List[int]]
-    _is_extend_in_batch: bool
+    _dp_max_padding: bool = False
+    _global_num_tokens: Optional[List[int]] = None
+    _is_extend_in_batch: bool = False
 
     @classmethod
     def set_metadata(cls, hidden_size: int, dtype: torch.dtype, device: torch.device):
@@ -293,6 +322,24 @@ def initialize_dp_attention(
 
     if enable_dp_attention:
         _ATTN_DP_SIZE = dp_size
+
+        # Elastic EP: shift the joiner's DP rank into the global rank space
+        # and mark its runtime DP collectives as suppressed until the
+        # primary's DataParallelController adopts it (see
+        # enable_joiner_all_gather). We deliberately keep
+        # _ENABLE_DP_ATTENTION_FLAG = True on the joiner so that
+        # VocabParallelEmbedding, Sampler, AttnTpContext, etc. construct
+        # with the same dp_attention layout as the primary; clearing the
+        # flag at init silently changes those construction-time shapes
+        # and corrupts joiner-owned logits after the post-scale WORLD
+        # gather.
+        if server_args.elastic_ep_backend is not None and server_args.max_ep_size:
+            offset = getattr(server_args, "ep_join_rank_offset", 0) or 0
+            _ATTN_DP_RANK = tp_rank + offset
+
+            global _ELASTIC_JOINER_SKIP_ALL_GATHER
+            if server_args.ep_join_mode in ("scale", "recover"):
+                _ELASTIC_JOINER_SKIP_ALL_GATHER = True
         if moe_dense_tp_size is None:
             _LOCAL_ATTN_DP_SIZE = _ATTN_DP_SIZE
         else:
@@ -462,17 +509,26 @@ def _dp_gather_via_all_reduce(
         )
 
     # Input IDs are in int 32. We should use inplace_all_reduce for local case because of custom all reduce.
-    NUM_GPUS_PER_NODE = 8
-    if (
-        not local_tokens.dtype.is_floating_point
-        and get_tensor_model_parallel_world_size() <= NUM_GPUS_PER_NODE
-    ):
-        from sglang.srt.distributed.parallel_state import inplace_all_reduce
-
-        inplace_all_reduce(global_tokens, group_name=get_tp_group().unique_name)
-
+    if _USE_WORLD_GROUP_FOR_DP_GATHER and not _ELASTIC_JOINER_SKIP_ALL_GATHER:
+        # Use the default Mooncake WORLD PG (the one recover_ranks updates),
+        # not the GroupCoordinator's device_group which never grows.
+        torch.distributed.all_reduce(
+            global_tokens,
+            op=torch.distributed.ReduceOp.SUM,
+            group=torch.distributed.group.WORLD,
+        )
     else:
-        global_tokens[:] = tensor_model_parallel_all_reduce(global_tokens)
+        NUM_GPUS_PER_NODE = 8
+        if (
+            not local_tokens.dtype.is_floating_point
+            and get_tensor_model_parallel_world_size() <= NUM_GPUS_PER_NODE
+        ):
+            from sglang.srt.distributed.parallel_state import inplace_all_reduce
+
+            inplace_all_reduce(global_tokens, group_name=get_tp_group().unique_name)
+
+        else:
+            global_tokens[:] = tensor_model_parallel_all_reduce(global_tokens)
 
 
 def _dp_gather_via_all_gather(
@@ -481,8 +537,14 @@ def _dp_gather_via_all_gather(
     forward_batch: ForwardBatch,
     is_partial: bool,
 ):
+    if _USE_WORLD_GROUP_FOR_DP_GATHER and not _ELASTIC_JOINER_SKIP_ALL_GATHER:
+        from sglang.srt.distributed.parallel_state import get_world_group
+        gather_group = get_world_group()
+    else:
+        gather_group = get_tp_group()
+
     if get_attention_tp_size() == 1:
-        get_tp_group().all_gather_into_tensor(global_tokens, local_tokens)
+        gather_group.all_gather_into_tensor(global_tokens, local_tokens)
         return
 
     if not is_partial:
@@ -492,7 +554,7 @@ def _dp_gather_via_all_gather(
         get_attention_tp_rank()
     ]
     get_attention_tp_group().reduce_scatter_tensor(scattered_local_tokens, local_tokens)
-    get_tp_group().all_gather_into_tensor(global_tokens, scattered_local_tokens)
+    gather_group.all_gather_into_tensor(global_tokens, scattered_local_tokens)
 
 
 def _dp_gather(
@@ -501,7 +563,7 @@ def _dp_gather(
     forward_batch: ForwardBatch,
     is_partial: bool,
 ):
-    if forward_batch.dp_padding_mode.is_max_len():
+    if forward_batch.dp_padding_mode is not None and forward_batch.dp_padding_mode.is_max_len():
         _dp_gather_via_all_gather(
             global_tokens, local_tokens, forward_batch, is_partial
         )
