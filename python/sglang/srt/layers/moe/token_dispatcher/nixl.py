@@ -44,6 +44,36 @@ class NixlEPBuffer:
     _num_max_dispatch_tokens_per_rank: Optional[int] = None
     _num_experts: Optional[int] = None
     _num_local_experts: Optional[int] = None
+    _connected_ep_size: Optional[int] = None  # exclusive upper bound of connected ranks
+    _scale_to: Optional[int] = None  # target EP frontier; bumped by on_scale()
+    _ep_size: Optional[int] = None  # current EP size for nixl_num_experts derivation
+
+    @classmethod
+    def on_scale(cls, from_ep_size: int, to_ep_size: int) -> None:
+        """Called from ElasticEPStateManager._on_scale_nixl after activate_ranks."""
+        cls._scale_to = to_ep_size
+        cls._ep_size = to_ep_size
+        logger.info("[Elastic EP][nixl] on_scale %d -> %d", from_ep_size, to_ep_size)
+
+    @classmethod
+    def _connect_ranks(cls, ranks: list, *, tag: str) -> None:
+        """Rebind the global TCPStore and call buffer.connect_ranks(ranks)."""
+        current_store = get_global_tcp_store()
+        if current_store is not None:
+            cls._buffer.set_tcp_store_group(current_store)
+
+        cls._buffer.connect_ranks(ranks)
+        logger.info(
+            "[Elastic EP][nixl] connect (%s) ranks=%s group_size=%s",
+            tag, ranks, cls._buffer.group_size,
+        )
+
+    @classmethod
+    def _update_connections(cls, scale_to: int) -> None:
+        """Connect newly-joined ranks; caller ensures scale_to > _connected_ep_size."""
+        new_ranks = list(range(cls._connected_ep_size, scale_to))
+        cls._connect_ranks(new_ranks, tag="update")
+        cls._connected_ep_size = scale_to
 
     @classmethod
     def get_nixl_buffer(
@@ -56,6 +86,12 @@ class NixlEPBuffer:
         num_local_experts: int = -1,
     ):
         if cls._buffer is not None:
+            if (
+                cls._scale_to is not None
+                and cls._connected_ep_size is not None
+                and cls._scale_to > cls._connected_ep_size
+            ):
+                cls._update_connections(cls._scale_to)
             return cls._buffer
 
         cls._hidden_size = hidden_size
@@ -63,23 +99,36 @@ class NixlEPBuffer:
         cls._num_experts = num_experts
         cls._num_local_experts = num_local_experts
 
+        rank = dist.get_rank(group)
+        world_size = dist.get_world_size(group)
+        # Joiners with --ep-join-rank-offset N use global EP rank r + N.
+        offset = ElasticEPStateManager.get_ep_join_rank_offset()
+        global_rank = rank + offset
+
+        # Pre-allocate buffers for max_ep_size: update_memory_buffers cannot
+        # resize at runtime. New ranks claim their slice on scale-up via
+        # _update_connections. nixl_max_ranks must equal the actual
+        # scale-up frontier — over-sizing reserves placeholder slots that
+        # the LL recv kernel strides over (requires NIXL >= 8e32438).
+        from sglang.srt.server_args import get_global_server_args
+
+        max_ep_size = get_global_server_args().max_ep_size or world_size
+        nixl_max_ranks = max_ep_size
+
         num_rdma_bytes = 0
         if deepep_mode.enable_normal():
             raise NotImplementedError("Normal mode is not supported for Nixl EP yet.")
         if deepep_mode.enable_low_latency():
             assert num_max_dispatch_tokens_per_rank != -1
             assert num_experts != -1 and num_experts % group.size() == 0
+            max_num_global_experts = nixl_max_ranks * num_local_experts
             num_rdma_bytes = Buffer.get_rdma_size_hint(
                 num_max_dispatch_tokens_per_rank,
                 hidden_size,
-                group.size(),
-                num_experts,
+                nixl_max_ranks,
+                max_num_global_experts,
             )
 
-        rank = dist.get_rank(group)
-        world_size = dist.get_world_size(group)
-
-        # Get the global TCPStore for coordination
         tcp_store = get_global_tcp_store()
         if tcp_store is None:
             raise RuntimeError(
@@ -88,23 +137,25 @@ class NixlEPBuffer:
             )
 
         logger.info(
-            f"Using NIXL EP (world_size={world_size}, rank={rank}, "
-            f"num_experts={cls._num_experts}, num_experts_per_rank={cls._num_local_experts}) "
+            f"Using NIXL EP (world_size={world_size}, max_ep_size={max_ep_size}, "
+            f"rank={rank}, global_rank={global_rank}, offset={offset}, "
+            f"num_experts={cls._num_experts}, "
+            f"num_experts_per_rank={cls._num_local_experts}) "
         )
 
-        cls._buffer = Buffer(
-            rank=rank,
-            tcp_store_group=tcp_store,
-        )
+        cls._buffer = Buffer(rank=global_rank, tcp_store_group=tcp_store)
 
         cls._buffer.update_memory_buffers(
-            num_ranks=world_size,
+            num_ranks=nixl_max_ranks,
             num_experts_per_rank=cls._num_local_experts,
             num_rdma_bytes=num_rdma_bytes,
         )
-        all_ranks = list(range(world_size))
-        cls._buffer.connect_ranks(all_ranks)
-
+        # Joiner additionally connects to the primary ranks below its offset.
+        scale_to = offset + world_size
+        cls._connect_ranks(list(range(scale_to)), tag="initial")
+        cls._connected_ep_size = scale_to
+        cls._scale_to = scale_to
+        cls._ep_size = scale_to
         return cls._buffer
 
     @classmethod
@@ -153,8 +204,14 @@ class _NixlEPDispatcherImplBase:
         self.active_ranks = (
             elastic_state.active_ranks if elastic_state is not None else None
         )
+        # query_mask_buffer requires mask_status.numel() == max_num_ranks
+        # (registered via update_memory_buffers as max_ep_size).
+        self._active_world_size = dist.get_world_size(group)
+        self._active_rank_offset = ElasticEPStateManager.get_ep_join_rank_offset()
+        from sglang.srt.server_args import get_global_server_args
+        _max_ep = get_global_server_args().max_ep_size or self._active_world_size
         self._mask_buffer = (
-            torch.zeros_like(self.active_ranks)
+            torch.zeros(_max_ep, dtype=torch.int32, device="cuda")
             if self.active_ranks is not None
             else None
         )
@@ -215,14 +272,17 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
         buffer = self._get_buffer()
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
         topk_ids = topk_ids.to(torch.int64)
+        ep_size = NixlEPBuffer._ep_size or buffer.group_size
         expected_m = (
-            hidden_states.shape[0] * buffer.group_size * topk_ids.shape[1]
+            hidden_states.shape[0] * ep_size * topk_ids.shape[1]
             + self.num_experts
         ) // self.num_experts
+
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,
             topk_ids,
         )
+
         return (
             hidden_states,
             topk_ids,
@@ -272,12 +332,28 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
         use_fp8 = not envs.SGLANG_NIXL_EP_BF16_DISPATCH.get()
 
         buffer = self._get_buffer()
+        nixl_num_experts = NixlEPBuffer._num_local_experts * NixlEPBuffer._ep_size
+        if hidden_states.shape[0] > self.num_max_dispatch_tokens_per_rank:
+            logger.error(
+                "[Elastic EP][nixl] BATCH TOO LARGE: x.size(0)=%d > "
+                "num_max_dispatch_tokens_per_rank=%d, nixl_num_experts=%d, "
+                "ep_size=%d, group_size=%d, topk_idx.shape=%s, "
+                "topk_idx.min=%d, topk_idx.max=%d",
+                hidden_states.shape[0],
+                self.num_max_dispatch_tokens_per_rank,
+                nixl_num_experts,
+                NixlEPBuffer._ep_size,
+                buffer.group_size,
+                list(topk_idx.shape),
+                topk_idx[topk_idx >= 0].min().item() if topk_idx.numel() > 0 and (topk_idx >= 0).any() else -1,
+                topk_idx.max().item(),
+            )
         packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
             buffer.dispatch(
                 hidden_states,
                 topk_idx,
                 self.num_max_dispatch_tokens_per_rank,
-                self.num_experts,
+                nixl_num_experts,
                 use_fp8=use_fp8,
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
@@ -323,8 +399,21 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
             return_recv_hook=self.return_recv_hook,
         )
         if self._mask_buffer is not None:
+            # Per-process fault mask. ElasticEPStateManager.active_ranks is
+            # written here only over the slice this process owns; the
+            # globally-synced view lives on the Mooncake PG (forwarded via
+            # ActiveRanksOutput in scheduler.py). TODO(elastic-EP):
+            # unify the two so NIXL kernel-mask faults propagate globally.
             buffer.query_mask_buffer(self._mask_buffer)
-            self.active_ranks.copy_(1 - self._mask_buffer)
+
+            # Only update the live-world slots; reserved slots (when
+            # max_ep_size > world_size) carry a sentinel that would
+            # corrupt is_scaling() / EPLB if written through.
+            n = self._active_world_size
+            off = self._active_rank_offset
+            self.active_ranks[off : off + n].copy_(
+                1 - self._mask_buffer[off : off + n]
+            )
 
         self.packed_recv_count = self.handle = None
         return combined_hidden_states, event, hook
