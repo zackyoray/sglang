@@ -70,27 +70,68 @@ class MLPSyncBatchInfo:
             dtype=dtype,
         )
 
-    def all_gather(self, device, group: torch.distributed.ProcessGroup):
+    def all_gather(
+        self,
+        device,
+        group: torch.distributed.ProcessGroup,
+        use_all_reduce: bool = False,
+    ):
         local_info_tensor = self._get_local_tensor(device=device)
-        global_info_tensor = torch.empty(
-            (self.dp_size, self.tp_size * self.cp_size, 6),
-            dtype=torch.int64,
-            device=device,
+        fallback_tensor = self._get_fallback_tensor(device=device)
+        # Prefill the gather buffer with the IDLE fallback before the
+        # collective: Mooncake PG with `max_world_size` may leave un-written
+        # slots after all_gather, and a zero slot is not a valid
+        # ForwardMode (downstream compute_output() would raise).
+        global_info_tensor = (
+            fallback_tensor
+            .expand(self.dp_size, self.tp_size * self.cp_size, 6)
+            .contiguous()
         )
 
-        torch.distributed.all_gather_into_tensor(
-            global_info_tensor.flatten(),
-            local_info_tensor,
-            group=group,
-        )
+        if use_all_reduce:
+            # Under max_world_size, the WORLD group's reported size can
+            # disagree between primary and joiner (allgather sizes its
+            # output from get_world_size(group), so they would not share
+            # the same slot count). Allreduce is the documented-safe
+            # primitive: write each rank's record into its global-rank
+            # slot and SUM-reduce across the group.
+            global_info_tensor.zero_()
+            flat_info = global_info_tensor.view(-1, 6)
+            rank = torch.distributed.get_rank(group)
+            if 0 <= rank < flat_info.shape[0]:
+                flat_info[rank] = local_info_tensor
+            torch.distributed.all_reduce(
+                global_info_tensor,
+                op=torch.distributed.ReduceOp.SUM,
+                group=group,
+            )
+            # Any slot with no participant contribution remains all-zero; turn
+            # it back into the existing IDLE fallback so downstream ForwardMode
+            # parsing never sees enum value 0.
+            missing = flat_info.abs().sum(dim=1) == 0
+            flat_info[missing] = fallback_tensor
+        else:
+            torch.distributed.all_gather_into_tensor(
+                global_info_tensor.flatten(),
+                local_info_tensor,
+                group=group,
+            )
+
+        # Set fallback values for inactive ranks (based on TP group's
+        # active_ranks view — when the gather ran over WORLD, the prefill
+        # above already covers missing slots).
+        tp_info = global_info_tensor.view(self.dp_size * self.tp_size * self.cp_size, 6)
+        num_ranks_in_tp_info = tp_info.shape[0]
         if device == "cpu":
             tp_active_ranks = get_tp_group().active_ranks_cpu
         else:
             tp_active_ranks = get_tp_group().active_ranks
-
-        # Set fallback values for inactive ranks
-        tp_info = global_info_tensor.view(self.dp_size * self.tp_size * self.cp_size, 6)
-        tp_info[tp_active_ranks == 0] = self._get_fallback_tensor(device=device)
+        if tp_active_ranks.shape[0] < num_ranks_in_tp_info:
+            tp_active_ranks = torch.ones(
+                num_ranks_in_tp_info, dtype=tp_active_ranks.dtype,
+                device=tp_active_ranks.device,
+            )
+        tp_info[tp_active_ranks[:num_ranks_in_tp_info] == 0] = fallback_tensor
 
         tp0_info = global_info_tensor[:, 0, :]
         self.tp0_info = tp0_info
@@ -174,7 +215,23 @@ def prepare_mlp_sync_batch_raw(
         local_batch.is_extend_in_batch = is_extend_in_batch
 
     tbo_preparer = TboDPAttentionPreparer()
-    if len(offload_tags) == 0 and (
+    # After elastic scale, use the Mooncake PG WORLD group for all_gather
+    # so all 8 ranks participate. BUT: joiner during init uses LOCAL TP group
+    # (can't join the 8-rank all_gather until adopted by primary's controller).
+    from sglang.srt.layers.dp_attention import (
+        _USE_WORLD_GROUP_FOR_DP_GATHER,
+        _ELASTIC_JOINER_SKIP_ALL_GATHER,
+    )
+    use_world_group = False
+    if _USE_WORLD_GROUP_FOR_DP_GATHER and not _ELASTIC_JOINER_SKIP_ALL_GATHER:
+        from sglang.srt.distributed.parallel_state import get_world_group
+        world = get_world_group()
+        # Use WORLD, not world.device_group; see
+        # dp_attention._dp_gather_via_all_reduce for rationale.
+        group = torch.distributed.group.WORLD
+        device = world.device
+        use_world_group = True
+    elif len(offload_tags) == 0 and (
         disable_overlap_schedule
         or envs.SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH.get()
     ):
@@ -199,7 +256,11 @@ def prepare_mlp_sync_batch_raw(
     )
 
     if not skip_all_gather:
-        mlp_sync_info.all_gather(device=device, group=group)
+        mlp_sync_info.all_gather(
+            device=device,
+            group=group,
+            use_all_reduce=use_world_group,
+        )
 
         mlp_sync_info.tbo_split_seq_index, mlp_sync_info.global_forward_mode = (
             tbo_preparer.compute_output(
