@@ -1609,6 +1609,27 @@ class ActiveRanksOutput(BaseReq):
 
 
 @dataclass
+class ElasticScaleWorkerPortsReq(BaseReq):
+    """Sent to DataParallelController to add joiner scheduler workers."""
+    new_worker_ports: List[int]
+
+
+@dataclass
+class ScaleElasticEPReqInput(BaseReq):
+    """Request to scale EP by changing the effective EP size (dp_attention mode)."""
+
+    new_ep_size: int
+
+
+@dataclass
+class ScaleElasticEPReqOutput(BaseReq):
+    success: bool
+    message: str
+    old_ep_size: int = 0
+    new_ep_size: int = 0
+
+
+@dataclass
 class GetInternalStateReq(BaseReq):
     pass
 
