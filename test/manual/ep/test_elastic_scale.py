@@ -444,5 +444,138 @@ class TestElasticScaleUpEndToEndNodes1(_ElasticScaleUpEndToEndBase):
     JOIN_RANK_OFFSET = TP_PER_GROUP
 
 
+# Intermediate-step EP size for the multi-step scaffolding test. With
+# --max-ep-size=8 and TP_PER_GROUP=4, a joiner with tp=2 and offset=4
+# advertises step_effective_ep_size = 4 + 2 = 6 (< max_ep_size). This
+# exercises the "joiner uses offset+tp_size, not max_ep_size" path that
+# is the building block for future multi-step scale-up (4 -> 6 -> 8).
+JOIN_TP_MULTI_STEP = 2
+STEP_EFFECTIVE_EP_SIZE_MULTI = TP_PER_GROUP + JOIN_TP_MULTI_STEP  # 6
+
+
+@unittest.skipUnless(
+    _count_visible_gpus() >= TP_PER_GROUP + JOIN_TP_MULTI_STEP,
+    f"Multi-step scale scaffolding needs at least "
+    f"{TP_PER_GROUP + JOIN_TP_MULTI_STEP} GPUs.",
+)
+@unittest.expectedFailure
+class TestElasticScaleUpMultiStepScaffolding(_ElasticScaleUpEndToEndBase):
+    """4 -> 6 single step against --max-ep-size 8.
+
+    Scaffolding for multi-step scale-up: validates the joiner-side
+    "step_effective = offset + tp_size" plumbing without requiring two
+    sequential joiner waves. Marked ``expectedFailure`` because the
+    primary/joiner state-sync for intermediate steps is not yet wired
+    end-to-end and the gsm8k accuracy gate is expected to fail today.
+    Once the multi-step path is fully implemented this decorator should
+    be removed.
+    """
+
+    JOIN_TP = JOIN_TP_MULTI_STEP
+    JOIN_NNODES = 1
+    JOIN_NODE_RANK = 0
+    JOIN_RANK_OFFSET = TP_PER_GROUP
+
+    @classmethod
+    def _launch_joining_group(cls) -> None:
+        """Same as the base launcher but use only JOIN_TP GPUs.
+
+        Base launcher hardcodes ``[TP_PER_GROUP, TOTAL_EP_SIZE)`` for the
+        joiner; here we want ``[TP_PER_GROUP, TP_PER_GROUP + JOIN_TP)``.
+        """
+        cmd = [
+            "sglang", "serve",
+            "--model-path", cls.model,
+            *_scale_up_common_args(
+                DIST_INIT_ADDR,
+                tp_size=cls.JOIN_TP,
+                nnodes=cls.JOIN_NNODES,
+                node_rank=cls.JOIN_NODE_RANK,
+            ),
+            "--ep-join-mode", "scale",
+            "--ep-join-rank-offset", str(cls.JOIN_RANK_OFFSET),
+            "--host", "127.0.0.1",
+            "--port", str(PORT_B),
+            "--device", "cuda",
+        ]
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(
+            str(i) for i in range(TP_PER_GROUP, TP_PER_GROUP + cls.JOIN_TP)
+        )
+        joining_log = os.environ.get(
+            "SGLANG_ELASTIC_SCALE_JOINING_LOG",
+            f"/tmp/elastic_scale_joining_multistep_{int(time.time())}.log",
+        )
+        cls._joining_log_path = joining_log
+        cls._joining_log_fh = open(joining_log, "w")
+        cls._joining_proc = subprocess.Popen(
+            cmd,
+            env=env,
+            stdout=cls._joining_log_fh,
+            stderr=subprocess.STDOUT,
+        )
+
+    def test_scale_up_on_demand(self):
+        # Override TOTAL_EP_SIZE expectation: scale primary 4 -> 6, not 4 -> 8.
+        self._generate_ok("pre-scale")
+
+        resp = self._post(
+            "/scale_elastic_ep",
+            json={"new_ep_size": STEP_EFFECTIVE_EP_SIZE_MULTI},
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        body = resp.json()
+        self.assertEqual(body["old_ep_size"], TP_PER_GROUP)
+        self.assertEqual(body["new_ep_size"], STEP_EFFECTIVE_EP_SIZE_MULTI)
+
+        self._launch_joining_group()
+
+        deadline = time.time() + 300
+        while time.time() < deadline:
+            resp = self._post("/is_scaling_elastic_ep")
+            if resp.ok and not resp.json().get("is_scaling_elastic_ep", True):
+                break
+            try:
+                self._post(
+                    "/generate",
+                    json={
+                        "text": "ping",
+                        "sampling_params": {"max_new_tokens": 1, "temperature": 0.0},
+                    },
+                )
+            except Exception:
+                pass
+            time.sleep(2)
+        else:
+            self.fail("Timed out waiting for scaling to complete (300s)")
+
+        self._generate_ok("post-scale")
+
+        gsm8k_num_examples = int(os.environ.get("SGLANG_ELASTIC_GSM8K_EXAMPLES", "8"))
+        gsm8k_num_threads = int(os.environ.get("SGLANG_ELASTIC_GSM8K_THREADS", "2"))
+        gsm8k_max_tokens = int(os.environ.get("SGLANG_ELASTIC_GSM8K_MAX_TOKENS", "512"))
+        gsm8k_min_score = float(os.environ.get("SGLANG_ELASTIC_GSM8K_MIN_SCORE", "0.40"))
+        metrics = run_eval(
+            SimpleNamespace(
+                base_url=self.base_url,
+                model=self.model,
+                eval_name="gsm8k",
+                api="completion",
+                max_tokens=gsm8k_max_tokens,
+                num_examples=gsm8k_num_examples,
+                num_threads=gsm8k_num_threads,
+            )
+        )
+        _preserve_gsm8k_report(self.model)
+        print(
+            f"[TEST] Post-scale 4->{STEP_EFFECTIVE_EP_SIZE_MULTI} GSM8K "
+            f"accuracy: {metrics['score']:.2%}"
+        )
+        self.assertGreater(
+            metrics["score"], gsm8k_min_score,
+            f"Multi-step scale GSM8K too low: {metrics['score']:.2%}"
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

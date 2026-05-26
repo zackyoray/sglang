@@ -505,12 +505,22 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
             )
 
+            # Step-effective EP size for THIS joiner: offset + tp_size,
+            # not max_ep_size. Same value for single-step (offset=4, tp=4,
+            # max=8 -> step=8); differs for multi-step (e.g. 4 -> 6 -> 8 the
+            # first joiner has offset=4, tp=2 -> step=6).
+            # NOTE: multi-step scaffolding only; primary/joiner state-sync
+            # for the intermediate-step case is not yet validated end-to-end.
+            step_effective_ep_size = (
+                self.server_args.ep_join_rank_offset + self.server_args.tp_size
+            )
+
             # The joiner received the primary's pre-scale metadata; extend it
             # with trivial slots for all newly-joined ranks (including self).
             if self.server_args.max_ep_size:
                 self._expand_eplb_metadata_for_scale(
                     from_ep_size=self.server_args.ep_size,
-                    effective_size=self.server_args.max_ep_size,
+                    effective_size=step_effective_ep_size,
                     log_tag="JOINER",
                 )
 
@@ -523,10 +533,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             enable_joiner_all_gather()
             update_dp_attention_post_scale(
-                new_dp_size=self.server_args.max_ep_size,
+                new_dp_size=step_effective_ep_size,
                 new_dp_rank=self.tp_rank + self.server_args.ep_join_rank_offset,
             )
-            self.server_args.dp_size = self.server_args.max_ep_size
+            self.server_args.dp_size = step_effective_ep_size
             if (
                 self.eplb_manager is not None
                 and self.server_args.ep_join_mode == "scale"
@@ -540,12 +550,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 # active so cuda graphs and routing immediately resume the
                 # full topology after rejoin.
                 ElasticEPStateManager.instance().reset()
-            # After join_process_groups returns, all ranks (primary + joiner) are
-            # confirmed active. Set active_ranks to all-ones so the joiner doesn't
-            # falsely detect "rank faults" and trigger spurious EPLB rebalance.
+            # After join_process_groups returns, all ranks in THIS step's
+            # frontier (primary + this joiner group) are confirmed active.
+            # Fill only [:step_effective] with 1 so reserved-but-unjoined
+            # slots beyond the current step (in a future multi-step scale-up)
+            # stay at 0 and is_scaling() can still detect them.
             inst = ElasticEPStateManager.instance()
             if inst is not None:
-                inst.active_ranks.fill_(1)
+                inst.active_ranks.zero_()
+                inst.active_ranks[:step_effective_ep_size] = 1
                 inst.snapshot_active_to_last()
                 inst.sync_active_to_cpu()
             logger.info(

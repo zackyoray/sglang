@@ -96,6 +96,17 @@ class ElasticEPStateManager:
                 cls._instance.active_ranks[global_rank] = 1
                 cls._instance.snapshot_active_to_last()
                 cls._instance.sync_active_to_cpu()
+                # Joiner's effective_ep_size is the post-join frontier for
+                # THIS scale step (offset + tp_size), not max_ep_size. For a
+                # single-step 4 -> 8 these are equal; for a multi-step
+                # 4 -> 6 -> 8 each joiner advertises only its step's size.
+                # NOTE: multi-step is scaffolded; primary/joiner state-sync
+                # for intermediate steps is not yet validated.
+                step_effective = (
+                    server_args.ep_join_rank_offset + server_args.tp_size
+                )
+                cls._instance.effective_ep_size = step_effective
+                cls._instance.original_ep_size = step_effective
 
             logger.info(
                 "[Elastic EP][init] rank=%d world_size=%d max_ep_size=%s "
