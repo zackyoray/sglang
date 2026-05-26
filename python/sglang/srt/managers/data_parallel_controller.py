@@ -618,6 +618,20 @@ class DataParallelController:
                     )
                 )
 
+                # Cosmetic global-rank overrides for the scheduler log prefix
+                # and proctitle. Elastic-EP joiners launch with a non-zero
+                # ep_join_rank_offset so a joiner with offset=4, tp=4 logs as
+                # DP4..7 instead of DP0..3, matching how the primary refers to
+                # its joiner peers (e.g. ranks_to_join=[4, 5]). Runtime ranks
+                # passed below are unchanged so ZMQ binding, NIXL connect, and
+                # Mooncake PG init still see local ranks.
+                offset = server_args.ep_join_rank_offset
+                display_tp_rank = tp_rank + offset
+                display_moe_ep_rank = moe_ep_rank + offset
+                display_dp_rank = (
+                    dp_rank + offset if dp_rank is not None else None
+                )
+
                 with self.env_lock, maybe_reindex_device_id(gpu_id) as gpu_id:
                     proc = mp.Process(
                         target=self.run_scheduler_process_func,
@@ -632,6 +646,9 @@ class DataParallelController:
                             pp_rank,
                             dp_rank,
                             writer,
+                            display_tp_rank,
+                            display_dp_rank,
+                            display_moe_ep_rank,
                         ),
                     )
                     with memory_saver_adapter.configure_subprocess(), numa_utils.configure_subprocess(

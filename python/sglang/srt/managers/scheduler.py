@@ -3765,8 +3765,20 @@ def configure_scheduler_process(
     moe_ep_rank: int,
     pp_rank: int,
     dp_rank: Optional[int],
+    display_tp_rank: Optional[int] = None,
+    display_dp_rank: Optional[int] = None,
+    display_moe_ep_rank: Optional[int] = None,
 ) -> Optional[int]:
     """Configure scheduler worker: logging, process title, etc.
+
+    The ``display_*_rank`` kwargs are cosmetic overrides used only by the
+    log prefix and ``setproctitle``. Runtime ranks (``tp_rank``,
+    ``dp_rank``, ``moe_ep_rank``) are passed unchanged to the
+    ``Scheduler`` constructor so ZMQ socket binding, NIXL ``connect_ranks``,
+    and Mooncake PG ``init_process_group`` see local ranks. Elastic-EP
+    joiners pass ``display_* = local_* + ep_join_rank_offset`` so a
+    joiner with ``--ep-join-rank-offset 4 --tp 4`` logs as
+    ``DP4 TP4 EP4`` even though its local rank is 0.
 
     Returns:
         dp_rank
@@ -3778,9 +3790,15 @@ def configure_scheduler_process(
         # [For Router] if env var "SGLANG_DP_RANK" exist, set dp_rank to the value of the env var
         dp_rank = int(os.environ["SGLANG_DP_RANK"])
 
+    shown_dp = display_dp_rank if display_dp_rank is not None else dp_rank
+    shown_tp = display_tp_rank if display_tp_rank is not None else tp_rank
+    shown_moe_ep = (
+        display_moe_ep_rank if display_moe_ep_rank is not None else moe_ep_rank
+    )
+
     prefix = ""
-    if dp_rank is not None:
-        prefix += f" DP{dp_rank}"
+    if shown_dp is not None:
+        prefix += f" DP{shown_dp}"
     if server_args.pp_size > 1:
         prefix += f" PP{pp_rank}"
     if server_args.attn_cp_size > 1:
@@ -3788,9 +3806,9 @@ def configure_scheduler_process(
     if server_args.moe_dp_size > 1:
         prefix += f" MOE_DP{moe_dp_rank}"
     if server_args.tp_size > 1:
-        prefix += f" TP{tp_rank}"
+        prefix += f" TP{shown_tp}"
     if server_args.ep_size > 1:
-        prefix += f" EP{moe_ep_rank}"
+        prefix += f" EP{shown_moe_ep}"
 
     # Config the process
     setproctitle.setproctitle(f"sglang::scheduler{prefix.replace(' ', '_')}")
@@ -3824,6 +3842,9 @@ def run_scheduler_process(
     pp_rank: int,
     dp_rank: Optional[int],
     pipe_writer,
+    display_tp_rank: Optional[int] = None,
+    display_dp_rank: Optional[int] = None,
+    display_moe_ep_rank: Optional[int] = None,
 ):
     dp_rank = configure_scheduler_process(
         server_args,
@@ -3834,6 +3855,9 @@ def run_scheduler_process(
         moe_ep_rank,
         pp_rank,
         dp_rank,
+        display_tp_rank=display_tp_rank,
+        display_dp_rank=display_dp_rank,
+        display_moe_ep_rank=display_moe_ep_rank,
     )
     parent_process = psutil.Process().parent()
 
