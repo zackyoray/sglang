@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import random
 from dataclasses import dataclass
 from pathlib import Path
@@ -239,24 +240,34 @@ class ExpertLocationMetadata:
             logical_to_all_physical_map != -1, dim=-1
         )
 
+        ep_rank = torch.distributed.get_rank() % ep_size
+        dispatch_map = (
+            compute_logical_to_rank_dispatch_physical_map(
+                server_args=server_args,
+                logical_to_all_physical_map=logical_to_all_physical_map,
+                ep_size=ep_size,
+                num_physical_experts=num_physical_experts,
+                ep_rank=ep_rank,
+            )
+            if server_args.ep_dispatch_algorithm == "static"
+            else None
+        )
+
+        _maybe_log_dispatch_map_probe(
+            tag="init_raw",
+            ep_rank=ep_rank,
+            ep_size=ep_size,
+            num_physical_experts=num_physical_experts,
+            dispatch_map=dispatch_map,
+        )
+
         return ExpertLocationMetadata(
             physical_to_logical_map=physical_to_logical_map,
             physical_to_logical_map_cpu=physical_to_logical_map.cpu(),
             logical_to_all_physical_map=logical_to_all_physical_map_padded,
             logical_to_all_physical_map_cpu=logical_to_all_physical_map_padded.cpu(),
             logical_to_all_physical_map_num_valid=logical_to_all_physical_map_num_valid,
-            logical_to_rank_dispatch_physical_map=(
-                compute_logical_to_rank_dispatch_physical_map(
-                    server_args=server_args,
-                    logical_to_all_physical_map=logical_to_all_physical_map,
-                    ep_size=ep_size,
-                    num_physical_experts=num_physical_experts,
-                    # TODO improve when we have real EP rank
-                    ep_rank=torch.distributed.get_rank() % ep_size,
-                )
-                if server_args.ep_dispatch_algorithm == "static"
-                else None
-            ),
+            logical_to_rank_dispatch_physical_map=dispatch_map,
         )
 
     # -------------------------------- mutation ------------------------------------
@@ -517,6 +528,39 @@ def compute_logical_to_rank_dispatch_physical_map(
         assert torch.all(logical_to_rank_dispatch_physical_map[r_] != -1)
 
     return logical_to_rank_dispatch_physical_map[ep_rank, :, :].to(device)
+
+
+def _maybe_log_dispatch_map_probe(
+    *,
+    tag: str,
+    ep_rank: int,
+    ep_size: int,
+    num_physical_experts: int,
+    dispatch_map: Optional[torch.Tensor],
+) -> None:
+    """Env-gated one-shot dump of dispatch_map sample slots for bisection.
+
+    Enable with SGLANG_DEBUG_DISPATCH_MAP=1. Dumps the chosen physical
+    slot for layer 0, logicals 0..3 from this rank's perspective. Used
+    to compare baseline vs recovery-style dispatch decisions when
+    diagnosing post-scale accuracy regressions.
+    """
+    if os.environ.get("SGLANG_DEBUG_DISPATCH_MAP", "0") != "1":
+        return
+    if dispatch_map is None:
+        logger.info(
+            "[Elastic EP][dispatch-probe][%s] ep_rank=%d ep_size=%d num_physical=%d "
+            "dispatch_map=None (non-static algorithm)",
+            tag, ep_rank, ep_size, num_physical_experts,
+        )
+        return
+    sample = dispatch_map[0, :4].tolist() if dispatch_map.numel() else []
+    logger.info(
+        "[Elastic EP][dispatch-probe][%s] ep_rank=%d ep_size=%d num_physical=%d "
+        "shape=%s layer=0 logicals=[0..3] -> physical_slots=%s",
+        tag, ep_rank, ep_size, num_physical_experts,
+        list(dispatch_map.shape), sample,
+    )
 
 
 def _logical_to_all_physical_raw(
