@@ -7162,30 +7162,20 @@ class PortArgs:
                 )
                 raise
 
-            # Phase E: joiner schedulers send outputs directly to the primary's
-            # tokenizer/detokenizer (skipping the joiner's own tokenizer which
-            # would otherwise be orphaned post-adoption). Primary tokenizer is
-            # at primary_dist_init_port + 1.
-            tokenizer_addr = NetworkAddress(dist_init_host, port_base).to_tcp()
-            detokenizer_addr = NetworkAddress(
-                dist_init_host, detokenizer_port
-            ).to_tcp()
-            if elastic_mode_active and server_args.is_ep_joiner:
-                primary_addr = NetworkAddress.parse(server_args.dist_init_addr)
-                primary_port_base = primary_addr.port + 1
-                tokenizer_addr = NetworkAddress(
-                    primary_addr.host, primary_port_base
-                ).to_tcp()
-                detokenizer_addr = NetworkAddress(
-                    primary_addr.host, primary_port_base + 1
-                ).to_tcp()
-
+            # Note: tokenizer/detokenizer redirect for joiner schedulers
+            # happens in DataParallelController.launch_tensor_parallel_group
+            # per-rank. The top-level PortArgs (used by the joiner's own
+            # TokenizerManager) MUST keep local addresses so the joiner can
+            # bind its own tokenizer socket. Phase E.1 only redirects the
+            # scheduler_input_port via DP_PREBIND_PORT_DELTA above.
             return PortArgs(
-                tokenizer_ipc_name=tokenizer_addr,
+                tokenizer_ipc_name=NetworkAddress(dist_init_host, port_base).to_tcp(),
                 scheduler_input_ipc_name=NetworkAddress(
                     dist_init_host, scheduler_input_port
                 ).to_tcp(),
-                detokenizer_ipc_name=detokenizer_addr,
+                detokenizer_ipc_name=NetworkAddress(
+                    dist_init_host, detokenizer_port
+                ).to_tcp(),
                 nccl_port=nccl_port,
                 rpc_ipc_name=NetworkAddress(dist_init_host, rpc_port).to_tcp(),
                 metrics_ipc_name=NetworkAddress(dist_init_host, metrics_port).to_tcp(),
