@@ -431,7 +431,9 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
         global_physical_count = _convert_per_token_to_global_physical_count(
             num_tokens,
             num_layers=self._expert_location_metadata.num_layers,
-            num_physical_experts=self._expert_location_metadata.num_physical_experts,
+            # Statistics gather: only currently-joined ranks contribute. After
+            # Phase C.2 this differs from num_physical_max; today they're equal.
+            num_physical_experts=self._expert_location_metadata.num_physical_active,
             _topk_ids_of_layer=self._topk_ids_of_layer,
         )
 
@@ -480,7 +482,10 @@ class _LayerBasedGpuSinglePassGatherer(_SinglePassGatherer):
             (
                 self._expert_location_metadata.num_layers,
                 (
-                    self._expert_location_metadata.num_physical_experts
+                    # Buffer shape: pre-allocate to the ceiling so scale events
+                    # don't trigger reallocation. After Phase C.2 this differs
+                    # from num_physical_active; today they're equal.
+                    self._expert_location_metadata.num_physical_max
                     if enable_global_physical_experts
                     else self._expert_location_metadata.num_local_physical_experts
                 ),
@@ -501,7 +506,8 @@ class _LayerBasedGpuSinglePassGatherer(_SinglePassGatherer):
                 self._data,
                 rank=self._rank,
                 num_local_physical_experts=self._expert_location_metadata.num_local_physical_experts,
-                num_physical_experts=self._expert_location_metadata.num_physical_experts,
+                # Statistics gather: only currently-joined ranks contribute.
+                num_physical_experts=self._expert_location_metadata.num_physical_active,
             )
 
         return dict(global_physical_count=global_physical_count)
@@ -548,7 +554,8 @@ class _DeepepNormalSinglePassGatherer(_LayerBasedCpuSinglePassGatherer):
             local_physical_count,
             rank=self._rank,
             num_local_physical_experts=self._expert_location_metadata.num_local_physical_experts,
-            num_physical_experts=self._expert_location_metadata.num_physical_experts,
+            # Statistics gather: only currently-joined ranks contribute.
+            num_physical_experts=self._expert_location_metadata.num_physical_active,
         )
         return dict(global_physical_count=global_physical_count)
 
@@ -844,8 +851,10 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         self._global_physical_count_of_buffered_step = _Buffer.init_new(
             item_shape=(
                 self._expert_location_metadata.num_layers,
-                # Cannot use local_physical_count to support select_experts
-                self._expert_location_metadata.num_physical_experts,
+                # Cannot use local_physical_count to support select_experts.
+                # Buffer shape: pre-allocate to the ceiling so scale events
+                # don't trigger reallocation.
+                self._expert_location_metadata.num_physical_max,
             ),
             buffer_size=self._server_args.expert_distribution_recorder_buffer_size,
             dtype=torch.int32,

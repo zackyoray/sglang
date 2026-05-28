@@ -57,7 +57,10 @@ class ExpertLocationDispatchInfo:
             partial_logical_to_all_physical_map_num_valid=expert_location_metadata.logical_to_all_physical_map_num_valid[
                 layer_id, :
             ],
-            num_physical_experts=expert_location_metadata.num_physical_experts,
+            # Routing math: dispatch decisions are made for currently-joined
+            # ranks only. After Phase C.2 this differs from num_physical_max;
+            # today they're equal.
+            num_physical_experts=expert_location_metadata.num_physical_active,
         )
 
 
