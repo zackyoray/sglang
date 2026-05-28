@@ -1630,6 +1630,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             global_ep_rank,
         )
 
+    def _joiner_slot_offset_for_scale(self, from_ep_size: int) -> int:
+        """Where the joiner's DPC slots begin in the primary's pre-allocated
+        ``workers`` list.
+
+        Under recovery-style Phase B, the primary pre-allocates
+        ``max_dp_size`` DPC worker slots at launch and activates a
+        contiguous range on each scale event. At a scale from
+        ``from_ep_size`` to ``effective_ep_size``, the new joiner's
+        slots occupy ``[from_ep_size, effective_ep_size)``. This helper
+        returns ``from_ep_size`` (the primary-side offset where the
+        new ports plug in). Note that this differs from the joiner-
+        process-launched ``--ep-join-rank-offset`` only when the
+        primary has already grown beyond ``tp_size`` from a prior
+        scale event — today both equal ``from_ep_size`` for a
+        single-step scale.
+        """
+        return from_ep_size
+
     def _fetch_joiner_worker_ports(self) -> Optional[List[int]]:
         """Synchronous REQ to the joiner's DP handshake endpoint.
 
@@ -1784,8 +1802,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     from sglang.srt.managers.io_struct import (
                         ElasticScaleWorkerPortsReq,
                     )
+                    # The joiner's local DP rank order maps to global slot
+                    # indices [ep_join_rank_offset .. +tp_size). Pass the
+                    # offset so the primary's pre-allocated DPC slots are
+                    # activated in place rather than appended.
+                    slot_offset = (
+                        self._joiner_slot_offset_for_scale(from_ep_size)
+                    )
                     self._pending_elastic_scale_msg = ElasticScaleWorkerPortsReq(
-                        new_worker_ports=worker_ports
+                        new_worker_ports=worker_ports,
+                        slot_offset=slot_offset,
                     )
 
             ElasticEPStateManager.instance().snapshot_active_to_last()

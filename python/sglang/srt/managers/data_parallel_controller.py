@@ -86,10 +86,27 @@ class LoadBalanceMethod(Enum):
 
 
 class DPBudget:
-    def __init__(self, dp_size: int):
+    """Per-rank load counters used by total_requests / total_tokens dispatchers.
+
+    Sized to ``max_dp_size`` once at construction; an optional ``active_mask``
+    filters dispatch decisions to currently-joined ranks. Inactive slots are
+    reported as load=infinity so the ``min(...)`` selection skips them.
+    """
+
+    def __init__(self, dp_size: int, active_mask: Optional[List[bool]] = None):
         self.dp_size = dp_size
         self.total_requests = [0] * dp_size
         self.total_tokens = [0] * dp_size
+        self.active_mask = (
+            list(active_mask) if active_mask is not None else [True] * dp_size
+        )
+
+    def refresh_active_mask(self, mask: List[bool]) -> None:
+        """Replace the active mask. Caller invokes this on scale events."""
+        assert len(mask) == self.dp_size, (
+            f"active mask length {len(mask)} != dp_size {self.dp_size}"
+        )
+        self.active_mask = list(mask)
 
     def update_budget(self, load_update: WatchLoadUpdateReq):
         """Update the budget."""
@@ -98,13 +115,23 @@ class DPBudget:
             self.total_tokens[load.dp_rank] = load.num_tokens
 
     def dispatch(self, method: LoadBalanceMethod):
+        # Sentinel "do not pick me" load for inactive slots.
+        INACTIVE = float("inf")
         if method == LoadBalanceMethod.TOTAL_REQUESTS:
-            target_rank = self.total_requests.index(min(self.total_requests))
+            scored = [
+                self.total_requests[i] if self.active_mask[i] else INACTIVE
+                for i in range(self.dp_size)
+            ]
+            target_rank = scored.index(min(scored))
         elif method == LoadBalanceMethod.TOTAL_TOKENS:
-            # Use total_requests as a tie-breaker when total_tokens are equal
+            # Use total_requests as a tie-breaker when total_tokens are equal.
             target_rank = min(
                 range(self.dp_size),
-                key=lambda i: (self.total_tokens[i], self.total_requests[i]),
+                key=lambda i: (
+                    (INACTIVE, INACTIVE)
+                    if not self.active_mask[i]
+                    else (self.total_tokens[i], self.total_requests[i])
+                ),
             )
         else:
             return None
@@ -151,16 +178,45 @@ class DataParallelController:
         }
         self.dispatching = dispatch_lookup[self.load_balance_method]
 
-        # Load balance budget
-        self.dp_budget = DPBudget(server_args.dp_size)
+        # Recovery-style Phase B: pre-allocate all elasticity-touched
+        # bookkeeping to ``max_dp_size`` (the ceiling set by --max-ep-size)
+        # so scale events flip activation bits on fixed-shape structures
+        # rather than appending. ``max_dp_size`` falls back to ``dp_size``
+        # for non-elastic deployments.
+        self.launch_dp_size: int = server_args.dp_size
+        self.max_dp_size: int = server_args.max_ep_size or server_args.dp_size
+        assert self.max_dp_size >= self.launch_dp_size, (
+            f"--max-ep-size ({self.max_dp_size}) must be >= "
+            f"--dp ({self.launch_dp_size})."
+        )
+
+        # Active mask: launch slots are active immediately, future slots
+        # remain False until a scale event fills them.
+        self.dp_active: List[bool] = (
+            [True] * self.launch_dp_size
+            + [False] * (self.max_dp_size - self.launch_dp_size)
+        )
+
+        # Load balance budget sized to max_dp_size and aware of which
+        # slots are currently joined. Refreshed on scale events.
+        self.dp_budget = DPBudget(self.max_dp_size, active_mask=self.dp_active)
 
         # To protect changing env vars to set CUDA_VISIBLE_DEVICES.
         self.env_lock = threading.Lock()
 
         # Launch data parallel workers
         self.scheduler_procs = []
-        self.workers: List[zmq.Socket] = [None] * server_args.dp_size
-        self.status: List[bool] = [True] * server_args.dp_size
+        # Worker sockets are pre-allocated to max_dp_size; entries beyond
+        # launch_dp_size start as None and are filled on add_elastic_workers.
+        self.workers: List[Optional[zmq.Socket]] = [None] * self.max_dp_size
+        # status historically tracked NIXL fault-detection per rank. Pre-
+        # allocate to max_dp_size; future slots are False until joined,
+        # which is consistent with the dp_active mask above.
+        self.status: List[bool] = list(self.dp_active)
+        # Cached list of currently-active slot indices for routing hot path.
+        # Invalidated on every dp_active change via _refresh_active_workers.
+        self._active_workers: List[int] = list(range(self.launch_dp_size))
+        self._active_count_cache: int = self.launch_dp_size
 
         if server_args.enable_dp_attention:
             self.launch_dp_attention_schedulers(server_args, port_args)
@@ -188,52 +244,114 @@ class DataParallelController:
             start_cpu_monitor_thread("data_parallel_controller")
 
     def send_to_all_workers(self, obj):
+        # Iterates the full max-sized list; skips inactive (None) slots.
+        # status[i] is False for both NIXL-faulted and not-yet-joined slots.
         for i, worker in enumerate(self.workers):
-            if self.status[i]:
+            if worker is not None and self.status[i]:
                 worker.send_pyobj(obj)
 
     def send_control_message(self, obj):
-        # Send control messages to first worker of tp group
-        for worker in self.workers[:: self.control_message_step]:
-            worker.send_pyobj(obj)
+        # Send control messages to first worker of tp group. Walk
+        # active workers only (slots beyond active count are None).
+        for i in self._active_workers[:: self.control_message_step]:
+            worker = self.workers[i]
+            if worker is not None:
+                worker.send_pyobj(obj)
 
     def handle_load_update_req(self, obj):
         self.dp_budget.update_budget(obj)
 
     def update_active_ranks(self, ranks: ActiveRanksOutput):
-        # In elastic mode, controller workers can exceed launch-time dp_size
-        # while ranks.status still reflects only the primary TP view, and
-        # joiner-half faults live in the joiner's own active_ranks tensor.
-        # Keep registered workers routable here; non-elastic mode uses the
-        # direct assignment below.
+        # In elastic mode, ranks.status reflects only the primary TP view
+        # and joiner-half faults live in the joiner's own active_ranks
+        # tensor. Keep registered workers routable by mirroring dp_active
+        # (which tracks "is this slot joined?") rather than overwriting
+        # with ranks.status. Non-elastic mode uses the direct assignment.
         if self.server_args.elastic_ep_backend is not None:
-            self.status = [True] * len(self.workers)
+            self.status = list(self.dp_active)
             return
-        self.status = ranks.status
+        # Non-elastic: dp_size == max_dp_size, ranks.status length matches.
+        if len(ranks.status) != self.max_dp_size:
+            logger.warning(
+                "[DPC] update_active_ranks: status len=%d != max_dp_size=%d; "
+                "ignoring update",
+                len(ranks.status), self.max_dp_size,
+            )
+            return
+        self.status = list(ranks.status)
 
-    def add_elastic_workers(self, new_worker_ports: List[int]):
-        """Add joiner scheduler workers after elastic scale-up.
+    def add_elastic_workers(
+        self, new_worker_ports: List[int], slot_offset: int = 0
+    ):
+        """Activate joiner scheduler workers after elastic scale-up.
 
-        Creates new ZMQ PUSH sockets to the joiner's scheduler endpoints
-        and extends the workers/status lists. Called when the primary
-        detects new ranks have joined via Mooncake PG.
+        Under recovery-style Phase B, ``self.workers`` is pre-allocated to
+        ``max_dp_size``; this method binds PUSH sockets for the slots
+        ``[slot_offset, slot_offset + len(new_worker_ports))`` and flips
+        the corresponding ``dp_active`` bits. The list never grows.
+
+        ``slot_offset`` lets the joiner specify where its ports plug in
+        (today: equal to ``from_ep_size`` / ``ep_join_rank_offset`` for a
+        single-step scale; future multi-step scales pick up successive
+        offsets). When the caller doesn't set it, falls back to
+        "first contiguous run of inactive slots" for backwards
+        compatibility — but this is not the validated path.
         """
+        if slot_offset == 0 and any(self.dp_active[: len(new_worker_ports)]):
+            # Backwards-compat: no slot_offset and slot 0 already active
+            # means the caller is on the legacy "append" code path. Find
+            # the first inactive slot and use that as the offset.
+            slot_offset = self.dp_active.index(False)
+
+        end = slot_offset + len(new_worker_ports)
+        if end > self.max_dp_size:
+            raise ValueError(
+                f"[Elastic EP] add_elastic_workers: "
+                f"slot_offset={slot_offset} + len(ports)={len(new_worker_ports)} "
+                f"exceeds max_dp_size={self.max_dp_size}. Restart with a "
+                f"larger --max-ep-size."
+            )
+
         bind_host = "127.0.0.1"
         if self.server_args.dist_init_addr:
             bind_host = NetworkAddress.parse(self.server_args.dist_init_addr).host
 
         # Primary binds PUSH sockets here; joiner schedulers connect PULL.
-        for port in new_worker_ports:
+        for i, port in enumerate(new_worker_ports):
+            slot = slot_offset + i
+            assert not self.dp_active[slot], (
+                f"[Elastic EP] add_elastic_workers: slot {slot} is already "
+                f"active. This indicates a duplicate scale event or a stale "
+                f"join. Aborting to avoid leaking the previous socket."
+            )
             endpoint = NetworkAddress(bind_host, port).to_tcp()
             sock = get_zmq_socket(self.context, zmq.PUSH, endpoint, True)
-            self.workers.append(sock)
-            self.status.append(True)
+            self.workers[slot] = sock
+            self.dp_active[slot] = True
+            # status mirrors dp_active at scale-event time; NIXL fault
+            # detection updates it later via update_active_ranks().
+            self.status[slot] = True
 
-        self.dp_budget = DPBudget(len(self.workers))
+        self.dp_budget.refresh_active_mask(self.dp_active)
+        self._refresh_active_workers()
         logger.info(
-            "[Elastic EP] DataParallelController grown to %d workers",
-            len(self.workers),
+            "[Elastic EP] DataParallelController activated slots %s "
+            "(active=%d / max=%d)",
+            list(range(slot_offset, end)),
+            self._active_count_cache,
+            self.max_dp_size,
         )
+
+    def _refresh_active_workers(self) -> None:
+        """Recompute the cached active-worker index list and count."""
+        self._active_workers = [
+            i for i, active in enumerate(self.dp_active) if active
+        ]
+        self._active_count_cache = len(self._active_workers)
+
+    def active_dp_count(self) -> int:
+        """Number of currently-joined DP workers (read-mostly)."""
+        return self._active_count_cache
 
     def dispatching_with_trace(self, req: Req):
         req.time_stats = DPControllerReqTimeStats.new_from_obj(req.time_stats)
@@ -261,7 +379,12 @@ class DataParallelController:
                 (ProfileReq, self.send_to_all_workers),
                 (WatchLoadUpdateReq, self.handle_load_update_req),
                 (ActiveRanksOutput, self.update_active_ranks),
-                (ElasticScaleWorkerPortsReq, lambda msg: self.add_elastic_workers(msg.new_worker_ports)),
+                (
+                    ElasticScaleWorkerPortsReq,
+                    lambda msg: self.add_elastic_workers(
+                        msg.new_worker_ports, slot_offset=msg.slot_offset
+                    ),
+                ),
             ]
         )
         self._request_dispatcher.add_fallback_fn(self.send_control_message)
@@ -677,22 +800,37 @@ class DataParallelController:
         if self.maybe_external_dp_rank_routing(req):
             return
 
-        while True:
-            if self.status[self.round_robin_counter]:
-                target = self.round_robin_counter
-                logger.debug(f"Choose worker {target}")
-                self.workers[target].send_pyobj(req)
-                self.round_robin_counter = (self.round_robin_counter + 1) % len(
-                    self.workers
-                )
-                break
-            self.round_robin_counter = (self.round_robin_counter + 1) % len(
-                self.workers
+        # Walk only over active slots. self._active_workers is the cached
+        # list of currently-joined slot indices; round_robin_counter is an
+        # index into THAT list, not into the full self.workers.
+        active = self._active_workers
+        if not active:
+            raise RuntimeError(
+                "round_robin_scheduler: no active DP workers (cluster not joined?)"
             )
+        attempts = 0
+        while attempts < len(active):
+            slot = active[self.round_robin_counter % len(active)]
+            self.round_robin_counter = (self.round_robin_counter + 1) % len(active)
+            if self.status[slot]:
+                logger.debug(f"Choose worker {slot}")
+                self.workers[slot].send_pyobj(req)
+                return
+            attempts += 1
+        raise RuntimeError(
+            f"round_robin_scheduler: all {len(active)} active DP workers "
+            f"have status=False (NIXL-faulted?); cannot route request"
+        )
 
     def follow_bootstrap_room_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
             return
+
+        active = self._active_workers
+        if not active:
+            raise RuntimeError(
+                "follow_bootstrap_room_scheduler: no active DP workers"
+            )
 
         # Set default bootstrap_room if in FAKE auto mode and room is None
         if (
@@ -700,20 +838,24 @@ class DataParallelController:
             and self.server_args.disaggregation_transfer_backend == "fake"
         ):
             req.bootstrap_room = self.round_robin_counter
-            self.round_robin_counter = (self.round_robin_counter + 1) % len(
-                self.workers
-            )
+            self.round_robin_counter = (self.round_robin_counter + 1) % len(active)
 
         assert req.bootstrap_room is not None, (
             "req.bootstrap_room should not be None. Do not send requests directly to "
             "prefill or decode instances; send to the router instead."
         )
-        target_rank = req.bootstrap_room % len(self.workers)
+        # bootstrap_room hashes into the active workers list, not the full
+        # max_dp_size list. After scale, this re-hashes (same as today's
+        # append-style behavior — see plan.md Phase 11.x for consistent
+        # hashing follow-up).
+        target_rank = active[req.bootstrap_room % len(active)]
         self.workers[target_rank].send_pyobj(req)
 
     def total_requests_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
             return
+        # DPBudget.dispatch already returns a slot index in [0, max_dp_size)
+        # filtered by the active mask via INACTIVE sentinels.
         target_worker = self.dp_budget.dispatch(LoadBalanceMethod.TOTAL_REQUESTS)
         self.workers[target_worker].send_pyobj(req)
 
