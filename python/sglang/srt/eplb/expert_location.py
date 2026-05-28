@@ -397,10 +397,12 @@ def _compute_logical_to_all_physical_map(
     num_logical_experts: int,
     ep_size: int,
     moe_ep_rank: int,
+    active_mask: Optional[torch.Tensor] = None,
 ):
     # This is rarely called, so we use for loops for maximum clarity
 
     num_layers, num_physical_experts = physical_to_logical_map.shape
+    num_local_gpu_physical_experts = num_physical_experts // ep_size
 
     logical_to_all_physical_map = [
         [[] for _ in range(num_logical_experts)] for _ in range(num_layers)
@@ -409,6 +411,10 @@ def _compute_logical_to_all_physical_map(
     # Find out the candidate physical experts for each logical expert on each layer
     for layer_id in range(num_layers):
         for physical_expert_id in range(num_physical_experts):
+            if active_mask is not None:
+                owner_rank = physical_expert_id // num_local_gpu_physical_experts
+                if not bool(active_mask[owner_rank]):
+                    continue
             logical_expert_id = physical_to_logical_map[
                 layer_id, physical_expert_id
             ].item()
@@ -419,7 +425,6 @@ def _compute_logical_to_all_physical_map(
     # Replace by the physical expert on local GPU or node if possible
     if moe_ep_rank is not None:
         num_gpus_per_node = server_args.ep_size // server_args.nnodes
-        num_local_gpu_physical_experts = num_physical_experts // ep_size
         num_local_node_physical_experts = (
             num_local_gpu_physical_experts * num_gpus_per_node
         )
@@ -468,6 +473,7 @@ def compute_logical_to_rank_dispatch_physical_map(
     num_physical_experts: int,
     ep_rank: int,
     seed: int = 42,
+    active_mask: Optional[torch.Tensor] = None,
 ):
     r = random.Random(seed)
 
@@ -480,6 +486,11 @@ def compute_logical_to_rank_dispatch_physical_map(
     num_layers, num_logical_experts, _ = logical_to_all_physical_map.shape
     dtype = logical_to_all_physical_map.dtype
 
+    if active_mask is None:
+        active_ranks = list(range(ep_size))
+    else:
+        active_ranks = [r_ for r_ in range(ep_size) if bool(active_mask[r_])]
+
     result_list = [
         [[-1] * num_logical_experts for _ in range(num_layers)] for _ in range(ep_size)
     ]
@@ -489,9 +500,15 @@ def compute_logical_to_rank_dispatch_physical_map(
             candidate_physical_expert_ids = _logical_to_all_physical_raw(
                 logical_to_all_physical_map, layer_id, logical_expert_id
             )
+            if active_mask is not None:
+                candidate_physical_expert_ids = [
+                    p
+                    for p in candidate_physical_expert_ids
+                    if bool(active_mask[p // num_local_gpu_physical_experts])
+                ]
 
             remaining_ranks = []
-            for moe_ep_rank in range(ep_size):
+            for moe_ep_rank in active_ranks:
                 val = _find_nearest_expert(
                     candidate_physical_expert_ids=candidate_physical_expert_ids,
                     num_local_gpu_physical_experts=num_local_gpu_physical_experts,
@@ -504,7 +521,7 @@ def compute_logical_to_rank_dispatch_physical_map(
                 if val == -1:
                     remaining_ranks.append(moe_ep_rank)
 
-            if remaining_ranks:
+            if remaining_ranks and candidate_physical_expert_ids:
                 choices = _fair_choices(
                     candidate_physical_expert_ids, k=len(remaining_ranks), r=r
                 )
@@ -512,7 +529,8 @@ def compute_logical_to_rank_dispatch_physical_map(
                     result_list[moe_ep_rank][layer_id][logical_expert_id] = choice
 
     logical_to_rank_dispatch_physical_map = torch.tensor(result_list, dtype=dtype)
-    assert torch.all(logical_to_rank_dispatch_physical_map != -1)
+    for r_ in active_ranks:
+        assert torch.all(logical_to_rank_dispatch_physical_map[r_] != -1)
 
     return logical_to_rank_dispatch_physical_map[ep_rank, :, :].to(device)
 
