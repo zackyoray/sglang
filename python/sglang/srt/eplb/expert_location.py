@@ -54,28 +54,12 @@ class ExpertLocationMetadata:
 
     @property
     def num_physical_active(self) -> int:
-        """Currently-active physical expert slot count.
-
-        Today (pre-Phase-C.2), this is always equal to
-        ``num_physical_experts`` because ``physical_to_logical_map`` is
-        sized to the active count. After Phase C.2 pre-allocates the
-        map to ``P_max`` columns from launch, this property derives the
-        active count from the EP active mask. Use this where the value
-        affects routing math, statistics gathering, or any code that
-        must skip reserved-but-unjoined ranks.
-        """
+        # Active slot count. Diverges from num_physical_max in C.2c.
         return self.physical_to_logical_map.shape[1]
 
     @property
     def num_physical_max(self) -> int:
-        """Pre-allocated physical expert slot count (the buffer ceiling).
-
-        Today (pre-Phase-C.2), this equals ``num_physical_experts``.
-        After Phase C.2, this returns the launch-time
-        ``num_local_per_rank * max_ep_size`` ceiling. Use this for
-        buffer-shape decisions where the structure must accommodate
-        the cluster's eventual maximum expert pool.
-        """
+        # Pre-allocated ceiling. Diverges from num_physical_active in C.2c.
         return self.physical_to_logical_map.shape[1]
 
     @property

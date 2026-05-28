@@ -431,9 +431,8 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
         global_physical_count = _convert_per_token_to_global_physical_count(
             num_tokens,
             num_layers=self._expert_location_metadata.num_layers,
-            # Statistics gather: only currently-joined ranks contribute. After
-            # Phase C.2 this differs from num_physical_max; today they're equal.
-            num_physical_experts=self._expert_location_metadata.num_physical_active,
+            # Output feeds the buffered-step recorder; must match P_max.
+            num_physical_experts=self._expert_location_metadata.num_physical_max,
             _topk_ids_of_layer=self._topk_ids_of_layer,
         )
 
@@ -506,8 +505,8 @@ class _LayerBasedGpuSinglePassGatherer(_SinglePassGatherer):
                 self._data,
                 rank=self._rank,
                 num_local_physical_experts=self._expert_location_metadata.num_local_physical_experts,
-                # Statistics gather: only currently-joined ranks contribute.
-                num_physical_experts=self._expert_location_metadata.num_physical_active,
+                # Output feeds the buffered-step recorder; must match P_max.
+                num_physical_experts=self._expert_location_metadata.num_physical_max,
             )
 
         return dict(global_physical_count=global_physical_count)
@@ -554,8 +553,8 @@ class _DeepepNormalSinglePassGatherer(_LayerBasedCpuSinglePassGatherer):
             local_physical_count,
             rank=self._rank,
             num_local_physical_experts=self._expert_location_metadata.num_local_physical_experts,
-            # Statistics gather: only currently-joined ranks contribute.
-            num_physical_experts=self._expert_location_metadata.num_physical_active,
+            # Output feeds the buffered-step recorder; must match P_max.
+            num_physical_experts=self._expert_location_metadata.num_physical_max,
         )
         return dict(global_physical_count=global_physical_count)
 
