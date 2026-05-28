@@ -545,16 +545,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     "elastic scale-up post-scale EPLB rebalance is not implemented yet"
                 )
 
-            if self.server_args.ep_join_mode == "recover":
-                # Recovery: the original world is healthy. Mark all peers
-                # active so cuda graphs and routing immediately resume the
-                # full topology after rejoin.
-                ElasticEPStateManager.instance().reset()
-            # After join_process_groups returns, all ranks in THIS step's
-            # frontier (primary + this joiner group) are confirmed active.
-            # Fill only [:step_effective] with 1 so reserved-but-unjoined
-            # slots beyond the current step (in a future multi-step scale-up)
-            # stay at 0 and is_scaling() can still detect them.
+            # Mark this step's frontier (primary + this joiner group) as
+            # active. Reserved slots beyond step_effective_ep_size stay at 0
+            # so a future multi-step scale-up's is_scaling() can detect them.
+            # Same end state for both scale and recover paths.
             inst = ElasticEPStateManager.instance()
             if inst is not None:
                 inst.active_ranks.zero_()
