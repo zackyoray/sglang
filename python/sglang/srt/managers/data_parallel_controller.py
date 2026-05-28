@@ -919,7 +919,12 @@ def run_data_parallel_controller_process(
                 "max_req_input_len": controller.max_req_input_len,
             }
         )
-        if server_args.node_rank == 0:
+        # Phase E: under elastic mode, joiner schedulers PULL from primary's
+        # pre-bound deterministic addresses (PortArgs.init_new + DPC pre-bind).
+        # The joiner-side DPC's event loop has nothing to do post-construction:
+        # all routing goes through the primary DPC. Skip it; just supervise
+        # the schedulers.
+        if server_args.node_rank == 0 and not server_args.is_ep_joiner:
             controller.event_loop()
         for proc in controller.scheduler_procs:
             proc.join()
