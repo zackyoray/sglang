@@ -161,9 +161,11 @@ class DataParallelController:
         # For DP balance
         self.global_balance_id = 0
 
-        # Init inter-process communication
+        # Init inter-process communication.
+        # Phase E: joiners skip recv_from_tokenizer (event_loop is also
+        # skipped, so the socket would have no readers).
         self.context = zmq.Context(1 + server_args.dp_size)
-        if server_args.node_rank == 0:
+        if server_args.node_rank == 0 and not server_args.is_ep_joiner:
             self.recv_from_tokenizer = get_zmq_socket(
                 self.context, zmq.PULL, port_args.scheduler_input_ipc_name, False
             )
@@ -537,6 +539,8 @@ class DataParallelController:
         worker_ports = []
         if server_args.node_rank == 0:
             if elastic_mode_active and not server_args.is_ep_joiner:
+                # Primary: pre-bind max_dp_size sockets at deterministic
+                # addresses. Joiner schedulers PULL from these directly.
                 from sglang.srt.server_args import DP_PREBIND_PORT_DELTA
                 prebind_base = (
                     NetworkAddress.parse(server_args.dist_init_addr).port
@@ -557,9 +561,13 @@ class DataParallelController:
                         "(active=%s)",
                         slot, addr, slot < server_args.dp_size,
                     )
+            elif elastic_mode_active and server_args.is_ep_joiner:
+                # Joiner: schedulers PULL from primary's pre-bound addresses
+                # (computed in PortArgs.init_new). The joiner DPC has no
+                # routing role; skip socket binding entirely.
+                pass
             else:
-                # Non-elastic or joiner: today's auto-pick path (joiner DPC
-                # still binds local sockets pre-Phase-E.3; will be removed).
+                # Non-elastic: today's auto-pick path.
                 for dp_rank in range(server_args.dp_size):
                     worker_port, worker_socket = get_zmq_socket_on_host(
                         self.context, zmq.PUSH, host=bind_host
@@ -567,9 +575,15 @@ class DataParallelController:
                     worker_ports.append(worker_port)
                     self.workers[dp_rank] = worker_socket
 
-        broadcasted_ports = self._broadcast_worker_ports(
-            server_args, worker_ports if worker_ports else None
-        )
+        # Phase E: joiner skips multi-node port broadcast (it has no ports
+        # to broadcast and no clients to notify; primary's pre-bind handles
+        # everything).
+        if elastic_mode_active and server_args.is_ep_joiner:
+            broadcasted_ports = None
+        else:
+            broadcasted_ports = self._broadcast_worker_ports(
+                server_args, worker_ports if worker_ports else None
+            )
         self.launch_tensor_parallel_group(
             server_args, port_args, 0, None, broadcasted_ports
         )
