@@ -7037,6 +7037,10 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
 
 ZMQ_TCP_PORT_DELTA = 233
 DP_ATTENTION_HANDSHAKE_PORT_DELTA = 13
+# Phase E: primary pre-binds DPC PUSH sockets at dist_init_port + DELTA + slot
+# for slot in [0, max_dp_size). Joiner schedulers PULL from this address
+# directly, eliminating the bind-then-release handshake.
+DP_PREBIND_PORT_DELTA = 50
 
 
 @dataclasses.dataclass
@@ -7109,9 +7113,31 @@ class PortArgs:
             detokenizer_port = port_base + 1
             rpc_port = port_base + 2
             metrics_port = port_base + 3
+            # Phase E: when elastic mode is active, scheduler_input_port for
+            # each DP rank is derived deterministically from dist_init_port.
+            # Primary pre-binds PUSH sockets at this address for all
+            # max_dp_size slots; joiner schedulers PULL directly, no
+            # bind-then-release handshake.
+            elastic_mode_active = (
+                server_args.elastic_ep_backend is not None
+                and server_args.max_ep_size is not None
+                and server_args.max_ep_size > server_args.tp_size
+            )
             if dp_rank is None:
                 # TokenizerManager to DataParallelController
                 scheduler_input_port = port_base + 4
+            elif elastic_mode_active:
+                # Joiner: dp_rank is the joiner's local DP rank; offset by
+                # ep_join_rank_offset to get the global slot.
+                # Primary: ep_join_rank_offset is 0, so global_slot == dp_rank.
+                global_slot = (
+                    server_args.ep_join_rank_offset + dp_rank
+                    if server_args.is_ep_joiner
+                    else dp_rank
+                )
+                scheduler_input_port = (
+                    dist_init_port + DP_PREBIND_PORT_DELTA + global_slot
+                )
             else:
                 assert worker_ports is not None
                 scheduler_input_port = worker_ports[dp_rank]
@@ -7136,14 +7162,30 @@ class PortArgs:
                 )
                 raise
 
+            # Phase E: joiner schedulers send outputs directly to the primary's
+            # tokenizer/detokenizer (skipping the joiner's own tokenizer which
+            # would otherwise be orphaned post-adoption). Primary tokenizer is
+            # at primary_dist_init_port + 1.
+            tokenizer_addr = NetworkAddress(dist_init_host, port_base).to_tcp()
+            detokenizer_addr = NetworkAddress(
+                dist_init_host, detokenizer_port
+            ).to_tcp()
+            if elastic_mode_active and server_args.is_ep_joiner:
+                primary_addr = NetworkAddress.parse(server_args.dist_init_addr)
+                primary_port_base = primary_addr.port + 1
+                tokenizer_addr = NetworkAddress(
+                    primary_addr.host, primary_port_base
+                ).to_tcp()
+                detokenizer_addr = NetworkAddress(
+                    primary_addr.host, primary_port_base + 1
+                ).to_tcp()
+
             return PortArgs(
-                tokenizer_ipc_name=NetworkAddress(dist_init_host, port_base).to_tcp(),
+                tokenizer_ipc_name=tokenizer_addr,
                 scheduler_input_ipc_name=NetworkAddress(
                     dist_init_host, scheduler_input_port
                 ).to_tcp(),
-                detokenizer_ipc_name=NetworkAddress(
-                    dist_init_host, detokenizer_port
-                ).to_tcp(),
+                detokenizer_ipc_name=detokenizer_addr,
                 nccl_port=nccl_port,
                 rpc_ipc_name=NetworkAddress(dist_init_host, rpc_port).to_tcp(),
                 metrics_ipc_name=NetworkAddress(dist_init_host, metrics_port).to_tcp(),

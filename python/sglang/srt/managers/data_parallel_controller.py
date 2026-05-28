@@ -283,24 +283,22 @@ class DataParallelController:
     def add_elastic_workers(
         self, new_worker_ports: List[int], slot_offset: int = 0
     ):
-        """Activate joiner scheduler workers after elastic scale-up.
+        """Activate joiner scheduler slots after elastic scale-up.
 
-        Under recovery-style Phase B, ``self.workers`` is pre-allocated to
-        ``max_dp_size``; this method binds PUSH sockets for the slots
-        ``[slot_offset, slot_offset + len(new_worker_ports))`` and flips
-        the corresponding ``dp_active`` bits. The list never grows.
+        Under Phase E, ``self.workers`` is pre-bound to deterministic
+        addresses at launch (see launch_dp_attention_schedulers). Joiner
+        schedulers PULL from those addresses directly. This method is now
+        a pure bit-flip: mark ``dp_active[slot] = True``, refresh the
+        budget, no socket creation.
 
-        ``slot_offset`` lets the joiner specify where its ports plug in
-        (today: equal to ``from_ep_size`` / ``ep_join_rank_offset`` for a
-        single-step scale; future multi-step scales pick up successive
-        offsets). When the caller doesn't set it, falls back to
-        "first contiguous run of inactive slots" for backwards
-        compatibility — but this is not the validated path.
+        ``new_worker_ports`` is retained in the message for backwards
+        compatibility but is unused under Phase E (the addresses are
+        already known to both ends via DP_PREBIND_PORT_DELTA).
         """
         if slot_offset == 0 and any(self.dp_active[: len(new_worker_ports)]):
             # Backwards-compat: no slot_offset and slot 0 already active
-            # means the caller is on the legacy "append" code path. Find
-            # the first inactive slot and use that as the offset.
+            # means the caller is on the legacy code path. Find the first
+            # inactive slot and use that as the offset.
             slot_offset = self.dp_active.index(False)
 
         end = slot_offset + len(new_worker_ports)
@@ -312,24 +310,12 @@ class DataParallelController:
                 f"larger --max-ep-size."
             )
 
-        bind_host = "127.0.0.1"
-        if self.server_args.dist_init_addr:
-            bind_host = NetworkAddress.parse(self.server_args.dist_init_addr).host
-
-        # Primary binds PUSH sockets here; joiner schedulers connect PULL.
-        for i, port in enumerate(new_worker_ports):
+        for i in range(len(new_worker_ports)):
             slot = slot_offset + i
             assert not self.dp_active[slot], (
-                f"[Elastic EP] add_elastic_workers: slot {slot} is already "
-                f"active. This indicates a duplicate scale event or a stale "
-                f"join. Aborting to avoid leaking the previous socket."
+                f"[Elastic EP] add_elastic_workers: slot {slot} already active"
             )
-            endpoint = NetworkAddress(bind_host, port).to_tcp()
-            sock = get_zmq_socket(self.context, zmq.PUSH, endpoint, True)
-            self.workers[slot] = sock
             self.dp_active[slot] = True
-            # status mirrors dp_active at scale-event time; NIXL fault
-            # detection updates it later via update_active_ranks().
             self.status[slot] = True
 
         self.dp_budget.refresh_active_mask(self.dp_active)
@@ -608,25 +594,50 @@ class DataParallelController:
         else:
             bind_host = NetworkAddress.parse(server_args.dist_init_addr).host
 
-        # Pre-allocate worker ports on node 0 to avoid conflicts. Elastic
-        # joiners still bind local PUSH sockets during startup so their normal
-        # warmup path can dispatch to local schedulers. When the primary later
-        # asks for these ports, the joiner releases them and the primary binds
-        # replacement PUSH sockets in add_elastic_workers().
+        # Phase E: under elastic mode the primary pre-binds PUSH sockets at
+        # deterministic addresses derived from dist_init_port. Joiner
+        # schedulers PULL from these addresses directly (their PortArgs
+        # computes the same addresses), so the bind-then-release handshake
+        # is no longer needed. Phase B's pre-allocated self.workers fits
+        # this naturally: slots [0, max_dp_size) are bound; [0, dp_size)
+        # are active, [dp_size, max_dp_size) wait for joiners to activate.
+        elastic_mode_active = (
+            server_args.elastic_ep_backend is not None
+            and server_args.max_ep_size is not None
+            and server_args.max_ep_size > server_args.tp_size
+        )
         worker_ports = []
         if server_args.node_rank == 0:
-            for dp_rank in range(server_args.dp_size):
-                worker_port, worker_socket = get_zmq_socket_on_host(
-                    self.context, zmq.PUSH, host=bind_host
+            if elastic_mode_active and not server_args.is_ep_joiner:
+                from sglang.srt.server_args import DP_PREBIND_PORT_DELTA
+                prebind_base = (
+                    NetworkAddress.parse(server_args.dist_init_addr).port
+                    + DP_PREBIND_PORT_DELTA
                 )
-                worker_ports.append(worker_port)
-                self.workers[dp_rank] = worker_socket
-                logger.debug(
-                    "Assigned port %s to worker %s on host %s",
-                    worker_port,
-                    dp_rank,
-                    bind_host,
-                )
+                for slot in range(self.max_dp_size):
+                    addr = NetworkAddress(
+                        bind_host, prebind_base + slot
+                    ).to_tcp()
+                    sock = get_zmq_socket(
+                        self.context, zmq.PUSH, addr, True
+                    )
+                    self.workers[slot] = sock
+                    if slot < server_args.dp_size:
+                        worker_ports.append(prebind_base + slot)
+                    logger.info(
+                        "[Elastic EP][Phase E] pre-bound DP slot %d at %s "
+                        "(active=%s)",
+                        slot, addr, slot < server_args.dp_size,
+                    )
+            else:
+                # Non-elastic or joiner: today's auto-pick path (joiner DPC
+                # still binds local sockets pre-Phase-E.3; will be removed).
+                for dp_rank in range(server_args.dp_size):
+                    worker_port, worker_socket = get_zmq_socket_on_host(
+                        self.context, zmq.PUSH, host=bind_host
+                    )
+                    worker_ports.append(worker_port)
+                    self.workers[dp_rank] = worker_socket
 
         broadcasted_ports = self._broadcast_worker_ports(
             server_args, worker_ports if worker_ports else None
