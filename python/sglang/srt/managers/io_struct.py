@@ -1610,19 +1610,19 @@ class ActiveRanksOutput(BaseReq):
 
 @dataclass
 class ElasticScaleWorkerPortsReq(BaseReq):
-    """Sent to DataParallelController to activate joiner scheduler workers.
+    """Activate ``slot_count`` pre-bound DPC worker slots starting at
+    ``slot_offset``.
 
-    Under recovery-style elastic-EP (Phase B), the primary's DPC has all
-    ``max_dp_size`` worker slots pre-allocated at launch. A scale event
-    activates a contiguous range of pre-allocated slots starting at
-    ``slot_offset``; ``new_worker_ports[i]`` is the joiner-bound port
-    for slot ``slot_offset + i``.
+    Under Phase E, the primary DPC pre-binds all ``max_dp_size`` PUSH
+    sockets at deterministic addresses at launch and joiner schedulers
+    PULL from them directly. This message just signals the primary DPC
+    to flip ``dp_active[slot_offset : slot_offset + slot_count]``.
 
-    For a 4 -> 8 scale-up with ``ep_join_rank_offset=4``, the joiner
-    emits ``slot_offset=4`` and ``new_worker_ports=[p4, p5, p6, p7]``.
+    For a 4 -> 8 scale-up with ``ep_join_rank_offset=4``, the primary
+    emits ``slot_offset=4, slot_count=4``.
     """
-    new_worker_ports: List[int]
-    slot_offset: int = 0
+    slot_offset: int
+    slot_count: int
 
 
 @dataclass

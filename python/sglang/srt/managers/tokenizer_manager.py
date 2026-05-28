@@ -2365,7 +2365,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
         self.send_to_scheduler.send_pyobj(ranks)
 
     def forward_elastic_scale_ports(self, msg: ElasticScaleWorkerPortsReq):
-        worker_count = self.server_args.dp_size + len(msg.new_worker_ports)
+        # Phase E: msg carries (slot_offset, slot_count) instead of
+        # the old (new_worker_ports, slot_offset) payload.
+        worker_count = msg.slot_offset + msg.slot_count
         self.elastic_worker_count = worker_count
         self.update_control_communicator_fan_out(worker_count)
         self.send_to_scheduler.send_pyobj(msg)

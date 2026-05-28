@@ -280,38 +280,23 @@ class DataParallelController:
             return
         self.status = list(ranks.status)
 
-    def add_elastic_workers(
-        self, new_worker_ports: List[int], slot_offset: int = 0
-    ):
-        """Activate joiner scheduler slots after elastic scale-up.
+    def add_elastic_workers(self, slot_offset: int, slot_count: int):
+        """Bit-flip activate ``slot_count`` slots starting at ``slot_offset``.
 
-        Under Phase E, ``self.workers`` is pre-bound to deterministic
-        addresses at launch (see launch_dp_attention_schedulers). Joiner
-        schedulers PULL from those addresses directly. This method is now
-        a pure bit-flip: mark ``dp_active[slot] = True``, refresh the
-        budget, no socket creation.
-
-        ``new_worker_ports`` is retained in the message for backwards
-        compatibility but is unused under Phase E (the addresses are
-        already known to both ends via DP_PREBIND_PORT_DELTA).
+        Sockets at these slots are already pre-bound at launch (see
+        launch_dp_attention_schedulers under elastic mode); joiner
+        schedulers PULL directly from those deterministic addresses.
         """
-        if slot_offset == 0 and any(self.dp_active[: len(new_worker_ports)]):
-            # Backwards-compat: no slot_offset and slot 0 already active
-            # means the caller is on the legacy code path. Find the first
-            # inactive slot and use that as the offset.
-            slot_offset = self.dp_active.index(False)
-
-        end = slot_offset + len(new_worker_ports)
+        end = slot_offset + slot_count
         if end > self.max_dp_size:
             raise ValueError(
                 f"[Elastic EP] add_elastic_workers: "
-                f"slot_offset={slot_offset} + len(ports)={len(new_worker_ports)} "
+                f"slot_offset={slot_offset} + slot_count={slot_count} "
                 f"exceeds max_dp_size={self.max_dp_size}. Restart with a "
                 f"larger --max-ep-size."
             )
 
-        for i in range(len(new_worker_ports)):
-            slot = slot_offset + i
+        for slot in range(slot_offset, end):
             assert not self.dp_active[slot], (
                 f"[Elastic EP] add_elastic_workers: slot {slot} already active"
             )
@@ -368,7 +353,7 @@ class DataParallelController:
                 (
                     ElasticScaleWorkerPortsReq,
                     lambda msg: self.add_elastic_workers(
-                        msg.new_worker_ports, slot_offset=msg.slot_offset
+                        msg.slot_offset, msg.slot_count
                     ),
                 ),
             ]
@@ -503,64 +488,7 @@ class DataParallelController:
             logger.debug("Worker port broadcast completed")
             return worker_ports
         finally:
-            if self.server_args.elastic_ep_backend is None:
-                rep_socket.close()
-            else:
-                threading.Thread(
-                    target=self._reply_ports_as_server,
-                    args=(rep_socket, worker_ports),
-                    daemon=True,
-                ).start()
-
-    def _reply_ports_as_server(self, rep_socket: zmq.Socket, worker_ports: List[int]):
-        """
-        Runs as a background thread to broadcast worker ports for recovered EP ranks
-        """
-        while True:
-            # Wait for client handshake
-            try:
-                client_rank = rep_socket.recv().decode()
-            except Exception:
-                logger.exception(
-                    "Failed to recv/decode handshake in reply thread; continue"
-                )
-                continue
-            logger.debug(f"Received handshake from node {client_rank}")
-
-            self._release_elastic_worker_sockets_for_primary()
-
-            # Send worker ports to client
-            rep_socket.send_pyobj(worker_ports)
-            logger.debug(f"Sent worker ports to node {client_rank}")
-
-    def _release_elastic_worker_sockets_for_primary(self):
-        """Let the primary controller take ownership of joiner worker endpoints."""
-        if not self.server_args.is_ep_joiner:
-            return
-        if getattr(self, "_elastic_worker_sockets_released", False):
-            return
-
-        for i, worker in enumerate(self.workers):
-            if worker is None:
-                continue
-            try:
-                worker.close(linger=0)
-                logger.info(
-                    "[Elastic EP] Released joiner local worker socket dp_rank=%d "
-                    "for primary controller binding",
-                    i,
-                )
-            except (zmq.ZMQError, OSError):
-                # ZMQError covers the bound-socket close path; OSError covers
-                # bad-fd or stuck-socket teardown. Anything outside this is
-                # an actual bug we want to surface, not swallow.
-                logger.exception(
-                    "[Elastic EP] Failed to release joiner worker socket dp_rank=%d",
-                    i,
-                )
-            self.workers[i] = None
-
-        self._elastic_worker_sockets_released = True
+            rep_socket.close()
 
     def _receive_ports_as_client(self, endpoint: str, node_rank: int) -> List[int]:
         """Receive worker ports from the server node."""

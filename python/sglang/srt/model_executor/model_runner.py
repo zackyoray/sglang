@@ -1648,47 +1648,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         """
         return from_ep_size
 
-    def _fetch_joiner_worker_ports(self) -> Optional[List[int]]:
-        """Synchronous REQ to the joiner's DP handshake endpoint.
-
-        Returns the joiner's scheduler-worker port list, or None on
-        timeout / connection failure. Failure is logged at ERROR level
-        because it leaves the cluster partially scaled: PG/NIXL admit
-        the joiner ranks but the DataParallelController never registers
-        the joiner's scheduler workers, so dispatch routes only to
-        primary slots. A retry/state-machine for adoption is a planned
-        follow-up; today the operator must observe the error log and
-        re-issue the scale request.
-        """
-        import zmq
-
-        from sglang.srt.server_args import DP_ATTENTION_HANDSHAKE_PORT_DELTA
-        from sglang.srt.utils.network import NetworkAddress
-
-        host = self.server_args.host or "127.0.0.1"
-        joiner_port = self.server_args.port + 1
-        endpoint = NetworkAddress(
-            host, joiner_port + DP_ATTENTION_HANDSHAKE_PORT_DELTA
-        ).to_tcp()
-
-        ctx = zmq.Context()
-        req = ctx.socket(zmq.REQ)
-        req.setsockopt(zmq.RCVTIMEO, 10000)
-        try:
-            req.connect(endpoint)
-            req.send(b"0")
-            return req.recv_pyobj()
-        except Exception as exc:
-            logger.error(
-                "[Elastic EP] failed to fetch joiner worker ports from %s: %s "
-                "(cluster partially scaled — joiner workers not registered)",
-                endpoint, exc,
-            )
-            return None
-        finally:
-            req.close()
-            ctx.term()
-
     def maybe_join_ep_ranks(self):
         """Poll for inactive ranks within effective_ep_size and accept them.
 
@@ -1793,26 +1752,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             self.server_args.dp_size = effective_size
 
-            # Controller leader fetches the joiner's scheduler worker
-            # ports via the DP handshake endpoint and stores the message
-            # for the scheduler loop to forward to the controller.
+            # Phase E: signal the primary DPC to bit-flip activation for
+            # the new joiner's slot range. Sockets at those slots are
+            # already pre-bound at launch and joiner schedulers PULL from
+            # them directly; this message is just the activation trigger.
             if self.tp_rank == 0:
-                worker_ports = self._fetch_joiner_worker_ports()
-                if worker_ports is not None:
-                    from sglang.srt.managers.io_struct import (
-                        ElasticScaleWorkerPortsReq,
-                    )
-                    # The joiner's local DP rank order maps to global slot
-                    # indices [ep_join_rank_offset .. +tp_size). Pass the
-                    # offset so the primary's pre-allocated DPC slots are
-                    # activated in place rather than appended.
-                    slot_offset = (
-                        self._joiner_slot_offset_for_scale(from_ep_size)
-                    )
-                    self._pending_elastic_scale_msg = ElasticScaleWorkerPortsReq(
-                        new_worker_ports=worker_ports,
-                        slot_offset=slot_offset,
-                    )
+                from sglang.srt.managers.io_struct import (
+                    ElasticScaleWorkerPortsReq,
+                )
+                slot_offset = self._joiner_slot_offset_for_scale(from_ep_size)
+                self._pending_elastic_scale_msg = ElasticScaleWorkerPortsReq(
+                    slot_offset=slot_offset,
+                    slot_count=effective_size - from_ep_size,
+                )
 
             ElasticEPStateManager.instance().snapshot_active_to_last()
             ElasticEPStateManager.instance().sync_active_to_cpu()
