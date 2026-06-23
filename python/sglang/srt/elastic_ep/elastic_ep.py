@@ -33,6 +33,14 @@ class ElasticEPState:
 
     def sync_active_to_cpu(self):
         if self.active_ranks is not None:
+            if (
+                self.active_ranks.device.type == "cuda"
+                and torch.cuda.is_current_stream_capturing()
+            ):
+                # CUDA graph capture cannot include a device-to-host copy into
+                # ordinary CPU memory. The CPU mirror is synchronized at scale
+                # boundaries; skip hot-path NIXL refreshes during capture.
+                return
             self.active_ranks_cpu = self.active_ranks.detach().cpu().clone()
 
     def snapshot_active_to_last(self):
@@ -165,6 +173,10 @@ class ElasticEPStateManager:
         cls._mark_phase("syncing_new_world")
 
     @classmethod
+    def mark_rewarming_runtime(cls) -> None:
+        cls._mark_phase("rewarming_runtime")
+
+    @classmethod
     def _mark_phase(cls, phase: str) -> None:
         inst = cls._instance
         if inst is not None and inst.pending_ep_size is not None:
@@ -268,9 +280,13 @@ def elastic_expanded_world_enabled() -> bool:
     sa = get_server_args()
     if getattr(sa, "max_ep_size", None) is None:
         return False
+    # During scale-up, primary does not commit effective_ep_size until after
+    # CUDA graph recapture and the post-scale ready barrier. Recapture forwards
+    # must still match joiners, which already see the expanded effective size.
     active_target_size = inst.effective_ep_size
     if inst.pending_ep_size is not None and inst.scale_phase in (
         "configuring_data_plane",
+        "rewarming_runtime",
         "syncing_new_world",
     ):
         active_target_size = inst.pending_ep_size

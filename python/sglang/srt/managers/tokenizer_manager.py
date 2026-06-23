@@ -268,6 +268,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.elastic_pending_ep_size = None
         self.elastic_scale_phase = "idle"
         self.elastic_last_error = None
+        self.elastic_cuda_graph_recaptured_ep_size = None
         self.enable_metrics = server_args.enable_metrics
         self.preferred_sampling_params = server_args.preferred_sampling_params
         self.crash_dump_folder = server_args.crash_dump_folder
@@ -2776,6 +2777,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.elastic_pending_ep_size = None
         self.elastic_scale_phase = "serving_expanded"
         self.elastic_last_error = None
+        self.elastic_cuda_graph_recaptured_ep_size = (
+            msg.cuda_graph_recaptured_ep_size
+        )
         self.update_control_communicator_fan_out(msg.effective_ep_size)
 
     def get_elastic_ep_state(self):
@@ -2785,6 +2789,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             "pending_ep_size": self.elastic_pending_ep_size,
             "scale_phase": self.elastic_scale_phase,
             "last_error": self.elastic_last_error,
+            "cuda_graph_recaptured_ep_size": (
+                self.elastic_cuda_graph_recaptured_ep_size
+            ),
         }
 
     async def scale_elastic_ep(

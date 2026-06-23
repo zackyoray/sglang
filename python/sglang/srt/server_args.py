@@ -1819,6 +1819,10 @@ class ServerArgs:
         bool,
         "Enable DeepEP Waterfill: dispatch the shared expert as the 9th routed expert to the least-loaded EP rank. Automatically sets --moe-a2a-backend deepep, implicitly enables shared-expert fusion, and supports --deepep-mode auto, normal, or low_latency. Use auto or low_latency for production decode so CUDA graph remains enabled. Supported on DeepSeek-V3/R1 with EP >= 2.",
     ] = False
+    elastic_ep_enable_cuda_graph: A[
+        bool,
+        "Allow decode CUDA graph for elastic EP runtime scale-up and recapture graphs after joined ranks are admitted. Prefill CUDA graph must still be disabled.",
+    ] = False
     ep_join_mode: A[
         Optional[Literal["scale", "recover"]],
         Arg(
@@ -5278,10 +5282,23 @@ class ServerArgs:
             prefill_cuda_graph_disabled = (
                 self.cuda_graph_config.prefill.backend == Backend.DISABLED
             )
-            assert decode_cuda_graph_disabled and prefill_cuda_graph_disabled, (
-                "Elastic EP runtime scale-up requires decode and prefill CUDA "
-                "graphs to be disabled."
-            )
+            if self.elastic_ep_enable_cuda_graph:
+                assert not decode_cuda_graph_disabled, (
+                    "--elastic-ep-enable-cuda-graph requires decode CUDA graph "
+                    "to be enabled."
+                )
+                assert prefill_cuda_graph_disabled, (
+                    "Elastic EP CUDA graph scale-up currently covers decode "
+                    "CUDA graph only; keep prefill CUDA graph disabled."
+                )
+            else:
+                assert decode_cuda_graph_disabled and prefill_cuda_graph_disabled, (
+                    "Elastic EP runtime scale-up does not support CUDA graph by "
+                    "default yet; disable decode and prefill CUDA graph, or opt "
+                    "into decode CUDA graph recapture with "
+                    "--elastic-ep-enable-cuda-graph while keeping prefill CUDA "
+                    "graph disabled."
+                )
             assert self.enable_dp_attention, (
                 "Elastic EP scale-up requires --enable-dp-attention; without it "
                 "the TP group is not equivalent to WORLD and the post-scale "

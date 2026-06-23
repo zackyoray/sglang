@@ -18,6 +18,7 @@ from sglang.srt.distributed import (
     get_attn_tensor_model_parallel_rank,
     get_attn_tensor_model_parallel_world_size,
     get_attn_tp_group,
+    get_elastic_world_group_if_initialized,
 )
 from sglang.srt.distributed import get_moe_dp_group as _get_moe_dp_group
 from sglang.srt.distributed import (
@@ -73,6 +74,11 @@ def update_dp_attention_post_scale(new_dp_size: int, new_dp_rank: int):
 
 
 def _elastic_world_all_reduce(tensor: torch.Tensor) -> None:
+    elastic_world_group = get_elastic_world_group_if_initialized()
+    if elastic_world_group is not None:
+        elastic_world_group.all_reduce(tensor)
+        return
+
     torch.distributed.all_reduce(
         tensor,
         op=torch.distributed.ReduceOp.SUM,
@@ -83,6 +89,11 @@ def _elastic_world_all_reduce(tensor: torch.Tensor) -> None:
 def _elastic_world_all_gather_into_tensor(
     output: torch.Tensor, input_: torch.Tensor
 ) -> None:
+    elastic_world_group = get_elastic_world_group_if_initialized()
+    if elastic_world_group is not None:
+        elastic_world_group.all_gather_into_tensor(output, input_)
+        return
+
     torch.distributed.all_gather_into_tensor(
         output, input_, group=torch.distributed.group.WORLD
     )
@@ -540,6 +551,10 @@ def _dp_gather_via_all_reduce(
 
     # Input IDs are in int 32. We should use inplace_all_reduce for local case because of custom all reduce.
     if _USE_WORLD_GROUP_FOR_DP_GATHER and not _ELASTIC_JOINER_SKIP_ALL_GATHER:
+        # Mooncake's recover_ranks() updates `torch.distributed.group.WORLD`
+        # in place, so post-scale joiners are visible there. For CUDA graph
+        # recapture we install a fresh elastic WORLD coordinator after recovery
+        # and route through it; otherwise fall back to raw WORLD.
         _elastic_world_all_reduce(global_tokens)
     else:
         NUM_GPUS_PER_NODE = 8

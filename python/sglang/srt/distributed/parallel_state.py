@@ -44,7 +44,11 @@ from torch.distributed import Backend, ProcessGroup
 
 from sglang.srt import platforms
 from sglang.srt.compilation.compilation_config import register_split_op
-from sglang.srt.distributed.utils import set_global_tcp_store
+from sglang.srt.distributed.utils import (
+    StatelessProcessGroup,
+    get_global_tcp_store,
+    set_global_tcp_store,
+)
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
@@ -1649,9 +1653,106 @@ class GroupCoordinator:
 _WORLD: Optional[GroupCoordinator] = None
 
 
+class ElasticWorldCoordinator:
+    """Graph-capturable WORLD collectives for the expanded elastic group."""
+
+    def __init__(self, ranks: List[int], device: torch.device, generation: int):
+        from sglang.srt.distributed.device_communicators.pynccl import (
+            PyNcclCommunicator,
+        )
+
+        self.ranks = list(ranks)
+        self.rank = torch.distributed.get_rank()
+        self.rank_in_group = self.ranks.index(self.rank)
+        self.world_size = len(self.ranks)
+        self.device = device
+        self.device_module = torch.get_device_module(self.device)
+        self.generation = generation
+
+        store = get_global_tcp_store()
+        if store is None:
+            raise RuntimeError(
+                "Elastic WORLD CUDA graph collectives require the global "
+                "TCPStore; initialize with moe_a2a_backend=nixl."
+            )
+        store = torch.distributed.PrefixStore(
+            f"elastic_world/{generation}", store
+        )
+
+        stateless_group = StatelessProcessGroup(
+            rank=self.rank_in_group,
+            world_size=self.world_size,
+            store=store,
+        )
+        self.pynccl_comm = (
+            PyNcclCommunicator(group=stateless_group, device=self.device)
+            if self.world_size > 1
+            else None
+        )
+
+    @contextmanager
+    def graph_capture(
+        self,
+        graph_capture_context: Optional[GraphCaptureContext] = None,
+        stream: Optional[torch.cuda.Stream] = None,
+    ):
+        if graph_capture_context is None:
+            if stream is None:
+                stream = self.device_module.Stream()
+            graph_capture_context = GraphCaptureContext(stream)
+
+        pynccl_comm = self.pynccl_comm
+        maybe_pynccl_context: Any
+        if pynccl_comm is None:
+            maybe_pynccl_context = nullcontext()
+        else:
+            maybe_pynccl_context = pynccl_comm.change_state(enable=True)
+
+        with maybe_pynccl_context:
+            yield graph_capture_context
+
+    def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+        if self.world_size == 1:
+            return input_
+
+        pynccl_comm = self.pynccl_comm
+        if pynccl_comm is not None and not pynccl_comm.disabled:
+            pynccl_comm.all_reduce(input_)
+            return input_
+
+        torch.distributed.all_reduce(input_, group=torch.distributed.group.WORLD)
+        return input_
+
+    def all_gather_into_tensor(self, output: torch.Tensor, input_: torch.Tensor):
+        if self.world_size == 1:
+            output.copy_(input_)
+            return
+
+        pynccl_comm = self.pynccl_comm
+        if pynccl_comm is not None and not pynccl_comm.disabled:
+            pynccl_comm.all_gather(output, input_)
+            return
+
+        torch.distributed.all_gather_into_tensor(
+            output, input_, group=torch.distributed.group.WORLD
+        )
+
+    def destroy(self):
+        if self.pynccl_comm is not None:
+            self.pynccl_comm.destroy()
+        self.pynccl_comm = None
+
+
+_ELASTIC_WORLD: Optional[ElasticWorldCoordinator] = None
+
+
 def get_world_group() -> GroupCoordinator:
     assert _WORLD is not None, "world group is not initialized"
     return _WORLD
+
+
+def get_elastic_world_group_if_initialized() -> Optional[ElasticWorldCoordinator]:
+    return _ELASTIC_WORLD
 
 
 def init_world_group(
@@ -1714,6 +1815,35 @@ def init_model_parallel_group(
         rank_offset=rank_offset,
         max_world_size=max_world_size,
     )
+
+
+def destroy_elastic_world_group() -> None:
+    global _ELASTIC_WORLD
+    if _ELASTIC_WORLD is not None:
+        _ELASTIC_WORLD.destroy()
+        _ELASTIC_WORLD = None
+
+
+def init_or_update_elastic_world_group(
+    ranks: List[int], generation: int
+) -> ElasticWorldCoordinator:
+    """Create the graph-aware coordinator for one expanded WORLD generation."""
+    global _ELASTIC_WORLD
+    assert torch.distributed.is_initialized()
+
+    ranks = list(ranks)
+    if _ELASTIC_WORLD is not None:
+        if (
+            _ELASTIC_WORLD.ranks == ranks
+            and _ELASTIC_WORLD.generation == generation
+        ):
+            return _ELASTIC_WORLD
+        destroy_elastic_world_group()
+
+    _ELASTIC_WORLD = ElasticWorldCoordinator(
+        ranks, get_world_group().device, generation
+    )
+    return _ELASTIC_WORLD
 
 
 _TP: Optional[GroupCoordinator] = None
@@ -1833,7 +1963,7 @@ def graph_capture(stream=None):
     ):
         with contextlib.ExitStack() as stack:
             seen = {id(_TP), id(_PP)}
-            for group in (_DCP, _MOE_EP, _MOE_TP):
+            for group in (_DCP, _MOE_EP, _MOE_TP, _ELASTIC_WORLD):
                 if group is not None and id(group) not in seen:
                     seen.add(id(group))
                     stack.enter_context(group.graph_capture(context))
@@ -2624,6 +2754,8 @@ def get_moe_tensor_parallel_rank():
 
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
+    destroy_elastic_world_group()
+
     global _TP
     if _TP:
         _TP.destroy()
@@ -2673,6 +2805,7 @@ def destroy_model_parallel():
 
 def destroy_distributed_environment():
     global _WORLD, _MODEL_PARALLEL_GROUP_TIMEOUT
+    destroy_elastic_world_group()
     if _WORLD:
         _WORLD.destroy()
     _WORLD = None

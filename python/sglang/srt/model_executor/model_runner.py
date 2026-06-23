@@ -74,6 +74,7 @@ from sglang.srt.distributed import (
     get_tp_group,
     get_world_group,
     init_distributed_environment,
+    init_or_update_elastic_world_group,
     initialize_model_parallel,
     set_custom_all_reduce,
     set_mscclpp_all_reduce,
@@ -173,6 +174,7 @@ from sglang.srt.model_executor.runner import (
     EagerRunner,
     PrefillCudaGraphRunner,
     get_batch_sizes_to_capture,
+    set_global_graph_memory_pool,
 )
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
@@ -579,6 +581,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.hisparse_coordinator = None
 
         self._linear_attn_registry_cache: Any = _UNSET
+        self.decode_cuda_graph_replay_count = 0
+        self._pending_elastic_joiner_cuda_graph_target_size: Optional[int] = None
+        self._pending_elastic_joiner_ready_barrier_target_size: Optional[int] = None
 
         # Load model weights and configure
         self.initialize()
@@ -645,12 +650,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     inst.snapshot_active_to_last()
                     inst.sync_active_to_cpu()
                     inst.scale_phase = "syncing_new_world"
-                self._elastic_scale_ready_barrier(
-                    target_size=join_effective_ep_size,
-                    log_tag="JOINER",
+                self._pending_elastic_joiner_ready_barrier_target_size = (
+                    join_effective_ep_size
                 )
-                if inst is not None:
-                    inst.scale_phase = "serving_expanded"
+                self._pending_elastic_joiner_cuda_graph_target_size = (
+                    join_effective_ep_size
+                )
             else:
                 ElasticEPStateManager.instance().reset()
 
@@ -1002,6 +1007,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # runners point at it) and the eager fallback when a cg runner can't run a
         # batch.
         self.eager_runner = EagerRunner(self)
+
+        self._validate_elastic_cuda_graph_recapture()
+
+        if (
+            self.server_args.is_ep_joiner
+            and self.server_args.ep_join_mode == "scale"
+        ):
+            self.prefill_cuda_graph_runner = self.eager_runner
+            self.decode_cuda_graph_runner = self.eager_runner
+            self.graph_mem_usage = 0
+            self._finalize_pending_elastic_joiner_runtime()
+            if self.server_args.forward_hooks:
+                register_forward_hooks(self.model, self.server_args.forward_hooks)
+            self.prealloc_symmetric_memory_pool()
+            if self.canary_manager is not None and not self.is_draft_worker:
+                self.canary_manager.mark_init_finished()
+            return
 
         # cuda-graph capture: prefill before decode, so both coalesce onto the
         # eager buffer allocated above. (init_prefill_cuda_graph routes prefill
@@ -1933,6 +1955,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 target_size,
             )
 
+    def _finalize_pending_elastic_joiner_runtime(self) -> None:
+        target_size = self._pending_elastic_joiner_cuda_graph_target_size
+        if target_size is not None:
+            self._pending_elastic_joiner_cuda_graph_target_size = None
+            self._recapture_elastic_cuda_graphs(target_size, log_tag="JOINER")
+
+        target_size = self._pending_elastic_joiner_ready_barrier_target_size
+        if target_size is not None:
+            self._pending_elastic_joiner_ready_barrier_target_size = None
+            self._elastic_scale_ready_barrier(
+                target_size=target_size,
+                log_tag="JOINER",
+            )
+            inst = ElasticEPStateManager.instance()
+            if inst is not None:
+                inst.scale_phase = "serving_expanded"
+
     def _finalize_scale_up(
         self,
         ranks_to_join: list[int],
@@ -1984,10 +2023,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.server_args.dp_size = target_size
         self.dp_size = target_size
 
+        ElasticEPStateManager.mark_rewarming_runtime()
+        cuda_graph_recaptured = self._recapture_elastic_cuda_graphs(
+            target_size, log_tag="PRIMARY"
+        )
         ElasticEPStateManager.mark_syncing_new_world()
         self._elastic_scale_ready_barrier(
             target_size=target_size,
-            log_tag="JOINER" if self.server_args.is_ep_joiner else "PRIMARY",
+            log_tag="PRIMARY",
         )
         ElasticEPStateManager.commit_scale()
 
@@ -2000,6 +2043,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 effective_ep_size=target_size,
                 slot_offset=slot_offset,
                 slot_count=target_size - from_ep_size,
+                cuda_graph_recaptured_ep_size=(
+                    target_size if cuda_graph_recaptured else None
+                ),
             )
 
         if self.tp_rank == 0 and not self.server_args.is_ep_joiner:
@@ -2045,6 +2091,121 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 "[Elastic EP] Rank recovery completed: recovered_ranks=%s",
                 ranks_to_recover,
             )
+
+    def _supports_elastic_cuda_graph_recapture(self) -> bool:
+        return self.device in ("cuda", "musa") or (
+            current_platform.is_out_of_tree() and current_platform.support_cuda_graph()
+        )
+
+    def _validate_elastic_cuda_graph_recapture(self) -> None:
+        if not self.server_args.elastic_ep_enable_cuda_graph:
+            return
+        if not self._supports_elastic_cuda_graph_recapture():
+            raise ValueError(
+                "Elastic EP CUDA graph recapture is not supported on "
+                f"device {self.device}."
+            )
+
+        validate = getattr(
+            self.attn_backend, "validate_elastic_cuda_graph_recapture", None
+        )
+        if validate is not None:
+            validate()
+
+    @staticmethod
+    def _elastic_cuda_graph_world_barrier() -> None:
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier(group=dist.group.WORLD)
+
+    def _prepare_elastic_cuda_graph_recapture(
+        self,
+        *,
+        target_size: int,
+    ) -> None:
+        if (
+            self.server_args.elastic_ep_backend == "mooncake"
+            and self.server_args.enable_dp_attention
+        ):
+            elastic_world_group = init_or_update_elastic_world_group(
+                ranks=list(range(target_size)),
+                generation=target_size,
+            )
+            pynccl_comm = elastic_world_group.pynccl_comm
+            if self.device == "cuda" and target_size > 1 and (
+                pynccl_comm is None or not getattr(pynccl_comm, "available", False)
+            ):
+                raise RuntimeError(
+                    "Elastic EP CUDA graph recapture requires a PyNccl "
+                    "communicator for post-scale WORLD collectives."
+                )
+
+        if self.device in ("cuda", "musa"):
+            torch.get_device_module(self.device).synchronize()
+        elif current_platform.is_out_of_tree():
+            current_platform.synchronize()
+
+    def _drop_elastic_cuda_graph_state(self) -> None:
+        self.decode_cuda_graph_runner = None
+        self.graph_mem_usage = 0
+        set_global_graph_memory_pool(None)
+        gc.collect()
+        current_platform.empty_cache()
+        if self.device in ("cuda", "musa"):
+            torch.get_device_module(self.device).synchronize()
+        elif current_platform.is_out_of_tree():
+            current_platform.synchronize()
+
+    def _recapture_elastic_cuda_graphs(
+        self,
+        target_size: int,
+        *,
+        log_tag: str,
+    ) -> bool:
+        if not self.server_args.elastic_ep_enable_cuda_graph:
+            return False
+
+        if self.tp_rank == 0:
+            logger.info(
+                "[Elastic EP][cuda-graph] %s recapture begin "
+                "(target_ep_size=%d)",
+                log_tag,
+                target_size,
+            )
+
+        self._elastic_cuda_graph_world_barrier()
+        self._drop_elastic_cuda_graph_state()
+        self._elastic_cuda_graph_world_barrier()
+        self._prepare_elastic_cuda_graph_recapture(target_size=target_size)
+        self._elastic_cuda_graph_world_barrier()
+
+        inst = ElasticEPStateManager.instance()
+        prev_scale_phase = inst.scale_phase if inst is not None else None
+        if inst is not None:
+            inst.scale_phase = "rewarming_runtime"
+        try:
+            self.init_decode_cuda_graph()
+        finally:
+            if (
+                inst is not None
+                and prev_scale_phase is not None
+                and inst.scale_phase == "rewarming_runtime"
+            ):
+                inst.scale_phase = prev_scale_phase
+
+        if self.device in ("cuda", "musa"):
+            torch.get_device_module(self.device).synchronize()
+        elif current_platform.is_out_of_tree():
+            current_platform.synchronize()
+        self._elastic_cuda_graph_world_barrier()
+
+        if self.tp_rank == 0:
+            logger.info(
+                "[Elastic EP][cuda-graph] %s recapture end "
+                "(target_ep_size=%d)",
+                log_tag,
+                target_size,
+            )
+        return True
 
     def maybe_join_ep_ranks(self):
         """Admit inactive ranks for pending scale or recovery operations."""
@@ -3455,6 +3616,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
             # Replay cuda graph if applicable
             if can_run_graph:
+                self.decode_cuda_graph_replay_count += 1
                 ret = self.decode_cuda_graph_runner.execute(
                     forward_batch,
                     pp_proxy_tensors=pp_proxy_tensors,

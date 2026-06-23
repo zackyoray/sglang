@@ -1758,6 +1758,7 @@ class ElasticScaleUpdateReq(BaseReq, kw_only=True):
     effective_ep_size: int
     slot_offset: int = 0
     slot_count: int = 0
+    cuda_graph_recaptured_ep_size: Optional[int] = None
     error: Optional[str] = None
 
 

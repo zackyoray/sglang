@@ -125,6 +125,17 @@ class PyNcclCommunicator:
         # when we are using CUDA graph.
         self.disabled = True
 
+    def destroy(self) -> None:
+        if not getattr(self, "available", False):
+            return
+
+        with torch.cuda.device(self.device):
+            torch.cuda.synchronize(self.device)
+            self.nccl.ncclCommDestroy(self.comm)
+        self.available = False
+        self.disabled = True
+        self.comm = None
+
     def _resolve_stream(self) -> torch.cuda.Stream:
         """Return the current device stream used for NCCL calls."""
         return get_current_device_stream_fast()
