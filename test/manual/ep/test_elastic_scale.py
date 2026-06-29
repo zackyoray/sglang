@@ -4,6 +4,8 @@ Test classes:
   TestElasticScaleUp4To6                primary + joiner scale-up (6 GPUs)
   TestElasticScaleUp4To5To6             two consecutive single-rank scale-ups
   TestElasticScaleUp4To8                full primary + joiner scale-up (8 GPUs)
+  TestElasticScaleUp4To5To6CudaGraph    repeated decode graph recapture
+  TestElasticScaleUp4To8CudaGraph       scale-up with decode graph recapture
 
 Run (8-GPU full scale-up):
 
@@ -49,6 +51,17 @@ def _extra_server_args() -> list[str]:
 DISABLED_CUDA_GRAPH_ARGS = [
     "--cuda-graph-backend-decode", "disabled",
     "--cuda-graph-backend-prefill", "disabled",
+]
+ELASTIC_CUDA_GRAPH_ARGS = [
+    "--elastic-ep-enable-cuda-graph",
+    "--cuda-graph-backend-prefill",
+    "disabled",
+    "--cuda-graph-bs-decode",
+    "1",
+    "2",
+    "4",
+    "8",
+    "16",
 ]
 
 
@@ -146,6 +159,7 @@ class _ElasticScaleUpEndToEndBase(CustomTestCase):
     TARGET_EP_SIZE: int
     CUDA_GRAPH_ARGS: list[str]
     MOE_DENSE_TP_SIZE: int | None = 1
+    EXPECT_CUDA_GRAPH_RECAPTURE = False
 
     def setUp(self):
         if (
@@ -300,6 +314,30 @@ class _ElasticScaleUpEndToEndBase(CustomTestCase):
         except AssertionError as exc:
             raise AssertionError(f"/generate logprob {msg_suffix} failed: {exc}") from exc
 
+    def _decode_cuda_graph_replay_count(self) -> int:
+        deadline = time.time() + 30
+        server_info_url = f"{self.base_url}/server_info"
+        while time.time() < deadline:
+            try:
+                response = requests.get(server_info_url, timeout=5)
+                response.raise_for_status()
+                return sum(
+                    state["decode_cuda_graph_replay_count"]
+                    for state in response.json()["internal_states"]
+                )
+            except (KeyError, requests.RequestException, ValueError):
+                pass
+            time.sleep(1)
+        self.fail("Primary server did not report CUDA graph replay state")
+
+    def _assert_decode_cuda_graph_replayed(self, previous_count: int) -> None:
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            if self._decode_cuda_graph_replay_count() > previous_count:
+                return
+            time.sleep(1)
+        self.fail("The post-scale request did not replay a decode CUDA graph")
+
     def _scale_once(
         self,
         *,
@@ -340,10 +378,17 @@ class _ElasticScaleUpEndToEndBase(CustomTestCase):
                 self.assertEqual(state.get("effective_ep_size"), target_ep_size)
                 self.assertEqual(state.get("scale_phase"), "serving_expanded")
                 self.assertIsNone(state.get("last_error"))
+                if self.EXPECT_CUDA_GRAPH_RECAPTURE:
+                    self.assertEqual(
+                        state.get("cuda_graph_recaptured_ep_size"), target_ep_size
+                    )
+                    replay_count = self._decode_cuda_graph_replay_count()
                 self._generate_ok(
                     "on newest joiner",
                     routed_dp_rank=target_ep_size - 1,
                 )
+                if self.EXPECT_CUDA_GRAPH_RECAPTURE:
+                    self._assert_decode_cuda_graph_replayed(replay_count)
                 return
             try:
                 self._post(
@@ -458,6 +503,32 @@ class TestElasticScaleUp4To8(_ElasticScaleUpEndToEndBase):
     TARGET_EP_SIZE = MAX_EP_SIZE
     CUDA_GRAPH_ARGS = DISABLED_CUDA_GRAPH_ARGS
     MOE_DENSE_TP_SIZE = None
+
+
+@unittest.skipUnless(
+    _count_visible_gpus() >= MAX_EP_SIZE,
+    f"Full scale-up E2E needs {MAX_EP_SIZE} GPUs.",
+)
+class TestElasticScaleUp4To8CudaGraph(_ElasticScaleUpEndToEndBase):
+    """Scale from four to eight ranks and recapture decode CUDA graphs."""
+
+    JOIN_TP = LAUNCH_EP_SIZE
+    JOIN_NNODES = 2
+    JOIN_NODE_RANK = 1
+    TARGET_EP_SIZE = MAX_EP_SIZE
+    CUDA_GRAPH_ARGS = ELASTIC_CUDA_GRAPH_ARGS
+    EXPECT_CUDA_GRAPH_RECAPTURE = True
+
+
+@unittest.skipUnless(
+    _count_visible_gpus() >= 6,
+    "4-to-5-to-6 CUDA graph scale-up E2E needs 6 GPUs.",
+)
+class TestElasticScaleUp4To5To6CudaGraph(TestElasticScaleUp4To5To6):
+    """Recapture decode CUDA graphs across two scale operations."""
+
+    CUDA_GRAPH_ARGS = ELASTIC_CUDA_GRAPH_ARGS
+    EXPECT_CUDA_GRAPH_RECAPTURE = True
 
 
 if __name__ == "__main__":
