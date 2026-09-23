@@ -144,7 +144,13 @@ class Disagg(msgspec.Struct):
         str,
         Arg(
             help="The backend for encoder disaggregation transfer. Auto selects a model- and TP-aware backend.",
-            choices=["auto", "zmq_to_scheduler", "zmq_to_tokenizer", "mooncake"],
+            choices=[
+                "auto",
+                "zmq_to_scheduler",
+                "zmq_to_tokenizer",
+                "mooncake",
+                "nixl",
+            ],
         ),
     ] = "auto"
     encoder_urls: A[List[str], "List of encoder server urls."] = msgspec.field(

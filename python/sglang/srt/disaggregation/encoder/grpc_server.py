@@ -28,6 +28,7 @@ from sglang.srt.disaggregation.encoder.server import (
     await_task_completion_on_cancel,
     launch_encoder,
 )
+from sglang.srt.disaggregation.encoder.transfer import REMOTE_WRITE_ENCODER_BACKENDS
 from sglang.srt.managers.io_struct import async_sock_send, wrap_as_pickle
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.runtime_context import (
@@ -139,7 +140,7 @@ class SGLangEncoderServer(SGLangEncoderServicer):
                 context.set_details(error_msg)
                 return sglang_encoder_pb2.EncodeResponse()
 
-            if get_disagg().encoder_transfer_backend == "mooncake":
+            if get_disagg().encoder_transfer_backend in REMOTE_WRITE_ENCODER_BACKENDS:
                 return sglang_encoder_pb2.EncodeResponse(
                     embedding_size=nbytes,
                     embedding_len=embedding_len,

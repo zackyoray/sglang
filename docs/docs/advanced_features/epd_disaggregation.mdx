@@ -17,7 +17,30 @@ To address these challenges, we introduce Encoder–Prefill–Decode (EPD) Disag
 You can launch a language-only model using `--language-only`, or an encoder-only model using `--encoder-only`.
 When launching a language-only model, you must additionally specify the encoder service endpoints via `--encoder-urls`.
 
-We support multiple encoder transfer backends, including zmq_to_scheduler, zmq_to_tokenizer, and mooncake (the default is zmq_to_scheduler). The backend can be selected using `--encoder-transfer-backend`.
+We support multiple encoder transfer backends, including zmq_to_scheduler, zmq_to_tokenizer, mooncake, and nixl (the default is zmq_to_scheduler). The backend can be selected using `--encoder-transfer-backend`.
+
+### Encoder transfer with NIXL
+
+Use `--encoder-transfer-backend nixl` on both the encoder and language/prefill server. NIXL uses the same backend configuration as PD disaggregation: `SGLANG_DISAGGREGATION_NIXL_BACKEND` selects the plugin (UCX by default), and `SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS` supplies its JSON parameters. The encoder and prefill processes must be able to reach each other through the selected plugin.
+
+```bash Command
+# encoder
+python -m sglang.launch_server \
+  --model-path Qwen/Qwen3-VL-8B-Instruct \
+  --encoder-only \
+  --encoder-transfer-backend nixl \
+  --port 30000
+
+# language-only server
+python -m sglang.launch_server \
+  --model-path Qwen/Qwen3-VL-8B-Instruct \
+  --language-only \
+  --encoder-urls http://127.0.0.1:30000 \
+  --encoder-transfer-backend nixl \
+  --port 30002
+```
+
+NIXL encoder transfer currently requires the HTTP encoder protocol. The gRPC encoder protocol supports the ZMQ backends.
 
 ### Encoder transfer with Mooncake
 

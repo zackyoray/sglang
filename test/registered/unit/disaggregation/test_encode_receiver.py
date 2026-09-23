@@ -7,15 +7,20 @@ import unittest
 from array import array
 from http import HTTPStatus
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from sglang.srt.disaggregation.encoder.receiver import (
     MMReceiverBase,
+    MMReceiverGrpc,
+    MMReceiverHTTP,
     WaitingMMRequestStatus,
     WaitingRDMARequest,
     WaitingZmqRequest,
     WaitingZmqRequestGrpc,
     _ReceiveRegistrationRunner,
+)
+from sglang.srt.disaggregation.encoder.transfer import (
+    NIXL_OUTCOME_UNCERTAIN_HEADER,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import EncoderDispatchErrorReq
@@ -350,6 +355,127 @@ class TestEncodeReceiverRequestConstruction(CustomTestCase):
         self.assertTrue(request._terminal)
         self.assertEqual(recv_socket.closed_by, scheduler_thread)
 
+    def test_uncertain_nixl_write_quarantines_pool_slot(self):
+        class UncertainResponse:
+            status = HTTPStatus.INTERNAL_SERVER_ERROR
+            headers = {NIXL_OUTCOME_UNCERTAIN_HEADER: "1"}
+
+            async def json(self):
+                return {"message": "NIXL transfer outcome uncertain"}
+
+            async def text(self):
+                return "NIXL transfer outcome uncertain"
+
+        request = WaitingRDMARequest.__new__(WaitingRDMARequest)
+        request.rid = "request-1"
+        request._buffer_lock = threading.Lock()
+        request._receive_error = None
+        request._receive_error_lock = threading.Lock()
+        request.embeddings_buffer = object()
+        request._pool_slot_id = 7
+        request.embedding_pool = Mock()
+        request.embeddings_engine = Mock()
+        request._quarantined_destinations = []
+        request._quarantine_lock = threading.Lock()
+
+        ok = asyncio.run(
+            request._check_encoder_responses([UncertainResponse()], "/send")
+        )
+
+        self.assertFalse(ok)
+        request.embedding_pool.quarantine.assert_called_once_with(7)
+        request.embedding_pool.release.assert_not_called()
+        self.assertIsNone(request._pool_slot_id)
+        self.assertIsNone(request.embeddings_buffer)
+        self.assertEqual(
+            request._receive_error,
+            ("NIXL transfer outcome uncertain", HTTPStatus.INTERNAL_SERVER_ERROR),
+        )
+
+    def test_lost_send_response_quarantines_pool_slot(self):
+        request = WaitingRDMARequest.__new__(WaitingRDMARequest)
+        request.rid = "request-1"
+        request._buffer_lock = threading.Lock()
+        request._receive_error = None
+        request._receive_error_lock = threading.Lock()
+        request.embeddings_buffer = object()
+        request._pool_slot_id = 9
+        request.embedding_pool = Mock()
+        request.embeddings_engine = Mock()
+        request._quarantined_destinations = []
+        request._quarantine_lock = threading.Lock()
+
+        ok = asyncio.run(
+            request._check_encoder_responses(
+                [ConnectionError("lost after POST /send")], "/send"
+            )
+        )
+
+        self.assertFalse(ok)
+        request.embedding_pool.quarantine.assert_called_once_with(9)
+        request.embedding_pool.release.assert_not_called()
+        self.assertIsNone(request._pool_slot_id)
+        self.assertIsNone(request.embeddings_buffer)
+
+    def test_dispatch_timeout_response_quarantines_pool_slot(self):
+        class TimeoutResponse:
+            status = HTTPStatus.GATEWAY_TIMEOUT
+            headers = {}
+
+            async def json(self):
+                return {"message": "DP /send timed out"}
+
+            async def text(self):
+                return "DP /send timed out"
+
+        request = WaitingRDMARequest.__new__(WaitingRDMARequest)
+        request.rid = "request-1"
+        request._buffer_lock = threading.Lock()
+        request._receive_error = None
+        request._receive_error_lock = threading.Lock()
+        request.embeddings_buffer = object()
+        request._pool_slot_id = 11
+        request.embedding_pool = Mock()
+        request.embeddings_engine = Mock()
+        request._quarantined_destinations = []
+        request._quarantine_lock = threading.Lock()
+
+        ok = asyncio.run(request._check_encoder_responses([TimeoutResponse()], "/send"))
+
+        self.assertFalse(ok)
+        request.embedding_pool.quarantine.assert_called_once_with(11)
+        request.embedding_pool.release.assert_not_called()
+        self.assertIsNone(request._pool_slot_id)
+        self.assertIsNone(request.embeddings_buffer)
+
+    def test_lost_send_response_retains_unpooled_mooncake_destination(self):
+        owner = object()
+        request = WaitingRDMARequest.__new__(WaitingRDMARequest)
+        request.rid = "request-1"
+        request._buffer_lock = threading.Lock()
+        request._receive_error = None
+        request._receive_error_lock = threading.Lock()
+        request.embeddings_buffer = owner
+        request._pool_slot_id = None
+        request.embedding_pool = None
+        request._receive_running = False
+        request._terminal = False
+        request.embeddings_engine = SimpleNamespace(deregister=Mock())
+        request._quarantined_destinations = []
+        request._quarantine_lock = threading.Lock()
+
+        ok = asyncio.run(
+            request._check_encoder_responses(
+                [ConnectionError("lost after POST /send")], "/send"
+            )
+        )
+
+        self.assertFalse(ok)
+        self.assertEqual(request._quarantined_destinations, [owner])
+        self.assertIsNone(request.embeddings_buffer)
+        request._cleanup_gpu_buffer()
+        request.embeddings_engine.deregister.assert_not_called()
+
     def test_tp_peer_failure_closes_local_receive_socket(self):
         class WaitingRequest:
             rid = "request-1"
@@ -393,6 +519,45 @@ class TestEncodeReceiverRequestConstruction(CustomTestCase):
         self.assertTrue(waiting_req.released)
         self.assertTrue(waiting_req.closed)
         self.assertEqual(len(abort_reqs), 1)
+
+
+class TestRDMABackendSelection(CustomTestCase):
+    def test_http_selects_rdma_waiter_for_both_backends(self):
+        for backend in ("mooncake", "nixl"):
+            with self.subTest(backend=backend):
+                receiver = MMReceiverHTTP.__new__(MMReceiverHTTP)
+                receiver.encoder_transfer_backend = backend
+                receiver.embeddings_engine = object()
+                receiver.dtype = object()
+                receiver.gpu_id = 3
+                receiver.embedding_pool = object()
+                receiver._quarantined_destinations = []
+                receiver._quarantine_lock = threading.Lock()
+                receiver._process_waiting_requests = Mock()
+                requests = [object()]
+                receiver.process_waiting_requests(requests)
+                receiver._process_waiting_requests.assert_called_once_with(
+                    requests,
+                    WaitingRDMARequest,
+                    embeddings_engine=receiver.embeddings_engine,
+                    dtype=receiver.dtype,
+                    gpu_id=3,
+                    embedding_pool=receiver.embedding_pool,
+                    quarantined_destinations=receiver._quarantined_destinations,
+                    quarantine_lock=receiver._quarantine_lock,
+                )
+
+    def test_grpc_rejects_both_rdma_backends(self):
+        for backend in ("mooncake", "nixl"):
+            with (
+                self.subTest(backend=backend),
+                patch(
+                    "sglang.srt.disaggregation.encoder.receiver.get_disagg",
+                    return_value=SimpleNamespace(encoder_transfer_backend=backend),
+                ),
+                self.assertRaisesRegex(NotImplementedError, "requires HTTP"),
+            ):
+                MMReceiverGrpc(None)
 
 
 if __name__ == "__main__":

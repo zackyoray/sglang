@@ -40,6 +40,10 @@ from sglang.srt.disaggregation.encoder.server import (
     MMEncoder,
     MMError,
 )
+from sglang.srt.disaggregation.encoder.transfer import (
+    NIXL_OUTCOME_UNCERTAIN_HEADER,
+    NixlTransferOutcomeUncertain,
+)
 from sglang.srt.managers.io_struct import (
     ProfileReq,
     ProfileReqType,
@@ -380,7 +384,7 @@ async def handle_encode_request(request: dict):
 
 @app.post("/send")
 async def handle_send_request(request: dict):
-    """Mooncake-only: drive the RDMA push of a staged embedding. The zmq
+    """Drive a remote write of a staged embedding. The ZMQ
     backends deliver embeddings inline during /encode and never call /send."""
     req_id = request["req_id"]
     if dp_dispatcher is not None:
@@ -402,6 +406,12 @@ async def handle_send_request(request: dict):
             return Response(
                 content=f"Encoder DP worker send error: {result['_error']}",
                 status_code=status_code,
+                headers=(
+                    {NIXL_OUTCOME_UNCERTAIN_HEADER: "1"}
+                    if result.get("_error_type")
+                    == NixlTransferOutcomeUncertain.__name__
+                    else None
+                ),
             )
         return ORJSONResponse(content=result.get("content"))
     try:
@@ -412,9 +422,14 @@ async def handle_send_request(request: dict):
             release_without_count=False,
         )
     except Exception as error:
-        logger.error("Mooncake send failed for req_id=%s: %s", req_id, error)
+        logger.error("Remote-write send failed for req_id=%s: %s", req_id, error)
         return ORJSONResponse(
             status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            headers=(
+                {NIXL_OUTCOME_UNCERTAIN_HEADER: "1"}
+                if isinstance(error, NixlTransferOutcomeUncertain)
+                else None
+            ),
             content={
                 "status": "error",
                 "message": str(error),

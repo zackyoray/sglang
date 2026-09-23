@@ -25,6 +25,10 @@ from fastapi import FastAPI
 from fastapi.responses import ORJSONResponse, Response
 from transformers import PretrainedConfig
 
+from sglang.srt.disaggregation.encoder.transfer import (
+    NIXL_OUTCOME_UNCERTAIN_HEADER,
+    REMOTE_WRITE_ENCODER_BACKENDS,
+)
 from sglang.srt.distributed.parallel_state import (
     GroupCoordinator,
     get_mooncake_transfer_engine,
@@ -1362,6 +1366,8 @@ class WaitingRDMARequest(WaitingMMRequestBase):
         model_type: Optional[str] = None,
         embedding_pool=None,
         embedding_port=None,
+        quarantined_destinations=None,
+        quarantine_lock=None,
     ):
         super().__init__(
             rid=rid,
@@ -1378,6 +1384,8 @@ class WaitingRDMARequest(WaitingMMRequestBase):
         self.embeddings_engine = embeddings_engine
         self.dtype = dtype
         self.gpu_id = gpu_id
+        self._quarantined_destinations = quarantined_destinations
+        self._quarantine_lock = quarantine_lock
         # The receive thread owns the buffer while _receive_running; once
         # _terminal latches, it releases the buffer itself on exit so the
         # scheduler thread never has to wait on it.
@@ -1420,6 +1428,14 @@ class WaitingRDMARequest(WaitingMMRequestBase):
 
     async def _check_encoder_responses(self, responses, endpoint: str) -> bool:
         """Record network failures for the scheduler thread to consume."""
+        if endpoint == "/send" and any(
+            isinstance(response, BaseException)
+            or response.headers.get(NIXL_OUTCOME_UNCERTAIN_HEADER) == "1"
+            or response.status != HTTPStatus.OK
+            for response in responses
+        ):
+            with self._buffer_lock:
+                self._quarantine_buffer_locked()
         error = await _extract_encoder_error(responses, endpoint, f"rid={self.rid}")
         if error is None:
             return True
@@ -1503,7 +1519,7 @@ class WaitingRDMARequest(WaitingMMRequestBase):
                         self.embeddings_buffer = pool_view
                         self._pool_slot_id = slot_id
                     logger.info(
-                        f"Pool-allocated Mooncake GPU landing buffer: "
+                        f"Pool-allocated remote-write GPU landing buffer: "
                         f"rid={self.rid}, size={total_bytes}, "
                         f"addr={buffer_address}, slot={slot_id}"
                     )
@@ -1518,7 +1534,7 @@ class WaitingRDMARequest(WaitingMMRequestBase):
                     with self._buffer_lock:
                         self.embeddings_buffer = gpu_buffer
                     logger.info(
-                        f"Per-request registered Mooncake GPU landing buffer "
+                        f"Per-request registered remote-write GPU landing buffer "
                         f"(pool disabled): rid={self.rid}, size={total_bytes}, "
                         f"addr={buffer_address}"
                     )
@@ -1605,6 +1621,22 @@ class WaitingRDMARequest(WaitingMMRequestBase):
                 logger.exception("Failed to deregister GPU buffer for rid=%s", self.rid)
         self.embeddings_buffer = None
 
+    def _quarantine_buffer_locked(self):
+        """Permanently retain a destination that an active WRITE may touch."""
+        if self.embeddings_buffer is None:
+            return
+        if self._pool_slot_id is not None:
+            self.embedding_pool.quarantine(self._pool_slot_id)
+            self._pool_slot_id = None
+        else:
+            if self._quarantined_destinations is None or self._quarantine_lock is None:
+                raise RuntimeError(
+                    "Remote-write destination quarantine storage is missing"
+                )
+            with self._quarantine_lock:
+                self._quarantined_destinations.append(self.embeddings_buffer)
+        self.embeddings_buffer = None
+
 
 async def _extract_encoder_error(responses, endpoint, context, encode_requests=None):
     """Return the first ``(message, status)`` error, or None.
@@ -1629,7 +1661,7 @@ async def _extract_encoder_error(responses, endpoint, context, encode_requests=N
                 f"Encoder {endpoint} timeout ({timeout_val}s)",
                 int(HTTPStatus.GATEWAY_TIMEOUT),
             )
-        if isinstance(resp, Exception):
+        if isinstance(resp, BaseException):
             logger.error(
                 f"Encoder {endpoint} failed for {ctx} (request {i}): {resp}",
                 exc_info=resp,
@@ -1683,6 +1715,7 @@ class EmbeddingPool:
         if engine is not None:
             engine.register(self.base, self.buffer.nbytes)
         self._segments_free: List[Tuple[int, int]] = [(0, size_bytes)]
+        self._segments_quarantined = set()
         self._inflight: Dict[int, Tuple[int, int]] = {}
         self._next_slot_id = 0
         self._total_inflight = 0
@@ -1798,6 +1831,11 @@ class EmbeddingPool:
         """Return a previously-allocated slot to the free list and wake any
         blocked alloc() waiters."""
         with self._cond:
+            if slot_id in self._segments_quarantined:
+                logger.error(
+                    "Refusing to release quarantined EmbeddingPool slot %s", slot_id
+                )
+                return
             seg = self._inflight.pop(slot_id, None)
             if seg is None:
                 return
@@ -1805,6 +1843,13 @@ class EmbeddingPool:
             self._total_inflight -= aligned
             self._coalesce_free_locked(off, aligned)
             self._cond.notify_all()
+
+    def quarantine(self, slot_id: int) -> None:
+        """Keep an allocated slot unavailable because DMA may still target it."""
+        with self._cond:
+            if slot_id not in self._inflight:
+                raise KeyError(f"EmbeddingPool unknown slot_id={slot_id}")
+            self._segments_quarantined.add(slot_id)
 
     def _coalesce_free_locked(self, off: int, length: int) -> None:
         self._segments_free.append((off, length))
@@ -1925,15 +1970,26 @@ class MMReceiverBase(ABC):
         self.gpu_id = get_device().gpu_id if scheduler is not None else 0
         self.wait_timeout = envs.SGLANG_ENCODER_RECV_TIMEOUT.get()
         self.embedding_pool = None
+        self._quarantined_destinations = []
+        self._quarantine_lock = threading.Lock()
 
         self.model_type = (
             getattr(hf_config, "model_type", "").lower()
             if hf_config is not None
             else None
         )
-        if self.encoder_transfer_backend == "mooncake":
+        if self.encoder_transfer_backend in REMOTE_WRITE_ENCODER_BACKENDS:
             self.dtype = dtype
-            self.embeddings_engine = get_mooncake_transfer_engine()
+            if self.encoder_transfer_backend == "nixl":
+                from sglang.srt.disaggregation.encoder.transfer import (
+                    NixlEmbeddingTransferEngine,
+                )
+
+                self.embeddings_engine = NixlEmbeddingTransferEngine(
+                    self.gpu_id, timeout=envs.SGLANG_ENCODER_SEND_TIMEOUT.get()
+                )
+            else:
+                self.embeddings_engine = get_mooncake_transfer_engine()
             if self.embeddings_engine is None:
                 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
                     init_mooncake_transfer_engine,
@@ -2693,7 +2749,7 @@ class MMReceiverHTTP(MMReceiverBase):
 
     # For zmq_to_scheduler and mooncake
     def process_waiting_requests(self, recv_reqs):
-        if self.encoder_transfer_backend == "mooncake":
+        if self.encoder_transfer_backend in REMOTE_WRITE_ENCODER_BACKENDS:
             return self._process_waiting_requests(
                 recv_reqs,
                 WaitingRDMARequest,
@@ -2701,6 +2757,8 @@ class MMReceiverHTTP(MMReceiverBase):
                 dtype=self.dtype,
                 gpu_id=self.gpu_id,
                 embedding_pool=self.embedding_pool,
+                quarantined_destinations=self._quarantined_destinations,
+                quarantine_lock=self._quarantine_lock,
             )
         return self._process_waiting_requests(
             recv_reqs,
@@ -2819,11 +2877,11 @@ class MMReceiverGrpc(MMReceiverBase):
         scheduler: Optional["Scheduler"] = None,
         encode_urls: Optional[List[str]] = None,
     ):
-        if get_disagg().encoder_transfer_backend == "mooncake":
+        if get_disagg().encoder_transfer_backend in REMOTE_WRITE_ENCODER_BACKENDS:
             # The RDMA receive path (WaitingRDMARequest + /meta + /send) only
             # exists for HTTP encoders; gRPC has no RDMA-capable receive.
             raise NotImplementedError(
-                "mooncake encoder_transfer_backend requires HTTP encoders; "
+                "Remote-write encoder_transfer_backend (mooncake/nixl) requires HTTP; "
                 "use zmq_to_scheduler / zmq_to_tokenizer with gRPC."
             )
         super().__init__(

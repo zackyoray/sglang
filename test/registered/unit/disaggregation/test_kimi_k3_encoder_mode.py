@@ -1153,7 +1153,7 @@ def test_epd_encoder_reuses_scheduler_zmq_peer():
         with config_override as server_args:
             encoder.server_args = server_args
             encoder.transfer_backend = "zmq_to_scheduler"
-            encoder.use_mooncake = False
+            encoder.use_remote_write = False
             encoder.send_timeout = 3
             encoder.context = context
             encoder.scheduler_send_sockets = {}
@@ -1229,7 +1229,7 @@ def test_epd_encoder_pipelines_zero_copy_sends_per_peer():
         with config_override as server_args:
             encoder.server_args = server_args
             encoder.transfer_backend = "zmq_to_scheduler"
-            encoder.use_mooncake = False
+            encoder.use_remote_write = False
             encoder.send_timeout = 1
             encoder.context = FakeContext(socket)
             encoder.scheduler_send_sockets = {}

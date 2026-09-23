@@ -29,7 +29,7 @@ from sglang.srt.disaggregation.encoder.server import (
     InternalError,
     MMEncoder,
     MMError,
-    MooncakeDelivery,
+    RemoteWriteDelivery,
     ReqState,
     SendDestination,
     ZmqDelivery,
@@ -38,6 +38,10 @@ from sglang.srt.disaggregation.encoder.server import (
     rid_to_cond,
     rid_to_receive_count,
     rid_to_receive_endpoint,
+)
+from sglang.srt.disaggregation.encoder.transfer import (
+    NIXL_OUTCOME_UNCERTAIN_HEADER,
+    NixlTransferOutcomeUncertain,
 )
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     MooncakeTransferEngine,
@@ -231,6 +235,51 @@ class TestEncoderMetaRegistry(CustomTestCase):
 
         asyncio.run(run())
 
+    def test_http_send_marks_uncertain_nixl_transfer(self):
+        async def run():
+            error = NixlTransferOutcomeUncertain("write may still be active")
+            encoder = SimpleNamespace(
+                send=AsyncMock(side_effect=error),
+                release_request=AsyncMock(),
+            )
+            request = {
+                "req_id": "req",
+                "prefill_host": "127.0.0.1",
+                "embedding_port": 5000,
+                "session_id": "session",
+                "buffer_address": 1234,
+            }
+            with (
+                patch.object(http_server, "dp_dispatcher", None),
+                patch.object(http_server, "encoder", encoder),
+            ):
+                response = await http_server.handle_send_request(request)
+
+            self.assertEqual(response.status_code, HTTPStatus.INTERNAL_SERVER_ERROR)
+            self.assertEqual(response.headers[NIXL_OUTCOME_UNCERTAIN_HEADER], "1")
+            encoder.release_request.assert_awaited_once_with("req")
+
+        asyncio.run(run())
+
+    def test_dp_http_send_preserves_uncertain_nixl_marker(self):
+        async def run():
+            dispatcher = SimpleNamespace(
+                dispatch_send=AsyncMock(
+                    return_value={
+                        "_error": "write may still be active",
+                        "_error_type": NixlTransferOutcomeUncertain.__name__,
+                        "_error_code": HTTPStatus.INTERNAL_SERVER_ERROR,
+                    }
+                )
+            )
+            with patch.object(http_server, "dp_dispatcher", dispatcher):
+                response = await http_server.handle_send_request({"req_id": "req"})
+
+            self.assertEqual(response.status_code, HTTPStatus.INTERNAL_SERVER_ERROR)
+            self.assertEqual(response.headers[NIXL_OUTCOME_UNCERTAIN_HEADER], "1")
+
+        asyncio.run(run())
+
     def test_dp_send_counts_the_normalized_destination(self):
         async def run():
             encoder = SimpleNamespace(send=AsyncMock(return_value=True))
@@ -395,11 +444,11 @@ class TestEncoderDelivery(CustomTestCase):
         asyncio.run(run())
 
     def test_cancelled_mooncake_send_keeps_embedding_until_transfer_stops(self):
-        async def run():
+        async def run(backend):
             transfer_started = threading.Event()
             finish_transfer = threading.Event()
 
-            def transfer_sync(*_args):
+            def transfer_sync(*_args, **_kwargs):
                 transfer_started.set()
                 finish_transfer.wait()
                 return 0
@@ -407,13 +456,13 @@ class TestEncoderDelivery(CustomTestCase):
             encoder = MMEncoder.__new__(MMEncoder)
             encoder.req_states = {}
             encoder._element_size = 2
-            encoder.transfer_backend = "mooncake"
+            encoder.transfer_backend = backend
             encoder.engine = SimpleNamespace(
                 register=unittest.mock.Mock(),
                 transfer_sync=unittest.mock.Mock(side_effect=transfer_sync),
                 deregister=unittest.mock.Mock(),
             )
-            encoder.delivery = MooncakeDelivery(encoder)
+            encoder.delivery = RemoteWriteDelivery(encoder)
 
             embedding = torch.ones((2, 4), dtype=torch.float16)
             state = ReqState(
@@ -433,7 +482,7 @@ class TestEncoderDelivery(CustomTestCase):
             with (
                 patch(
                     "sglang.srt.disaggregation.encoder.server.get_disagg",
-                    return_value=SimpleNamespace(encoder_transfer_backend="mooncake"),
+                    return_value=SimpleNamespace(encoder_transfer_backend=backend),
                 ),
                 patch.object(meta_registry, "discard", AsyncMock()),
             ):
@@ -471,13 +520,15 @@ class TestEncoderDelivery(CustomTestCase):
             self.assertIsNone(state.embedding_data)
             self.assertNotIn(state.req_id, encoder.req_states)
 
-        asyncio.run(run())
+        for backend in ("mooncake", "nixl"):
+            with self.subTest(backend=backend):
+                asyncio.run(run(backend))
 
     def test_failed_mooncake_transfer_releases_per_send_registration(self):
-        async def run():
+        async def run(backend):
             encoder = MMEncoder.__new__(MMEncoder)
             encoder._element_size = 2
-            encoder.transfer_backend = "mooncake"
+            encoder.transfer_backend = backend
             encoder.engine = SimpleNamespace(
                 register=unittest.mock.Mock(),
                 transfer_sync=unittest.mock.Mock(
@@ -495,24 +546,28 @@ class TestEncoderDelivery(CustomTestCase):
                 embedding=embedding,
             )
 
-            with patch(
-                "sglang.srt.disaggregation.encoder.server.get_disagg",
-                return_value=SimpleNamespace(encoder_transfer_backend="mooncake"),
+            with (
+                patch(
+                    "sglang.srt.disaggregation.encoder.server.get_disagg",
+                    return_value=SimpleNamespace(encoder_transfer_backend=backend),
+                ),
+                self.assertRaisesRegex(RuntimeError, "transfer failed"),
             ):
-                with self.assertRaisesRegex(RuntimeError, "transfer failed"):
-                    await encoder._send(
-                        embedding,
-                        mm_data,
-                        session_id="session",
-                        buffer_address=1,
-                    )
+                await encoder._send(
+                    embedding,
+                    mm_data,
+                    session_id="session",
+                    buffer_address=1,
+                )
 
             encoder.engine.register.assert_called_once_with(
                 embedding.data_ptr(), embedding.nbytes
             )
             encoder.engine.deregister.assert_called_once_with(embedding.data_ptr())
 
-        asyncio.run(run())
+        for backend in ("mooncake", "nixl"):
+            with self.subTest(backend=backend):
+                asyncio.run(run(backend))
 
     @staticmethod
     def _global_cache_context(num_items=2):
@@ -642,7 +697,7 @@ class TestEncoderDelivery(CustomTestCase):
         self.assertEqual(
             set(EncoderDelivery.__subclasses__()),
             {
-                MooncakeDelivery,
+                RemoteWriteDelivery,
                 ZmqDelivery,
             },
         )
@@ -766,6 +821,7 @@ class TestEncoderDelivery(CustomTestCase):
         )
         encoder = MMEncoder.__new__(MMEncoder)
         encoder._element_size = embedding.element_size()
+        encoder.transfer_backend = "mooncake"
         encoder.engine = engine
         return encoder, embedding, mm_data
 
@@ -2080,7 +2136,7 @@ class TestEncoderDelivery(CustomTestCase):
             encoder.rank = 0
             encoder.req_states = {}
             encoder.abandoned_req_ids = set()
-            encoder.use_mooncake = False
+            encoder.use_remote_write = False
             encoder.mm_global_cache = None
             encoder.profiler = None
             encoder.send_timeout = 1

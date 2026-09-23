@@ -32,6 +32,7 @@ from sglang.srt.disaggregation.encoder.receiver import (
     EmbeddingData,
     video_meta_attrs_for,
 )
+from sglang.srt.disaggregation.encoder.transfer import REMOTE_WRITE_ENCODER_BACKENDS
 from sglang.srt.distributed.parallel_state import (
     get_default_distributed_backend,
     get_mooncake_transfer_engine,
@@ -432,7 +433,7 @@ class EncoderDelivery(ABC):
     async def release(self, state: ReqState) -> None: ...
 
 
-class MooncakeDelivery(EncoderDelivery):
+class RemoteWriteDelivery(EncoderDelivery):
     async def send(
         self,
         state: ReqState,
@@ -550,7 +551,7 @@ class MMEncoder:
             get_mm().media_url_max_file_size_mb,
         )
         self.transfer_backend = get_disagg().encoder_transfer_backend
-        self.use_mooncake = self.transfer_backend == "mooncake"
+        self.use_remote_write = self.transfer_backend in REMOTE_WRITE_ENCODER_BACKENDS
         self.rank = rank
         # DP rank for metric labels; overridden by runtime.run_dp_worker.
         # 0 in the single-instance (non-DP) path.
@@ -682,10 +683,19 @@ class MMEncoder:
                 f"Using transfer backend: {get_disagg().encoder_transfer_backend}"
             )
 
-            if get_disagg().encoder_transfer_backend == "mooncake":
+            if get_disagg().encoder_transfer_backend in REMOTE_WRITE_ENCODER_BACKENDS:
                 self.local_ip = get_local_ip_auto()
 
-                self.engine = get_mooncake_transfer_engine()
+                if self.transfer_backend == "nixl":
+                    from sglang.srt.disaggregation.encoder.transfer import (
+                        NixlEmbeddingTransferEngine,
+                    )
+
+                    self.engine = NixlEmbeddingTransferEngine(
+                        self.gpu_id, timeout=self.send_timeout, initiator=True
+                    )
+                else:
+                    self.engine = get_mooncake_transfer_engine()
                 if self.engine is None:
                     from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
                         init_mooncake_transfer_engine,
@@ -707,8 +717,8 @@ class MMEncoder:
             # Need to ensure the NCCL launch order on rank0 matches the dispatch order rank>0
             self.encode_dispatch_lock = asyncio.Lock()
 
-            if get_disagg().encoder_transfer_backend == "mooncake":
-                self.delivery = MooncakeDelivery(self)
+            if get_disagg().encoder_transfer_backend in REMOTE_WRITE_ENCODER_BACKENDS:
+                self.delivery = RemoteWriteDelivery(self)
                 # Embeddings live here, so registry cleanup uses the common release.
                 meta_registry.on_release = self.release_request
                 meta_registry.sweep_timeout = self.send_timeout
@@ -1914,12 +1924,12 @@ class MMEncoder:
         embedding_port=None,
         url=None,
     ):
-        if get_disagg().encoder_transfer_backend == "mooncake":
+        if get_disagg().encoder_transfer_backend in REMOTE_WRITE_ENCODER_BACKENDS:
             # Encode is synchronous, so mm_data was staged before /encode returned.
             req_id = mm_data.req_id
             if embedding is None:
                 raise InternalError(
-                    f"No embedding available for Mooncake GPU-direct transfer: {req_id}"
+                    f"No embedding available for remote-write transfer: {req_id}"
                 )
 
             expected_nbytes = mm_data.shape[0] * mm_data.shape[1] * self._element_size
@@ -1936,11 +1946,12 @@ class MMEncoder:
             transfer_error = None
             try:
                 _t_xfer_start = time.monotonic()
-                xfer_ret = await self._run_mooncake_transfer(
+                xfer_ret = await self._run_remote_write_transfer(
                     session_id,
                     embedding.data_ptr(),
                     buffer_address,
                     embedding.nbytes,
+                    source_owner=embedding,
                 )
             except BaseException as error:
                 transfer_error = error
@@ -1960,18 +1971,18 @@ class MMEncoder:
             xfer_ms = (time.monotonic() - _t_xfer_start) * 1000.0
             if encoder_metrics_collector is not None:
                 encoder_metrics_collector.observe_transfer(
-                    xfer_ms / 1000.0, backend="mooncake"
+                    xfer_ms / 1000.0, backend=self.transfer_backend
                 )
             if xfer_ret < 0:
                 raise InternalError(
-                    f"Mooncake transfer_sync failed for {req_id} "
-                    f"(session={session_id}, nbytes={embedding.nbytes}, "
+                    f"{self.transfer_backend} transfer_sync failed for {req_id} "
+                    f"(nbytes={embedding.nbytes}, "
                     f"ret={xfer_ret})"
                 )
             # Emit at INFO for slow transfers or per-send registrations.
             if xfer_ms > 200.0 or not mr_already_registered:
                 logger.info(
-                    f"[{req_id}] mooncake transfer_sync={xfer_ms:.1f}ms "
+                    f"[{req_id}] {self.transfer_backend} transfer_sync={xfer_ms:.1f}ms "
                     f"nbytes={embedding.nbytes} shared_mr={mr_already_registered}"
                 )
 
@@ -1985,8 +1996,8 @@ class MMEncoder:
         logger.info(f"{endpoint = }")
 
         # Serialize data
-        if get_disagg().encoder_transfer_backend == "mooncake":
-            # Mooncake already pushed the embedding via RDMA;
+        if get_disagg().encoder_transfer_backend in REMOTE_WRITE_ENCODER_BACKENDS:
+            # The transport already pushed the embedding into the landing buffer;
             new_mm_data = mm_data.copy_without_embedding()
             serialized_data = pickle.dumps(new_mm_data)
             buffer = None
@@ -2079,21 +2090,26 @@ class MMEncoder:
         )
         if (
             encoder_metrics_collector is not None
-            and get_disagg().encoder_transfer_backend != "mooncake"
+            and get_disagg().encoder_transfer_backend
+            not in REMOTE_WRITE_ENCODER_BACKENDS
         ):
             encoder_metrics_collector.observe_transfer(
                 time.perf_counter() - transfer_start,
                 backend=get_disagg().encoder_transfer_backend,
             )
 
-    async def _run_mooncake_transfer(
+    async def _run_remote_write_transfer(
         self,
         session_id,
         source_address: int,
         destination_address: int,
         size: int,
+        source_owner=None,
     ) -> int:
         """Keep the send active until its blocking transfer stops using the MR."""
+        kwargs = (
+            {"source_owner": source_owner} if self.transfer_backend == "nixl" else {}
+        )
         return await _await_transfer_completion(
             asyncio.to_thread(
                 self.engine.transfer_sync,
@@ -2101,8 +2117,9 @@ class MMEncoder:
                 source_address,
                 destination_address,
                 size,
+                **kwargs,
             ),
-            f"Mooncake transfer to session={session_id}",
+            "Encoder remote-write transfer",
         )
 
     def _register_shared_mr(self, mm_data: EmbeddingData, embedding: torch.Tensor):
@@ -2237,7 +2254,7 @@ class MMEncoder:
         is_health_check = all(
             is_health_check_request(req["req_id"]) for req in requests
         )
-        keep_on_gpu = self.use_mooncake and not is_health_check
+        keep_on_gpu = self.use_remote_write and not is_health_check
         use_global_cache = self.mm_global_cache is not None and not is_health_check
         try:
             if self.rank == 0:

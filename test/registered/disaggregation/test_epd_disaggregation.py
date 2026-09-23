@@ -66,6 +66,7 @@ class TestEPDDisaggregationOmni(PDDisaggregationServerBase):
         )
         assert cls.encoder_transfer_backend in (
             "mooncake",
+            "nixl",
             "zmq_to_scheduler",
             "zmq_to_tokenizer",
         ), f"Invalid EPD_ENCODER_TRANSFER_BACKEND: {cls.encoder_transfer_backend}"
@@ -1574,6 +1575,9 @@ class TestEPDDisaggregationMooncake(MMMUMixin, PDDisaggregationServerBase):
     """
 
     # Qwen2.5-VL-3B-Instruct scores ~0.40 on the 50-sample MMMU subset.
+    encoder_transfer_backend = os.environ.get(
+        "EPD_ENCODER_TRANSFER_BACKEND", "mooncake"
+    )
     accuracy = 0.40
     mmmu_args = ["--limit", "50"]
 
@@ -1613,7 +1617,7 @@ class TestEPDDisaggregationMooncake(MMMUMixin, PDDisaggregationServerBase):
             "--trust-remote-code",
             "--encoder-only",
             "--encoder-transfer-backend",
-            "mooncake",
+            cls.encoder_transfer_backend,
             "--tp",
             "1",
             "--port",
@@ -1636,7 +1640,7 @@ class TestEPDDisaggregationMooncake(MMMUMixin, PDDisaggregationServerBase):
             "--encoder-urls",
             cls.encode_url,
             "--encoder-transfer-backend",
-            "mooncake",
+            cls.encoder_transfer_backend,
             "--disaggregation-mode",
             "prefill",
             "--disaggregation-bootstrap-port",

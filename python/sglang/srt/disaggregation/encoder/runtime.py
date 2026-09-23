@@ -35,6 +35,7 @@ from sglang.srt.disaggregation.encoder.server import (
     await_task_completion_on_cancel,
     launch_encoder,
 )
+from sglang.srt.disaggregation.encoder.transfer import REMOTE_WRITE_ENCODER_BACKENDS
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     ProfileReq,
@@ -1104,7 +1105,7 @@ async def _push_embedding_to_prefill(
     req_id = request["req_id"]
     backend = enc.transfer_backend
 
-    if backend == "mooncake":
+    if backend in REMOTE_WRITE_ENCODER_BACKENDS:
         return
 
     if backend == "zmq_to_scheduler" and request.get("embedding_port") is None:
@@ -1150,7 +1151,7 @@ async def send_staged_embedding(
     *,
     release_without_count: bool,
 ) -> bool:
-    """Send one Mooncake embedding and retire its state on any failure."""
+    """Send one remote-write embedding and retire its state on any failure."""
     req_id = request["req_id"]
     try:
         sent = await enc.send(
@@ -1306,7 +1307,8 @@ async def execute_encode_pipeline(
         await _release_failed_request(
             enc,
             req_id,
-            preserve_metadata=backend == "mooncake" and error_published,
+            preserve_metadata=backend in REMOTE_WRITE_ENCODER_BACKENDS
+            and error_published,
         )
         _record_pipeline_result(modality, "error")
         raise
@@ -1317,7 +1319,8 @@ async def execute_encode_pipeline(
         await _release_failed_request(
             enc,
             req_id,
-            preserve_metadata=backend == "mooncake" and error_published,
+            preserve_metadata=backend in REMOTE_WRITE_ENCODER_BACKENDS
+            and error_published,
         )
         _record_pipeline_result(modality, "error")
         raise
@@ -1326,7 +1329,7 @@ async def execute_encode_pipeline(
     if error_msg:
         time_stats.trace_ctx.abort(abort_info={"reason": error_msg})
         error_published = await _publish_pipeline_error(req_id, error_msg)
-        if backend == "mooncake":
+        if backend in REMOTE_WRITE_ENCODER_BACKENDS:
             await _release_failed_request(
                 enc,
                 req_id,
@@ -1356,7 +1359,7 @@ async def execute_encode_pipeline(
             req_id, nbytes, embedding_len, embedding_dim
         )
 
-        if backend == "mooncake":
+        if backend in REMOTE_WRITE_ENCODER_BACKENDS:
             request.pop("mm_items", None)
             request.update(
                 embedding_size=nbytes,
