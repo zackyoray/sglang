@@ -1568,7 +1568,7 @@ def _a2a_fusion_adjustments(view: Any) -> dict:
             "Flashinfer MoE A2A is enabled. --disable-shared-experts-fusion is automatically set."
         )
         return {"disable_shared_experts_fusion": True}
-    if view.moe_a2a_backend == "deepep_v2":
+    if view.moe_a2a_backend in ("deepep_v2", "nixl_ep_v2"):
         # Fused shared experts are not validated with DeepEP v2.
         return {"disable_shared_experts_fusion": True}
     return {}
@@ -1582,6 +1582,7 @@ _A2A_EP_SPANNING_BACKENDS = frozenset(
         "deepep_v2",
         "mooncake",
         "nixl",
+        "nixl_ep_v2",
         "ascend_fuseep",
         "flashinfer",
         "flashinfer_megamoe",

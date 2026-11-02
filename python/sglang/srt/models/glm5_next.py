@@ -1105,7 +1105,7 @@ class Glm5NextModel(nn.Module):
         if (
             get_moe_a2a_backend().is_deepep()
             or get_moe_a2a_backend().is_mooncake()
-            or get_moe_a2a_backend().is_deepep_v2()
+            or get_moe_a2a_backend().is_elastic_buffer()
         ):
             self.enable_a2a_moe = True
         else:

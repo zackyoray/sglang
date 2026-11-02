@@ -38,6 +38,7 @@ class MoeA2ABackend(Enum):
     DEEPEP = "deepep"
     MOONCAKE = "mooncake"
     NIXL = "nixl"
+    NIXL_EP_V2 = "nixl_ep_v2"
     MORI = "mori"
     ASCEND_FUSEEP = "ascend_fuseep"
     ASCEND_TP = "ascend_tp"
@@ -69,6 +70,9 @@ class MoeA2ABackend(Enum):
     def is_nixl(self):
         return self == MoeA2ABackend.NIXL
 
+    def is_nixl_ep_v2(self):
+        return self == MoeA2ABackend.NIXL_EP_V2
+
     def is_flashinfer(self):
         return self == MoeA2ABackend.FLASHINFER
 
@@ -89,6 +93,10 @@ class MoeA2ABackend(Enum):
 
     def is_deepep_v2(self):
         return self == MoeA2ABackend.DEEPEP_V2
+
+    def is_elastic_buffer(self):
+        """Backends using the DeepEP v2 dispatch/combine tensor layout."""
+        return self.is_deepep_v2() or self.is_nixl_ep_v2()
 
     def is_pplx(self):
         return self == MoeA2ABackend.PPLX
@@ -658,7 +666,7 @@ def is_deepep_class_backend() -> bool:
     b = get_moe_a2a_backend()
     return (
         b.is_deepep()
-        or b.is_deepep_v2()
+        or b.is_elastic_buffer()
         or b.is_mooncake()
         or b.is_mori()
         or b.is_pplx()

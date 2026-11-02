@@ -105,7 +105,14 @@ def _ensure_deepep_v2_available() -> None:
 
 
 def _ensure_fp8_quant_available() -> None:
-    _ensure_deepep_v2_available()
+    global sglang_per_token_group_quant_fp8, _fp8_quant_import_error
+    if sglang_per_token_group_quant_fp8 is None:
+        try:
+            from sglang.kernels.ops.quantization.fp8_kernel import (
+                sglang_per_token_group_quant_fp8,
+            )
+        except (ImportError, OSError) as exc:
+            _fp8_quant_import_error = exc
     if sglang_per_token_group_quant_fp8 is None:
         detail = (
             f" Original import error: {_fp8_quant_import_error}"
@@ -253,6 +260,15 @@ class _DeepEPv2Impl:
             prefill_expand = not scale_format.ue8m0
         self._prefill_expand_enabled = prefill_expand
 
+    def _ensure_available(self) -> None:
+        _ensure_deepep_v2_available()
+
+    def _topk_indices_dtype(self) -> torch.dtype:
+        return torch.int64
+
+    def _dispatch_buffer(self, buffer, dispatch_x, **kwargs):
+        return buffer.dispatch(dispatch_x, num_experts=self.num_experts, **kwargs)
+
     def _destroy_handle(self) -> None:
         self._handle = None
 
@@ -308,9 +324,9 @@ class _DeepEPv2Impl:
                 "DeepEP v2 dispatch called while the previous dispatch handle is "
                 "still unconsumed (missing combine)"
             )
-        _ensure_deepep_v2_available()
+        self._ensure_available()
         topk_weights = topk_output.topk_weights
-        topk_ids = topk_output.topk_ids.to(torch.int64)
+        topk_ids = topk_output.topk_ids.to(self._topk_indices_dtype())
         self._validate_common(hidden_states, topk_ids)
         is_decode = not get_is_extend_in_batch()
         use_masked = is_decode
@@ -354,11 +370,11 @@ class _DeepEPv2Impl:
             do_cpu_sync_val = False
 
         buffer = self._get_buffer()
-        recv_x, recv_topk_idx, recv_topk_weights, handle, event = buffer.dispatch(
+        recv_x, recv_topk_idx, recv_topk_weights, handle, event = self._dispatch_buffer(
+            buffer,
             dispatch_x,
             topk_idx=topk_ids,
             topk_weights=topk_weights,
-            num_experts=self.num_experts,
             num_max_tokens_per_rank=num_max_tokens,
             expert_alignment=_EXPERT_ALIGNMENT,
             num_sms=envs.SGLANG_DEEPEP_V2_NUM_SMS.get(),
@@ -459,6 +475,8 @@ class _DeepEPv2Impl:
 
 
 class DeepEPv2Dispatcher(BaseDispatcher):
+    _IMPL_CLASS = _DeepEPv2Impl
+
     def __init__(
         self,
         group: dist.ProcessGroup,
@@ -481,7 +499,7 @@ class DeepEPv2Dispatcher(BaseDispatcher):
             envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
         )
         self.use_fp8_dispatch = use_fp8_dispatch
-        self._impl = _DeepEPv2Impl(
+        self._impl = self._IMPL_CLASS(
             group=group,
             router_topk=router_topk,
             num_experts=num_experts,

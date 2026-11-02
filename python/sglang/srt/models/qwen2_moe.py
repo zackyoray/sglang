@@ -147,7 +147,7 @@ def can_fuse_shared_expert(
         or getattr(config, "shared_expert_intermediate_size", 0) <= 0
         or config.shared_expert_intermediate_size != config.moe_intermediate_size
         or get_moe_a2a_backend().is_deepep()
-        or get_moe_a2a_backend().is_deepep_v2()
+        or get_moe_a2a_backend().is_elastic_buffer()
         or get_moe_a2a_backend().is_mori()
     ):
         return False
@@ -371,7 +371,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     if (
                         get_moe_a2a_backend().is_deepep()
                         or get_moe_a2a_backend().is_mori()
-                        or get_moe_a2a_backend().is_deepep_v2()
+                        or get_moe_a2a_backend().is_elastic_buffer()
                         or get_moe_a2a_backend().is_flashinfer()
                         or get_moe_a2a_backend().is_flashinfer_megamoe()
                         or get_moe_a2a_backend().is_megamoe()
@@ -395,7 +395,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
         if (
             get_moe_a2a_backend().is_deepep()
-            or get_moe_a2a_backend().is_deepep_v2()
+            or get_moe_a2a_backend().is_elastic_buffer()
             or get_moe_a2a_backend().is_mori()
             or get_moe_a2a_backend().is_ascend_fuseep()
         ):
@@ -812,7 +812,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
         if (
             get_moe_a2a_backend().is_deepep()
-            or get_moe_a2a_backend().is_deepep_v2()
+            or get_moe_a2a_backend().is_elastic_buffer()
             or get_moe_a2a_backend().is_mori()
             or get_moe_a2a_backend().is_ascend_fuseep()
         ):

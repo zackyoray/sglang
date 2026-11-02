@@ -87,7 +87,7 @@ def prebuild_deepep_v2_buffer(*, model) -> None:
     from sglang.srt.layers.moe.token_dispatcher.deepep_v2 import DeepEPv2Dispatcher
     from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
-    if not get_moe_a2a_backend().is_deepep_v2():
+    if not get_moe_a2a_backend().is_elastic_buffer():
         return
 
     for module in model.modules():
