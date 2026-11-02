@@ -269,6 +269,9 @@ class _DeepEPv2Impl:
     def _dispatch_buffer(self, buffer, dispatch_x, **kwargs):
         return buffer.dispatch(dispatch_x, num_experts=self.num_experts, **kwargs)
 
+    def _get_dispatch_ep_size(self):
+        return max(1, self.num_experts // self.num_local_experts)
+
     def _destroy_handle(self) -> None:
         self._handle = None
 
@@ -420,7 +423,7 @@ class _DeepEPv2Impl:
         if use_masked:
             recv_capacity = recv_hidden_states.shape[0]
             # expected_m is only a schedule hint; masked_m is the actual bound.
-            ep_group_size = max(1, self.num_experts // self.num_local_experts)
+            ep_group_size = self._get_dispatch_ep_size()
             expected_m = max(
                 1,
                 (local_tokens * ep_group_size * self.router_topk + self.num_experts)

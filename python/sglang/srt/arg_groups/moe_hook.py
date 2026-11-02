@@ -398,9 +398,17 @@ def handle_a2a_moe(server_args: Any):
 
     if a2a_backend in ("deepep_v2", "nixl_ep_v2"):
         if a2a_backend == "nixl_ep_v2" and cfg.elastic_ep_backend is not None:
-            raise ValueError(
-                "nixl_ep_v2 does not yet support SGLang elastic EP membership changes."
-            )
+            domain_size = envs.SGLANG_NIXL_EP_V2_MAX_SCALEUP_RANKS.get()
+            if (
+                not domain_size
+                or domain_size < 1
+                or not cfg.max_ep_size
+                or cfg.max_ep_size % domain_size
+            ):
+                raise ValueError(
+                    "Set SGLANG_NIXL_EP_V2_MAX_SCALEUP_RANKS to the maximum "
+                    "ranks per NVLink domain, dividing --max-ep-size."
+                )
         validate_deepep_v2_model_architecture(server_args)
         # ElasticBuffer requires CUMEM, but not NVLS or its preallocation.
         os.environ.setdefault("NCCL_CUMEM_ENABLE", "1")

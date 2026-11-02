@@ -18,6 +18,8 @@ class _DeepEPv2ModelPolicy(msgspec.Struct, frozen=True):
 
 
 _DEEPEP_V2_MODELS: dict[str, _DeepEPv2ModelPolicy] = {
+    # V3 inherits the V2 model and its EP combine/reduction implementation.
+    "DeepseekV2ForCausalLM": _DeepEPv2ModelPolicy(),
     "DeepseekV3ForCausalLM": _DeepEPv2ModelPolicy(),
     "DeepseekV4ForCausalLM": _DeepEPv2ModelPolicy(),
     "Qwen3MoeForCausalLM": _DeepEPv2ModelPolicy(),

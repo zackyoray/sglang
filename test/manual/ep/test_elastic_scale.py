@@ -134,7 +134,7 @@ def _scale_up_common_args(
     args = [
         "--trust-remote-code",
         "--moe-a2a-backend",
-        "nixl",
+        os.environ.get("SGLANG_ELASTIC_MOE_A2A_BACKEND", "nixl"),
         "--deepep-mode",
         "low_latency",
         "--tp",

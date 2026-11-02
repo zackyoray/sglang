@@ -48,7 +48,21 @@ class TestNixlEPV2(unittest.TestCase):
             _SCALE_BLOCK_SIZE=128,
             _EXPERT_ALIGNMENT=128,
             torch=types.SimpleNamespace(dtype=dtype, int64=self.int64),
-            dist=types.SimpleNamespace(get_world_size=lambda group: 2),
+            dist=types.SimpleNamespace(
+                get_world_size=lambda group: 2, get_rank=lambda group: 0
+            ),
+            logger=Mock(),
+            get_exec=lambda: types.SimpleNamespace(
+                moe=types.SimpleNamespace(elastic_ep_backend=None)
+            ),
+            get_parallel=lambda: types.SimpleNamespace(max_ep_size=8),
+            get_global_tcp_store=Mock(return_value=object()),
+            ElasticEPStateManager=types.SimpleNamespace(
+                get_ep_join_rank_offset=lambda: 0
+            ),
+            envs=types.SimpleNamespace(
+                SGLANG_NIXL_EP_V2_MAX_SCALEUP_RANKS=types.SimpleNamespace(get=lambda: 8)
+            ),
             get_resources=lambda: resources,
             _ensure_deepep_v2_available=Mock(),
             BaseDispatcher=object,
@@ -205,6 +219,56 @@ class TestNixlEPV2(unittest.TestCase):
         self.assertIsNone(impl._handle)
         with self.assertRaisesRegex(RuntimeError, "without a valid dispatch handle"):
             impl.combine(None)
+
+    def test_scale_connects_only_new_peers_and_commits_world(self):
+        state = self.facade._state()
+        state.buffer = self.buffer
+        state.peer_prefix = "test-peers"
+        state.dispatch_ep_size = 4
+        self.buffer.rank_id = 0
+        self.buffer.get_connected_ranks.return_value = [1, 2, 3]
+        self.buffer.get_topology.return_value = ("direct", 8)
+        self.facade.on_scale(4, 8)
+        self.buffer.connect_ranks.assert_called_once_with(
+            [4, 5, 6, 7],
+            store=self.ns["get_global_tcp_store"](),
+            key_prefix="test-peers",
+        )
+        self.buffer.set_active_ranks.assert_called_once_with(list(range(8)))
+        self.assertEqual(state.dispatch_ep_size, 8)
+
+    def test_elastic_constructor_reserves_maximum_world(self):
+        self.ns["get_exec"] = lambda: types.SimpleNamespace(
+            moe=types.SimpleNamespace(elastic_ep_backend="mooncake")
+        )
+        self.buffer.rank_id = 0
+        self.buffer.get_connected_ranks.return_value = [1]
+        self.buffer.get_topology.return_value = ("direct", 8)
+        self.get_buffer()
+        kwargs = self.transport.call_args.kwargs
+        self.assertEqual(kwargs["max_num_scaleup_ranks"], 8)
+        self.assertEqual(kwargs["max_num_scaleout_ranks"], 1)
+        self.assertEqual(kwargs["scaleup_rank_idx"], 0)
+        self.assertEqual(kwargs["bootstrap_id"], "sglang/nixl_ep_v2/cohort/0/2")
+        self.buffer.publish.assert_called_once()
+        self.buffer.set_active_ranks.assert_called_once_with([0, 1])
+
+    def test_joiner_uses_global_rank_and_connects_existing_world(self):
+        self.ns["get_exec"] = lambda: types.SimpleNamespace(
+            moe=types.SimpleNamespace(elastic_ep_backend="mooncake")
+        )
+        self.ns["ElasticEPStateManager"].get_ep_join_rank_offset = lambda: 4
+        self.buffer.rank_id = 4
+        self.buffer.get_connected_ranks.return_value = [5]
+        self.buffer.get_topology.return_value = ("direct", 8)
+        self.get_buffer()
+        self.assertEqual(self.transport.call_args.kwargs["scaleup_rank_idx"], 4)
+        self.buffer.connect_ranks.assert_called_once_with(
+            [0, 1, 2, 3],
+            store=self.ns["get_global_tcp_store"](),
+            key_prefix="sglang/nixl_ep_v2/peers",
+        )
+        self.buffer.set_active_ranks.assert_called_once_with(list(range(6)))
 
     def test_combine_failure_releases_handle(self):
         impl = object.__new__(self.ns["_NixlEPV2Impl"])

@@ -2524,7 +2524,7 @@ def init_distributed_environment(
         )
 
         # Create a global TCPStore for coordination (used by NIXL)
-        if moe_a2a_backend == "nixl":
+        if moe_a2a_backend in ("nixl", "nixl_ep_v2"):
             _create_global_tcp_store(
                 rank,
                 world_size,
