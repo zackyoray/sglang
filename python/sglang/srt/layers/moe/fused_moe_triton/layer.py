@@ -211,11 +211,16 @@ def create_moe_dispatcher(
             async_finish=True,
             return_recv_hook=True,
         )
-    elif a2a_backend.is_deepep_v2():
+    elif a2a_backend.is_elastic_buffer():
         output_dtype = get_deepep_v2_dispatcher_output_dtype(
             _deepep_v2_experts_are_fp8(quant_method)
         )
-        return DeepEPv2Dispatcher(
+        from sglang.srt.layers.moe.token_dispatcher.nixl_v2 import NixlEPV2Dispatcher
+
+        dispatcher_cls = (
+            NixlEPV2Dispatcher if a2a_backend.is_nixl_ep_v2() else DeepEPv2Dispatcher
+        )
+        return dispatcher_cls(
             group=get_parallel().tp_group.device_group,
             router_topk=moe_runner_config.top_k,
             num_experts=moe_runner_config.num_experts,
@@ -274,7 +279,7 @@ def _deepep_v2_experts_are_fp8(quant_method) -> bool:
 
 def _validate_deepep_v2_quant_method(quant_method) -> None:
     """Validate the expert formats the DeepEP v2 adapter can feed."""
-    if not get_moe_a2a_backend().is_deepep_v2():
+    if not get_moe_a2a_backend().is_elastic_buffer():
         return
 
     if isinstance(quant_method, UnquantizedFusedMoEMethod):
@@ -527,7 +532,7 @@ class FusedMoE(torch.nn.Module):
         _validate_hpc_ops_quant_method(self.quant_method)
         _validate_deepep_v2_quant_method(self.quant_method)
         if (
-            get_moe_a2a_backend().is_deepep_v2()
+            get_moe_a2a_backend().is_elastic_buffer()
             and isinstance(self.quant_method, Fp8MoEMethod)
             and self.quant_method.use_mxfp8
         ):

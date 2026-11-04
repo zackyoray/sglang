@@ -1208,6 +1208,9 @@ class ModelRunner:
         self.graph_memory_usage = capture.memory_usage
         self.graph_time_usage = capture.time_usage
 
+        # ElasticBuffer joiners must publish/connect before the ready barrier:
+        # primaries may already be waiting for their transport metadata.
+        prebuild_deepep_v2_buffer(model=self.model)
         if is_scale_joiner:
             if self._elastic_cuda_graph_enabled():
                 if defer_decode_capture:
@@ -1216,8 +1219,6 @@ class ModelRunner:
             # Scheduler startup calls this path even when CUDA graphs are disabled.
             target_size = get_parallel().ep_join_rank_offset + get_parallel().tp_size
             self._finalize_elastic_ep_joiner(target_size)
-
-        prebuild_deepep_v2_buffer(model=self.model)
 
     def init_routed_experts_capturer(self):
         if self.is_draft_worker:

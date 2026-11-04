@@ -881,7 +881,7 @@ class DeepseekV2MoE(nn.Module):
                 or get_moe_a2a_backend().is_flashinfer()
                 or get_moe_a2a_backend().is_megamoe()
                 or get_moe_a2a_backend().is_flashinfer_megamoe()
-                or get_moe_a2a_backend().is_deepep_v2()
+                or get_moe_a2a_backend().is_elastic_buffer()
                 or should_use_flashinfer_cutlass_moe_fp4_allgather()
                 or envs.SGLANG_SHARED_EXPERT_TP1.get()
             )
@@ -978,7 +978,7 @@ class DeepseekV2MoE(nn.Module):
             or get_moe_a2a_backend().is_nixl()
             or get_moe_a2a_backend().is_mori()
             or get_moe_a2a_backend().is_ascend_fuseep()
-            or get_moe_a2a_backend().is_deepep_v2()
+            or get_moe_a2a_backend().is_elastic_buffer()
         ):
             # TODO: we will support tp < ep in the future
             self.ep_size = get_parallel().moe_ep_size
@@ -1001,7 +1001,7 @@ class DeepseekV2MoE(nn.Module):
             or get_moe_a2a_backend().is_mori()
             or get_moe_a2a_backend().is_ascend_fuseep()
             or get_moe_a2a_backend().is_flashinfer()
-            or get_moe_a2a_backend().is_deepep_v2()
+            or get_moe_a2a_backend().is_elastic_buffer()
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
         # SGLANG_OPT_MOE_QUANT_ONCE eligibility, resolved lazily on first
@@ -3028,7 +3028,7 @@ class DeepseekV2Model(nn.Module):
                     # so unrelated backends' allocator sizing is unchanged.
                     is_a2a_moe = (
                         is_deepep_class_backend()
-                        or get_moe_a2a_backend().is_deepep_v2()
+                        or get_moe_a2a_backend().is_elastic_buffer()
                     )
                     tp_size = 1 if is_a2a_moe else get_parallel().tp_size
                     intermediate_size = (
@@ -3052,7 +3052,7 @@ class DeepseekV2Model(nn.Module):
         self.enable_a2a_moe = (
             get_moe_a2a_backend().is_deepep()
             or get_moe_a2a_backend().is_mooncake()
-            or get_moe_a2a_backend().is_deepep_v2()
+            or get_moe_a2a_backend().is_elastic_buffer()
         )
 
         # llama_4_scaling: for supporting Mistral-Large-3 model

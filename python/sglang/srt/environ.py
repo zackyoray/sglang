@@ -1439,6 +1439,8 @@ class Envs:
     SGLANG_DISABLE_STATIC_WATERFILL = EnvBool(False)
     SGLANG_NIXL_EP_BF16_DISPATCH = EnvBool(False)
     SGLANG_NIXL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
+    # Maximum rank positions per NVLink domain in the NIXL EP v2 elastic world.
+    SGLANG_NIXL_EP_V2_MAX_SCALEUP_RANKS = EnvInt(None)
     SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_ENABLE_MOE_DEFERRED_FINALIZE = EnvBool(True)
     # The [M*top_k, hidden] HBM round trip pays only at small M; 0 disables.

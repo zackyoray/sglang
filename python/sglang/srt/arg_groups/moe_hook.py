@@ -396,7 +396,25 @@ def handle_a2a_moe(server_args: Any):
                 ),
             )
 
-    if a2a_backend == "deepep_v2":
+    if a2a_backend in ("deepep_v2", "nixl_ep_v2"):
+        if a2a_backend == "nixl_ep_v2" and cfg.ep_join_mode == "recover":
+            raise ValueError(
+                "--moe-a2a-backend nixl_ep_v2 does not support "
+                "--elastic-ep-join-mode recover. Only initial startup and "
+                "elastic scale-up are supported by this integration."
+            )
+        if a2a_backend == "nixl_ep_v2" and cfg.elastic_ep_backend is not None:
+            domain_size = envs.SGLANG_NIXL_EP_V2_MAX_SCALEUP_RANKS.get()
+            if (
+                not domain_size
+                or domain_size < 1
+                or not cfg.max_ep_size
+                or cfg.max_ep_size % domain_size
+            ):
+                raise ValueError(
+                    "Set SGLANG_NIXL_EP_V2_MAX_SCALEUP_RANKS to the maximum "
+                    "ranks per NVLink domain, dividing --max-ep-size."
+                )
         validate_deepep_v2_model_architecture(server_args)
         # ElasticBuffer requires CUMEM, but not NVLS or its preallocation.
         os.environ.setdefault("NCCL_CUMEM_ENABLE", "1")
@@ -407,28 +425,32 @@ def handle_a2a_moe(server_args: Any):
                 server_args, "_handle_a2a_moe", moe_runner_backend="deep_gemm"
             )
             logger.warning(
-                "DeepEP v2 MoE: resolved --moe-runner-backend auto -> deep_gemm."
+                "DeepEP v2 / NIXL EP v2 MoE: resolved --moe-runner-backend auto -> deep_gemm."
             )
         elif resolved_runner != "deep_gemm":
             raise ValueError(
-                "DeepEP v2 MoE currently supports only "
+                "DeepEP v2 / NIXL EP v2 MoE currently supports only "
                 f"--moe-runner-backend deep_gemm. Got {resolved_runner!r}. "
                 "Add a runner adapter before enabling DeepEP v2 with other "
                 "MoE runners."
             )
         if cfg.enable_two_batch_overlap or cfg.enable_single_batch_overlap:
             raise ValueError(
-                "DeepEP v2 MoE has not implemented the TBO/SBO overlap hooks yet. "
+                "DeepEP v2 / NIXL EP v2 MoE has not implemented the TBO/SBO overlap hooks yet. "
                 "Disable --enable-two-batch-overlap and "
-                "--enable-single-batch-overlap when using --moe-a2a-backend deepep_v2."
+                f"--enable-single-batch-overlap when using --moe-a2a-backend {a2a_backend}."
             )
         if cfg.enforce_shared_experts_fusion:
             raise ValueError(
-                "DeepEP v2 MoE has not validated fused shared experts yet. "
+                "DeepEP v2 / NIXL EP v2 MoE has not validated fused shared experts yet. "
                 "Remove --enforce-shared-experts-fusion when using "
-                "--moe-a2a-backend deepep_v2."
+                f"--moe-a2a-backend {a2a_backend}."
             )
-        if cfg.deepep_v2_mode == "direct" and cfg.nnodes > 1:
+        if (
+            a2a_backend == "deepep_v2"
+            and cfg.deepep_v2_mode == "direct"
+            and cfg.nnodes > 1
+        ):
             raise ValueError(
                 "--deepep-v2-mode direct is NVLink-only and cannot run across "
                 f"nodes (nnodes={cfg.nnodes}); pass --deepep-v2-mode hybrid."
@@ -442,18 +464,13 @@ def handle_a2a_moe(server_args: Any):
             ),
         )
         logger.warning(
-            f"DeepEP v2 MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{cfg.tp_size}]."
+            f"DeepEP v2 / NIXL EP v2 MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{cfg.tp_size}]."
         )
         logger.warning(
-            "DeepEP v2 MoE is using deepep_v2_mode=%s. This controls "
-            "ElasticBuffer direct/hybrid mode and is independent from "
-            "--deepep-mode normal/low_latency. DeepEP v2 MoE enables the "
-            "decode CUDA graph on the masked decode path (any comm mode) "
-            "and disables shared expert fusion. "
-            "SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK is a "
-            "per-rank communication buffer capacity, not a model limit; "
-            "increase it for large prefill/chunked-prefill workloads.",
-            cfg.deepep_v2_mode,
+            "%s uses the ElasticBuffer compute path. NIXL EP v2 chooses "
+            "direct/hybrid mode automatically; --deepep-v2-mode applies only "
+            "to DeepEP v2. Shared dispatch tuning uses SGLANG_DEEPEP_V2_*.",
+            a2a_backend,
         )
 
     # The resolving view, not the field: `_a2a_backend_overrides` may have
@@ -630,9 +647,9 @@ def validate_deepep_v2_speculative_draft(server_args: Any) -> None:
         algorithm = SpeculativeAlgorithm.from_string(view.speculative_algorithm)
         if not algorithm.is_ngram():
             draft_backend = view.moe_a2a_backend
-    if draft_backend == "deepep_v2":
+    if draft_backend in ("deepep_v2", "nixl_ep_v2"):
         raise ValueError(
-            "DeepEP v2 MoE is not validated as a speculative draft backend. "
+            "DeepEP v2 / NIXL EP v2 MoE is not validated as a speculative draft backend. "
             "Select another --speculative-moe-a2a-backend."
         )
 
@@ -678,7 +695,7 @@ def _decode_graph_dispatch_tokens_per_rank(server_args: Any) -> tuple[int, int]:
 def validate_deepep_v2_dispatch_token_budget(server_args: Any) -> None:
     """Check the configured prefill and decode-graph buffer bounds."""
     view = resolved_view(server_args)
-    if view.moe_a2a_backend != "deepep_v2":
+    if view.moe_a2a_backend not in ("deepep_v2", "nixl_ep_v2"):
         return
 
     capacity = envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
@@ -686,7 +703,7 @@ def validate_deepep_v2_dispatch_token_budget(server_args: Any) -> None:
         prefill_tokens = required_deepep_v2_prefill_tokens_per_rank(server_args)
         if prefill_tokens > capacity:
             raise ValueError(
-                "DeepEP v2 per-rank prefill budget exceeds "
+                "ElasticBuffer per-rank prefill budget exceeds "
                 "SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK: "
                 f"required={prefill_tokens}, capacity={capacity}. Raise the "
                 "environment value or lower --chunked-prefill-size/"
@@ -697,7 +714,7 @@ def validate_deepep_v2_dispatch_token_budget(server_args: Any) -> None:
     graph_tokens = graph_bs * tokens_per_req
     if graph_tokens > capacity:
         raise ValueError(
-            "DeepEP v2 per-rank decode CUDA graph exceeds "
+            "ElasticBuffer per-rank decode CUDA graph exceeds "
             "SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK: "
             f"required={graph_tokens}, capacity={capacity} "
             f"(requests={graph_bs}, tokens/request={tokens_per_req}). Raise "
@@ -713,7 +730,7 @@ def validate_deepep_v2_model_architecture(server_args: Any) -> None:
         == ConnectorType.INSTANCE
     ):
         raise ValueError(
-            "DeepEP v2 MoE cannot validate a model loaded through an instance "
+            "DeepEP v2 / NIXL EP v2 MoE cannot validate a model loaded through an instance "
             "connector. Load it from a model path or use "
             "--moe-a2a-backend deepep."
         )
@@ -723,7 +740,7 @@ def validate_deepep_v2_model_architecture(server_args: Any) -> None:
         architectures = getattr(hf_config, "architectures", None) or []
         architecture = architectures[0] if architectures else None
         raise ValueError(
-            f"DeepEP v2 MoE is not validated for {architecture!r}. The model "
+            f"DeepEP v2 / NIXL EP v2 MoE is not validated for {architecture!r}. The model "
             "package must register its architecture with "
             "register_deepep_v2_model, because its combine and post-expert "
             "reduction semantics must be validated first."

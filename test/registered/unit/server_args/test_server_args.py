@@ -3319,6 +3319,57 @@ class TestDeepEPv2Args(CustomTestCase):
             setattr(server_args, key, value)
         return server_args
 
+    def test_nixl_v2_resolves_shared_compute_path(self):
+        from sglang.srt.arg_groups.overrides import resolved_view
+
+        args = self._args(moe_a2a_backend="nixl_ep_v2", tp_size=8)
+        args._model_config.hf_config.architectures = ["DeepseekV2ForCausalLM"]
+        handle_a2a_moe(args)
+        self.assertEqual(resolved_view(args).moe_runner_backend, "deep_gemm")
+        self.assertEqual(resolved_view(args).ep_size, 8)
+        self.assertTrue(resolved_view(args).disable_shared_experts_fusion)
+
+    def test_nixl_v2_chooses_transport_mode_automatically(self):
+        handle_a2a_moe(self._args(moe_a2a_backend="nixl_ep_v2", nnodes=2))
+
+    def test_nixl_v2_recovery_rejected_before_topology_validation(self):
+        for domain_size in (None, 8):
+            with self.subTest(domain_size=domain_size):
+                args = self._args(
+                    moe_a2a_backend="nixl_ep_v2",
+                    elastic_ep_backend="mooncake",
+                    ep_join_mode="recover",
+                    max_ep_size=8,
+                )
+                with envs.SGLANG_NIXL_EP_V2_MAX_SCALEUP_RANKS.override(domain_size):
+                    with self.assertRaisesRegex(
+                        ValueError, "nixl_ep_v2 does not support .*recover"
+                    ):
+                        handle_a2a_moe(args)
+
+    def test_nixl_v2_elastic_scale_join_remains_supported(self):
+        args = self._args(
+            moe_a2a_backend="nixl_ep_v2",
+            elastic_ep_backend="mooncake",
+            ep_join_mode="scale",
+            max_ep_size=8,
+        )
+        with envs.SGLANG_NIXL_EP_V2_MAX_SCALEUP_RANKS.override(8):
+            handle_a2a_moe(args)
+
+    def test_nixl_v2_elastic_requires_maximum_domain_layout(self):
+        args = self._args(
+            moe_a2a_backend="nixl_ep_v2", elastic_ep_backend="mooncake", max_ep_size=8
+        )
+        with envs.SGLANG_NIXL_EP_V2_MAX_SCALEUP_RANKS.override(None):
+            with self.assertRaisesRegex(ValueError, "MAX_SCALEUP_RANKS"):
+                handle_a2a_moe(args)
+        with envs.SGLANG_NIXL_EP_V2_MAX_SCALEUP_RANKS.override(3):
+            with self.assertRaisesRegex(ValueError, "MAX_SCALEUP_RANKS"):
+                handle_a2a_moe(args)
+        with envs.SGLANG_NIXL_EP_V2_MAX_SCALEUP_RANKS.override(8):
+            handle_a2a_moe(args)
+
     def test_validated_architectures_allowed(self):
         for architecture in (
             "DeepseekV3ForCausalLM",

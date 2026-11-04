@@ -160,6 +160,10 @@ class ElasticEPStateManager:
 
             if get_exec().moe.moe_a2a_backend == "nixl":
                 cls._on_scale = cls._on_scale_nixl
+            elif get_exec().moe.moe_a2a_backend == "nixl_ep_v2":
+                from sglang.srt.layers.moe.token_dispatcher.nixl_v2 import NixlEPV2Buffer
+
+                cls._on_scale = NixlEPV2Buffer.on_scale
 
             inst.ep_join_rank_offset = get_parallel().ep_join_rank_offset
             if get_exec().moe.is_ep_joiner:
