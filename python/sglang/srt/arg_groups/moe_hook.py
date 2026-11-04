@@ -397,6 +397,12 @@ def handle_a2a_moe(server_args: Any):
             )
 
     if a2a_backend in ("deepep_v2", "nixl_ep_v2"):
+        if a2a_backend == "nixl_ep_v2" and cfg.ep_join_mode == "recover":
+            raise ValueError(
+                "--moe-a2a-backend nixl_ep_v2 does not support "
+                "--elastic-ep-join-mode recover. Only initial startup and "
+                "elastic scale-up are supported by this integration."
+            )
         if a2a_backend == "nixl_ep_v2" and cfg.elastic_ep_backend is not None:
             domain_size = envs.SGLANG_NIXL_EP_V2_MAX_SCALEUP_RANKS.get()
             if (

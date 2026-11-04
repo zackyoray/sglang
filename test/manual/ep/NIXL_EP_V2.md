@@ -40,6 +40,12 @@ single-node 4-to-8 GPU test, set both to 8. Joining ranks publish transport
 metadata through SGLang's global TCPStore before the join-ready barrier.
 Scale-up connects the new peers and commits the expanded active world.
 
+Fault recovery is unsupported by this integration. Combining `nixl_ep_v2`
+with `--elastic-ep-join-mode recover` is rejected during argument validation,
+before transport initialization. Bootstrap requires the constructor cohort to
+participate together; restarting one rank cannot rejoin surviving buffers.
+Successful scale-up does not establish fault tolerance.
+
 Run the basic serving test and then the existing elastic scale test with v2:
 
 ```bash
@@ -86,5 +92,5 @@ Use the appropriate NIC for your cluster. The environment also set
 `SGLANG_DEEPEP_BF16_DISPATCH=1` for this BF16 checkpoint.
 
 Separate eight-rank transport checks passed for eager dispatch/combine,
-an empty-token rank, and CUDA graph replay. Multi-node operation, fault
-recovery, scale-down, and asynchronous scaling remain unvalidated.
+an empty-token rank, and CUDA graph replay. Multi-node serving, scale-down,
+and asynchronous scaling remain unvalidated. Fault recovery is unsupported.
