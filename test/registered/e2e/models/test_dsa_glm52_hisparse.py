@@ -9,10 +9,11 @@ from sglang.test.kl_test_utils import get_input_ids
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
     assert_process_healthy,
+    configure_nixl_pd_backend,
 )
 
 register_cuda_ci(
-    est_time=700,
+    est_time=1400,
     stage="nightly",
     runner_config="8-gpu-b200",
 )
@@ -88,9 +89,21 @@ class TestGLM52PDHiSparseSpec(PDDisaggregationServerBase, GSM8KMixin):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
+        cls.configure_transfer_backend()
         cls.launch_all()
 
+    @classmethod
+    def configure_transfer_backend(cls):
+        pass
+
     def test_gsm8k(self):
+        for url in (self.prefill_url, self.decode_url):
+            response = requests.get(url + "/server_info", timeout=30)
+            response.raise_for_status()
+            self.assertEqual(
+                response.json()["disaggregation_transfer_backend"],
+                self.transfer_backend[-1],
+            )
         GSM8KMixin.test_gsm8k(self)
         # The PD router does not expose the decode server's speculative metrics.
         response = requests.get(self.decode_url + "/server_info", timeout=30)
@@ -181,6 +194,12 @@ class TestGLM52PDHiSparseSpec(PDDisaggregationServerBase, GSM8KMixin):
                 self.assertGreater(meta["spec_verify_ct"], 0)
                 # ignore_eos can append more text immediately after the answer.
                 self.assertRegex(result["text"], rf"^\s*{answer}(?!\d)")
+
+
+class TestGLM52PDHiSparseSpecNixl(TestGLM52PDHiSparseSpec):
+    @classmethod
+    def configure_transfer_backend(cls):
+        configure_nixl_pd_backend(cls)
 
 
 if __name__ == "__main__":

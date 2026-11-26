@@ -197,6 +197,7 @@ class TestNixlAbortNotification(
                 is_dummy=False,
                 agent_name=agent_name,
                 dst_kv_indices=np.array([1], dtype=np.int32),
+                dst_device_kv_indices=None,
             )
         manager.conclude_failure = MagicMock(
             side_effect=lambda **kw: manager.update_status(

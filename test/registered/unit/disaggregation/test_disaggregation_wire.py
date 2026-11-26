@@ -42,7 +42,13 @@ from sglang.srt.disaggregation.mooncake.conn import (
     TransferInfo,
 )
 from sglang.srt.disaggregation.mooncake.transport import MooncakeTransport
-from sglang.srt.disaggregation.nixl.conn import NixlKVManager
+from sglang.srt.disaggregation.nixl.conn import (
+    NixlKVManager,
+)
+from sglang.srt.disaggregation.nixl.conn import TransferInfo as NixlTransferInfo
+from sglang.srt.disaggregation.nixl.conn import (
+    _kv_xfer_mem_segments,
+)
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
@@ -2330,6 +2336,12 @@ class _MemcpyNixlAgent:
     def get_xfer_descs(self, reqs, mem_type):
         return reqs
 
+    def prep_xfer_dlist(self, peer_name, descs, mem_type):
+        return descs
+
+    def make_prepped_xfer(self, op, src_handle, src_indices, dst_handle, dst_indices):
+        return src_handle[src_indices], dst_handle[dst_indices]
+
     def initialize_xfer(self, op, src_descs, dst_descs, peer_name, notif=b""):
         return src_descs, dst_descs
 
@@ -2828,7 +2840,141 @@ class TestStagingScatterLifecycle(CustomTestCase):
         self.assertFalse(handler._pending_scatters)
 
 
-class TestMooncakeHiSparseSpecIndices(CustomTestCase):
+class TestHiSparseSpecIndices(CustomTestCase):
+    def test_dual_page_maps_write_only_the_intended_slots(self):
+        # Both maps are valid in every destination pool, so descriptor bounds
+        # checks alone cannot detect using the host map for draft KV.
+        for backend in (MooncakeKVManager, NixlKVManager):
+            for with_device_map in (False, True):
+                with self.subTest(backend=backend.__name__, dual_map=with_device_map):
+                    memory = np.full(4096, 0xCD, dtype=np.uint8)
+                    expected = memory.copy()
+                    src_ptrs, dst_ptrs = [0, 256, 512], [1024, 1536, 2048]
+                    src_pages = np.array([1, 3, 4], dtype=np.int32)
+                    host_pages = np.array([40, 41, 9], dtype=np.int32)
+                    device_pages = np.array([7, 8, 2], dtype=np.int32)
+                    dst_strides, slots = [4, 4, 4], 48
+                    for entry, src in enumerate(src_ptrs):
+                        for page in src_pages:
+                            memory[src + page * 4 : src + page * 4 + 4] = (
+                                entry * 32 + page
+                            )
+                    expected[:] = memory
+                    for entry, (src, dst, stride) in enumerate(
+                        zip(src_ptrs, dst_ptrs, dst_strides)
+                    ):
+                        pages = (
+                            device_pages
+                            if with_device_map and entry == 2
+                            else host_pages
+                        )
+                        for src_page, dst_page in zip(src_pages, pages):
+                            expected[
+                                dst + dst_page * stride : dst + dst_page * stride + 4
+                            ] = memory[src + src_page * 4 : src + src_page * 4 + 4]
+                    manager = object.__new__(backend)
+                    manager.kv_args = SimpleNamespace(
+                        gpu_id=0,
+                        kv_data_ptrs=src_ptrs,
+                        kv_item_lens=[4] * 3,
+                        kv_data_lens=[slots * 4] * 3,
+                        kv_data_mem_kinds=["VRAM"] * 3,
+                        kv_layer_ids=[],
+                        num_draft_entries=1,
+                        mla_compression_ratios=None,
+                        prefill_start_layer=0,
+                        prefill_end_layer=2,
+                    )
+                    manager.pp_size = 1
+                    manager.is_mla_backend = True
+                    manager.is_hybrid_mla_backend = False
+                    manager.enable_custom_mem_pool = False
+                    manager.max_transfer_batch_indices = 0
+                    device_map = device_pages if with_device_map else None
+                    if backend is MooncakeKVManager:
+
+                        def copy_blocks(session_id, blocks):
+                            for src, dst, size in blocks:
+                                memory[dst : dst + size] = memory[src : src + size]
+                            return 0
+
+                        attach_mooncake_transport(
+                            manager,
+                            engine_writes(copy_blocks),
+                            kv=src_ptrs,
+                            peer_kv=dst_ptrs,
+                        )
+                        with patch(
+                            "sglang.srt.disaggregation.mooncake.conn.get_memory",
+                            return_value=SimpleNamespace(enable_unified_memory=False),
+                        ):
+                            manager.send_kvcache(
+                                "session",
+                                src_pages,
+                                dst_ptrs,
+                                host_pages,
+                                None,
+                                dst_device_kv_indices=device_map,
+                            )
+                    else:
+                        manager.agent = _MemcpyNixlAgent(memory)
+                        manager._use_strided_descs = False
+                        manager._num_slots_src = slots
+                        manager.prep_handles_segment_src = {}
+                        peer = SimpleNamespace(
+                            agent_name="decode",
+                            gpu_id=1,
+                            dst_kv_ptrs=dst_ptrs,
+                            dst_kv_item_lens=dst_strides,
+                            dst_num_slots=slots,
+                            dst_kv_mem_kinds=["DRAM", "DRAM", "VRAM"],
+                        )
+                        manager.decode_kv_args_table = {"decode": peer}
+                        manager._init_mixed_equal_tp_prep_handles(
+                            peer,
+                            _kv_xfer_mem_segments(["VRAM"] * 3, peer.dst_kv_mem_kinds),
+                        )
+                        # Exercise chunked writes and layer offsets in prepared dlists.
+                        for chunk in (slice(0, 2), slice(2, 3)):
+                            manager.send_kvcache_mixed(
+                                "decode",
+                                src_pages[chunk],
+                                host_pages[chunk],
+                                dst_device_kv_indices=device_map[chunk]
+                                if device_map is not None
+                                else None,
+                            )
+                    np.testing.assert_array_equal(memory, expected)
+
+    def test_nixl_receiver_metadata_preserves_both_maps(self):
+        manager = object.__new__(NixlKVManager)
+        manager.local_ip, manager.rank_port = "127.0.0.1", 1234
+        manager.agent = SimpleNamespace(name="decode")
+        host = np.array([40, 41], dtype=np.int32)
+        device = np.array([7, 8], dtype=np.int64)
+        for dummy in (False, True):
+            msg = manager.build_receiver_metadata_message(
+                bootstrap_room=1,
+                required_dst_info_num=1,
+                kv_indices=host,
+                aux_index=0,
+                state_indices=None,
+                decode_prefix_len=0,
+                is_dummy=dummy,
+                device_kv_indices=device,
+            )
+            req = NixlTransferInfo.from_zmq(msg[1:])
+            self.assertEqual(req.is_dummy, dummy)
+            if dummy:
+                self.assertIsNone(req.dst_device_kv_indices)
+            else:
+                np.testing.assert_array_equal(req.dst_device_kv_indices, device)
+                np.testing.assert_array_equal(req.dst_kv_indices, host)
+            # Old one-map senders have no appended frame.
+            self.assertIsNone(
+                NixlTransferInfo.from_zmq(msg[1:-1]).dst_device_kv_indices
+            )
+
     def test_draft_buffers_use_logical_device_indices(self):
         """A local target layer count must not turn remote target KV into draft KV."""
         for pp_size, stage_start in ((1, 0), (2, 0), (2, 2)):

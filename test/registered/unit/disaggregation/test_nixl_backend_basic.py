@@ -327,6 +327,25 @@ class TestNixlEmptyStateTransfer(CustomTestCase):
 
 
 class TestNixlTransferWorker(CustomTestCase):
+    def test_mixed_transfer_slices_both_destination_maps(self):
+        room = 31
+        mgr = self._make_manager(room)
+        req = mgr.transfer_infos[room]["agent"]
+        req.dst_kv_indices = np.array([40, 41, 42], dtype=np.int32)
+        req.dst_device_kv_indices = np.array([7, 8, 9], dtype=np.int32)
+        mgr.decode_kv_args_table["agent"].kv_xfer_segments = [object()]
+        mgr.send_kvcache_mixed = MagicMock(return_value=["kv_handle"])
+        chunk = self._make_chunk(room, [1, 2, 3], False)
+        chunk.index_slice = slice(1, 3)
+
+        self._run_worker_once(mgr, chunk)
+
+        mgr.send_kvcache_mixed.assert_called_once()
+        args, kwargs = mgr.send_kvcache_mixed.call_args
+        np.testing.assert_array_equal(args[1], [1, 2])
+        np.testing.assert_array_equal(args[2], [41, 42])
+        np.testing.assert_array_equal(kwargs["dst_device_kv_indices"], [8, 9])
+
     def _make_manager(self, room):
         mgr = object.__new__(NixlKVManager)
         mgr.customized_info_enabled = False

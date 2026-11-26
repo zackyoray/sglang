@@ -303,9 +303,9 @@ class TransferInfo:
     dst_state_indices: List[List[int]]
     decode_prefix_len: Optional[int] = None  # for decode radix cache
     is_dummy: bool = False
-    # NOTE: optional staging field; populated via STAGING_RSP. Keep at the
-    # end so positional construction in from_zmq() continues to work.
+    # Optional staging field populated via STAGING_RSP.
     staging: Optional[StagingTransferInfo] = None
+    dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -343,6 +343,11 @@ class TransferInfo:
             dst_state_indices=dst_state_indices,
             decode_prefix_len=decode_prefix_len,
             is_dummy=is_dummy,
+            dst_device_kv_indices=(
+                np.frombuffer(msg[10], dtype=np.int32)
+                if len(msg) > 10 and msg[10]
+                else None
+            ),
         )
 
 
@@ -1847,6 +1852,22 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         and self.kv_args.kv_data_ptrs
                     ):
                         is_dcp_transfer = dst_info.requires_dcp_relayout
+                        chunked_dst_device_kv_indices = None
+                        if req.dst_device_kv_indices is not None:
+                            if is_dcp_transfer or dst_info.kv_xfer_segments is None:
+                                raise NotImplementedError(
+                                    "NIXL HiSparse device indices require mixed-memory "
+                                    "whole-page transfers"
+                                )
+                            if len(req.dst_device_kv_indices) != len(
+                                req.dst_kv_indices
+                            ):
+                                raise ValueError(
+                                    "HiSparse host/device page map length mismatch"
+                                )
+                            chunked_dst_device_kv_indices = req.dst_device_kv_indices[
+                                kv_chunk.index_slice
+                            ]
                         if is_dcp_transfer:
                             chunked_dst_kv_indice = req.dst_kv_indices
                         else:
@@ -1869,6 +1890,12 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                                 )
 
                         src_prefill_kv_indices = kv_chunk.prefill_kv_indices
+                        if chunked_dst_device_kv_indices is not None:
+                            chunked_dst_device_kv_indices = (
+                                chunked_dst_device_kv_indices[
+                                    : len(src_prefill_kv_indices)
+                                ]
+                            )
 
                         # Decide which kv send path to use:
                         #   1. Staging (heterogeneous TP, both sides have
@@ -1969,6 +1996,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                                             req.agent_name,
                                             src_prefill_kv_indices,
                                             chunked_dst_kv_indice,
+                                            dst_device_kv_indices=chunked_dst_device_kv_indices,
                                         )
                                     )
                             elif (
@@ -2632,6 +2660,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         peer_name: str,
         prefill_kv_indices: npt.NDArray[np.int32],
         dst_kv_indices: npt.NDArray[np.int32],
+        dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
     ):
         info = self.decode_kv_args_table[peer_name]
         segments = info.kv_xfer_segments
@@ -2645,8 +2674,16 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             src_indices = repeat_indices_over_layers(
                 prefill_kv_indices, num_layers, self._num_slots_src
             )
+            # HiSparse target pages live in host memory; appended draft KV
+            # uses independently allocated logical device pages (as in Mooncake).
+            dst_pages = (
+                dst_device_kv_indices
+                if dst_device_kv_indices is not None
+                and info.dst_kv_mem_kinds[seg.start] == "VRAM"
+                else dst_kv_indices
+            )
             dst_indices = repeat_indices_over_layers(
-                dst_kv_indices, num_layers, seg.dst_num_slots
+                dst_pages, num_layers, seg.dst_num_slots
             )
             xfer_handle = self.agent.make_prepped_xfer(
                 "WRITE",
@@ -3838,6 +3875,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             packed_state_indices,
             str(decode_prefix_len or 0).encode("ascii"),
             str(int(is_dummy)).encode("ascii"),
+            (
+                np.asarray(device_kv_indices, dtype=np.int32).tobytes()
+                if not is_dummy and device_kv_indices is not None
+                else b""
+            ),
         ]
 
 
