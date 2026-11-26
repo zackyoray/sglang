@@ -7,6 +7,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
+    configure_nixl_pd_backend,
 )
 from sglang.test.test_utils import (
     DEFAULT_HYBRID_GDN_SMALL_MODEL_NAME_FOR_TEST,
@@ -109,6 +110,8 @@ STAGING_ENV = {
 class TestDisaggregationStagingDecodeLargerTP(PDDisaggregationServerBase):
     """Prefill TP=2 -> Decode TP=4 with staging buffer enabled (MHA model)."""
 
+    prefill_pp_size = 1
+
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
@@ -137,7 +140,17 @@ class TestDisaggregationStagingDecodeLargerTP(PDDisaggregationServerBase):
             "--enable-metrics",
             "--enable-request-time-stats-logging",
         ]
-        prefill_args += cls.transfer_backend + cls.rdma_devices_for(range(2))
+        if cls.prefill_pp_size > 1:
+            prefill_args += [
+                "--pp-size",
+                str(cls.prefill_pp_size),
+                "--disable-overlap-schedule",
+                "--chunked-prefill-size",
+                "256",
+            ]
+        prefill_args += cls.transfer_backend + cls.rdma_devices_for(
+            range(2 * cls.prefill_pp_size)
+        )
         env = {**os.environ, **STAGING_ENV}
         cls.process_prefill = popen_launch_pd_server(
             cls.model,
@@ -185,6 +198,19 @@ class TestDisaggregationStagingDecodeLargerTP(PDDisaggregationServerBase):
         metrics = run_eval(args)
         print(f"[Staging DecodeLargerTP] Evaluation metrics: {metrics}")
         self.assertGreater(metrics["score"], 0.60)
+
+
+class TestDisaggregationStagingPrefillPP(TestDisaggregationStagingDecodeLargerTP):
+    """PP2/TP2 prefill -> PP1/TP4 decode, using the same staging accuracy gate."""
+
+    prefill_pp_size = 2
+
+
+class TestDisaggregationNixlStagingPrefillPP(TestDisaggregationStagingPrefillPP):
+    @classmethod
+    def start_prefill(cls):
+        configure_nixl_pd_backend(cls)
+        super().start_prefill()
 
 
 class TestDisaggregationGDNHybridHeteroTP(PDDisaggregationServerBase):

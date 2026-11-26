@@ -43,6 +43,19 @@ def _kv_layer_ids(target_ids, draft_ids):
 
 
 class TestStagingDraftKvSlots(CustomTestCase):
+    def test_plain_mha_staging_uses_view_model_layer_ids(self):
+        pool = _Pool("t", [16, 17])
+        pool.model_layer_ids = (16, 17)
+        k_buffers, v_buffers, slot_ids = build_staging_slot_metadata(
+            kv_layer_ids=[],
+            num_draft_entries=0,
+            kv_pool=pool,
+            draft_kv_pool=None,
+        )
+        self.assertEqual(k_buffers, ["tK16", "tK17"])
+        self.assertEqual(v_buffers, ["tV16", "tV17"])
+        self.assertEqual(slot_ids, [16, 17, 16, 17])
+
     def test_undescribable_draft_still_yields_target_buffers(self):
         # Returning nothing here left the caller skipping set_kv_buffer_tensors
         # entirely, and staging then came up with no buffers at all.

@@ -1623,6 +1623,10 @@ def build_staging_slot_metadata(
         return None
 
     ids = list(kv_layer_ids or [])
+    if not ids and not num_draft_entries:
+        # Plain MHA transfer regions need no layer ids, but PP staging does.
+        # The view's model ids follow its per-layer K and V buffer order.
+        ids = list(getattr(kv_pool, "model_layer_ids", ())) * 2
     num_target = len(ids) - num_draft_entries
     half = num_target // 2
     k_buffers, k_ids = list(kv_pool.k_buffer), ids[:half]

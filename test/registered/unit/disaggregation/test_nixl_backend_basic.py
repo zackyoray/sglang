@@ -1232,6 +1232,124 @@ class TestNixlStaging(CustomTestCase):
         mgr.server_args = SimpleNamespace(chunked_prefill_size=4)
         return mgr
 
+    def test_staged_pp_layer_and_head_slices(self):
+        import torch
+
+        from sglang.srt.disaggregation.common.staging_buffer import (
+            compute_staging_layout,
+        )
+
+        # Distinct K/V, global layer, token and head values expose overlapping
+        # stage writes even when every NIXL handle completes successfully.
+        kv = np.arange(2 * 4 * 10 * 8 * 2, dtype=np.float32).reshape(2, 4, 10, 8, 2)
+        for pp_size, src_tp, dst_tp in ((2, 2, 4), (2, 4, 2), (1, 2, 4)):
+            for pages in ([1, 3, 4], [2]):
+                for dst_rank in range(dst_tp):
+                    with self.subTest(
+                        pp=pp_size, tp=(src_tp, dst_tp), pages=pages, dst=dst_rank
+                    ):
+                        tokens = (np.array(pages)[:, None] * 2 + np.arange(2)).ravel()
+                        writers, _, total = compute_staging_layout(
+                            src_tp, dst_tp, dst_rank, 8, len(tokens), 8, 4
+                        )
+                        destination = np.full(total, 255, dtype=np.uint8)
+                        for stage in range(pp_size):
+                            layers = list(
+                                range(
+                                    stage * (4 // pp_size), (stage + 1) * (4 // pp_size)
+                                )
+                            )
+                            for src_rank in range(src_tp):
+                                # Only the ranks whose global head ranges intersect connect.
+                                lo = max(
+                                    src_rank * (8 // src_tp), dst_rank * (8 // dst_tp)
+                                )
+                                hi = min(
+                                    (src_rank + 1) * (8 // src_tp),
+                                    (dst_rank + 1) * (8 // dst_tp),
+                                )
+                                if lo >= hi:
+                                    continue
+                                mgr = self._make_manager()
+                                mgr.pp_size = pp_size
+                                mgr.attn_tp_size = src_tp
+                                mgr.kv_args.engine_rank = src_rank
+                                mgr.kv_args.total_kv_head_num = 8
+                                mgr.kv_args.kv_layer_ids = layers * 2
+                                local = kv[
+                                    :,
+                                    layers,
+                                    :,
+                                    src_rank * (8 // src_tp) : (src_rank + 1)
+                                    * (8 // src_tp),
+                                ]
+                                mgr.set_kv_buffer_tensors(
+                                    [torch.from_numpy(x.copy()) for x in local[0]],
+                                    [torch.from_numpy(x.copy()) for x in local[1]],
+                                    2,
+                                    layers * 2,
+                                )
+                                gathered = []
+
+                                def gather(
+                                    ks, vs, indices, buffer, head, heads, page_size
+                                ):
+                                    gathered.append(
+                                        np.concatenate(
+                                            [
+                                                x.numpy()[
+                                                    tokens, head : head + heads
+                                                ].ravel()
+                                                for x in ks + vs
+                                            ]
+                                        ).view(np.uint8)
+                                    )
+
+                                buffer = SimpleNamespace(
+                                    get_ptr=lambda: 0x1000, fits=lambda size: True
+                                )
+                                with patch(
+                                    "sglang.srt.disaggregation.common.staging_buffer.gather_all_layers_to_staging",
+                                    side_effect=gather,
+                                ):
+                                    mgr.send_kvcache_staged(
+                                        "peer",
+                                        np.array(pages, dtype=np.int32),
+                                        0x100000,
+                                        total,
+                                        0,
+                                        dst_rank,
+                                        dst_tp,
+                                        0,
+                                        staging_buffer=buffer,
+                                        dst_layer_ids=list(range(4)) * 2,
+                                    )
+                                src_descs, dst_descs = mgr.agent.get_xfer_descs_calls
+                                self.assertEqual(
+                                    len(src_descs[0]),
+                                    1 if pp_size == 1 else len(layers) * 2,
+                                )
+                                for src, dst in zip(src_descs[0], dst_descs[0]):
+                                    src_offset, dst_offset = (
+                                        int(src[0]) - 0x1000,
+                                        int(dst[0]) - 0x100000,
+                                    )
+                                    size = int(src[1])
+                                    destination[dst_offset : dst_offset + size] = (
+                                        gathered[0][src_offset : src_offset + size]
+                                    )
+                        # Writer-major, then [all K layers, all V layers].
+                        expected = []
+                        for writer in range(writers):
+                            heads = 8 // dst_tp // writers
+                            head = dst_rank * (8 // dst_tp) + writer * heads
+                            expected.append(
+                                kv[:, :, tokens, head : head + heads].ravel()
+                            )
+                        np.testing.assert_array_equal(
+                            destination.view(np.float32), np.concatenate(expected)
+                        )
+
     def test_send_aux_uses_destination_row_stride(self):
         context = get_context().override_server_args(
             disaggregation_enable_kv_checksum=False
@@ -1740,6 +1858,16 @@ class TestNixlUnifiedMemory(CustomTestCase):
         mgr._validate_unified_peer(legacy)
         with self.assertRaisesRegex(ValueError, "layout mismatch"):
             mgr._validate_unified_peer(peer)
+
+        mgr.enable_staging = True
+        mgr.kv_buffer_tensors = {"slot_layer_ids": [0, 1, 4, 0, 1, 4]}
+        mgr._staging_ctx = SimpleNamespace(allocator=None)
+        staged = mgr.build_receiver_registration_message()[1:]
+        peer = KVArgsRegisterInfo.from_zmq(staged)
+        self.assertEqual(peer.dst_staging_slot_layer_ids, [0, 1, 4, 0, 1, 4])
+        self.assertEqual(
+            KVArgsRegisterInfo.from_zmq(staged[:27]).dst_staging_slot_layer_ids, []
+        )
 
     def test_shared_arena_is_registered_once(self):
         mgr = self._manager()

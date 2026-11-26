@@ -365,6 +365,7 @@ class KVArgsRegisterInfo:
     dst_kv_item_len: int
     dst_kv_item_lens: list[int]
     dst_kv_layer_ids: list[int] = dataclasses.field(default_factory=list)
+    dst_staging_slot_layer_ids: list[int] = dataclasses.field(default_factory=list)
     dst_dcp_size: int = 1
     dst_dcp_rank: int = 0
     requires_dcp_relayout: bool = False
@@ -442,6 +443,11 @@ class KVArgsRegisterInfo:
             decode_tp_rank=int(msg[11].decode("ascii")),
             dst_kv_item_len=dst_kv_item_len,
             dst_kv_item_lens=dst_kv_item_lens,
+            dst_staging_slot_layer_ids=(
+                list(struct.unpack(f"{len(msg[27]) // 4}I", msg[27]))
+                if len(msg) > 27 and msg[27]
+                else []
+            ),
             dst_kv_layer_ids=dst_kv_layer_ids,
             # msg[20:22] are the layer-id frames above; DCP trails them.
             dst_dcp_size=(
@@ -1135,6 +1141,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             get_schedule().chunked_prefill_size,
             self._staging_ctx.prefetch_requested,
             self._staging_ctx.prefetch_sockets,
+            requester_pp_rank=self.pp_rank,
             upto_tokens=upto_tokens,
         )
         if upto_tokens is None:
@@ -2787,6 +2794,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         dst_attn_tp_size: int,
         dst_kv_item_len: int,
         staging_buffer=None,
+        dst_layer_ids: Optional[List[int]] = None,
+        dst_slot_layer_ids: Optional[List[int]] = None,
     ):
         """Transfer KV cache via staging buffers (gather -> bulk RDMA -> scatter on decode)."""
         from sglang.srt.disaggregation.common.staging_buffer import (
@@ -2821,6 +2830,21 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         per_layer_bytes = num_tokens * num_heads_to_send * head_dim * dtype_size
         per_rank_bytes = per_layer_bytes * num_layers * 2
 
+        if self.pp_size > 1:
+            # Match Mooncake: gather slots are [all K, all V], including draft KV.
+            src_slot_ids = (
+                self.kv_buffer_tensors.get("slot_layer_ids")
+                or self.kv_args.kv_layer_ids
+            )
+            dst_slot_ids = dst_slot_layer_ids or dst_layer_ids or []
+            pairs = build_transfer_entry_pairs(
+                src_slot_ids, dst_slot_ids, num_layers * 2, len(dst_slot_ids)
+            )
+            dst_num_layers = len(dst_slot_ids) // 2
+        else:
+            pairs = None
+            dst_num_layers = num_layers
+
         num_writers, writer_rank_bytes, total_staging_needed = compute_staging_layout(
             self.attn_tp_size,
             dst_attn_tp_size,
@@ -2828,7 +2852,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             total_kv_heads,
             num_tokens,
             head_dim * dtype_size,
-            num_layers,
+            dst_num_layers,
         )
         writer_idx = local_tp_rank % num_writers if num_writers > 1 else 0
         rank_offset = sum(writer_rank_bytes[:writer_idx])
@@ -2861,12 +2885,24 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         )
 
         dst_write_ptr = dst_staging_ptr + rank_offset
+        if pairs is None:
+            # Preserve the single contiguous PP=1 transfer.
+            blocks = [(0, 0, per_rank_bytes)]
+        else:
+            blocks = [
+                (src * per_layer_bytes, dst * per_layer_bytes, per_layer_bytes)
+                for src, dst in pairs
+            ]
         src_reqs = np.array(
-            [[staging_buffer.get_ptr(), per_rank_bytes, self.kv_args.gpu_id]],
+            [
+                [staging_buffer.get_ptr() + src, size, self.kv_args.gpu_id]
+                for src, _, size in blocks
+            ],
             dtype=np.uint64,
         )
         dst_reqs = np.array(
-            [[dst_write_ptr, per_rank_bytes, dst_gpu_id]], dtype=np.uint64
+            [[dst_write_ptr + dst, size, dst_gpu_id] for _, dst, size in blocks],
+            dtype=np.uint64,
         )
 
         src_descs = self.agent.get_xfer_descs(src_reqs, "VRAM")
@@ -2961,6 +2997,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             dst_info.decode_tp_size,
             dst_info.dst_kv_item_len,
             staging_buffer=staging_strategy.staging_buffer,
+            dst_layer_ids=dst_info.dst_kv_layer_ids,
+            dst_slot_layer_ids=dst_info.dst_staging_slot_layer_ids,
         )
         if handle is None:
             # A silent slice fallback would leak this chunk's decode-side
@@ -3805,6 +3843,12 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         ]
         if self.enable_unified_memory:
             message.append(json.dumps(self._unified_wire_layout()).encode("ascii"))
+        if self.enable_staging and self.kv_buffer_tensors is not None:
+            # Frame 26 is reserved for the unified-memory layout.
+            if not self.enable_unified_memory:
+                message.append(b"")
+            slot_ids = self.kv_buffer_tensors.get("slot_layer_ids", [])
+            message.append(struct.pack(f"{len(slot_ids)}I", *slot_ids))
         return message
 
     def build_receiver_metadata_message(
